@@ -6,6 +6,9 @@
     "paths": {
       "@somo/db": ["../../packages/db/src/index.ts"],
       "@somo/integrations": ["../../packages/integrations/src/index.ts"],
+      "@somo/integrations/simulators": [
+        "../../packages/integrations/src/simulators/index.ts"
+      ],
       "@somo/testkit": ["../../packages/testkit/src/index.ts"]
     },
     "types": ["node", "vitest/globals"]

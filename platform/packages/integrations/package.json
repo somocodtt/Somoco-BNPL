@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./simulators": "./src/simulators/index.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

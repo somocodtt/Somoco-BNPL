@@ -18,7 +18,11 @@ import {
   type InternalDatabase,
 } from "./client.js";
 import { completeInboxMessage, receiveInboxMessage } from "./inbox.js";
-import { claimOutboxBatch, enqueueOutbox } from "./outbox.js";
+import {
+  claimOutboxBatch,
+  enqueueOutbox,
+  listOutboxAttempts,
+} from "./outbox.js";
 import { applicationRepo } from "./repositories/applications.js";
 import { appendAuditEvent } from "./repositories/audit.js";
 import { completeOwnershipTransfer } from "./repositories/contracts.js";
@@ -593,6 +597,58 @@ describe("populated legacy schema migration", () => {
       message: expect.stringContaining("legacy registration owner"),
     });
     await expectLegacySchemaUnchanged(pool);
+  });
+
+  it("backfills active 0003 claims as started attempts that can be abandoned and reclaimed", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const messageId = randomUUID();
+    const aggregateId = randomUUID();
+    await pool.query(
+      `
+        insert into outbox_message (
+          id, topic, aggregate_type, aggregate_id, payload, occurred_at,
+          attempts, claimed_by, claimed_at, available_at
+        ) values ($1, 'erp.publish', 'contract', $2, '{}', now() - interval '2 hours',
+                  1, 'legacy-worker', now() - interval '1 hour', now() - interval '2 hours')
+      `,
+      [messageId, aggregateId],
+    );
+
+    await applyMigrationFile(pool, "0004_tearful_dark_phoenix.sql");
+    const connection = createDatabase(databaseUrl);
+    try {
+      const [reclaimed] = await claimOutboxBatch(connection.db, {
+        workerId: "replacement-worker",
+        limit: 1,
+        claimLeaseMs: 5,
+        maxAttempts: 3,
+      });
+
+      expect(reclaimed).toMatchObject({ id: messageId, attempts: 2 });
+      expect(await listOutboxAttempts(connection.db, messageId)).toMatchObject([
+        {
+          attemptNumber: 1,
+          workerId: "legacy-worker",
+          outcome: "ABANDONED",
+          failureCode: "OUTBOX_CLAIM_EXPIRED",
+        },
+        {
+          attemptNumber: 2,
+          workerId: "replacement-worker",
+          outcome: "STARTED",
+          failureCode: null,
+          finishedAt: null,
+        },
+      ]);
+    } finally {
+      await connection.close();
+    }
   });
 });
 

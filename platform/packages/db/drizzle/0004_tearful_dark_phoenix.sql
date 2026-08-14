@@ -7,10 +7,26 @@ ALTER TABLE "outbox_message" ADD COLUMN "claim_token" uuid;--> statement-breakpo
 UPDATE "outbox_attempt"
 SET "lease_token" = gen_random_uuid(),
     "finished_at" = "attempted_at";--> statement-breakpoint
-ALTER TABLE "outbox_attempt" ALTER COLUMN "lease_token" SET NOT NULL;--> statement-breakpoint
 UPDATE "outbox_message"
 SET "claim_token" = gen_random_uuid()
 WHERE "claimed_by" IS NOT NULL;--> statement-breakpoint
+INSERT INTO "outbox_attempt" (
+  "outbox_message_id",
+  "attempt_number",
+  "worker_id",
+  "lease_token",
+  "attempted_at",
+  "outcome"
+)
+SELECT "id",
+       "attempts",
+       "claimed_by",
+       "claim_token",
+       "claimed_at",
+       'STARTED'
+FROM "outbox_message"
+WHERE "claimed_by" IS NOT NULL;--> statement-breakpoint
+ALTER TABLE "outbox_attempt" ALTER COLUMN "lease_token" SET NOT NULL;--> statement-breakpoint
 ALTER TABLE "outbox_attempt" ADD CONSTRAINT "outbox_attempt_outcome_allowed" CHECK ("outbox_attempt"."outcome" in ('STARTED', 'ABANDONED', 'PUBLISHED', 'RETRY_SCHEDULED', 'EXCEPTION'));--> statement-breakpoint
 ALTER TABLE "outbox_attempt" ADD CONSTRAINT "outbox_attempt_outcome_consistent" CHECK ((
         ("outbox_attempt"."outcome" = 'STARTED' and "outbox_attempt"."finished_at" is null and "outbox_attempt"."failure_code" is null and "outbox_attempt"."next_attempt_at" is null)

@@ -202,4 +202,30 @@ describe("deterministic integration simulators", () => {
       expect(create).toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
     }
   });
+
+  it("rejects every simulator when the actual runtime is production despite a test assertion", () => {
+    const priorNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      const factories = [
+        () => createNiaSimulator({ environment: "test", fixtures: [] }),
+        () => createSmsSimulator({ environment: "test", fixtures: [] }),
+        () => createTrackerSimulator({ environment: "test", fixtures: [] }),
+        () => createCreditBureauSimulator({ environment: "test" }),
+        () =>
+          createPaymentWebhookSimulator({
+            environment: "test",
+            fixtures: [],
+          }),
+        () => createErpSimulator({ environment: "test", fixtures: [] }),
+      ];
+
+      for (const create of factories) {
+        expect(create).toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+      }
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    }
+  });
 });

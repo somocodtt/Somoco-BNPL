@@ -5,6 +5,12 @@ export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
   resolve: {
     alias: {
+      "@somo/integrations/simulators": fileURLToPath(
+        new URL(
+          "../../packages/integrations/src/simulators/index.ts",
+          import.meta.url,
+        ),
+      ),
       "@somo/db": fileURLToPath(
         new URL("../../packages/db/src/index.ts", import.meta.url),
       ),

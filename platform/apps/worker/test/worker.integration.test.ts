@@ -4,7 +4,7 @@ import {
   IntegrationTemporaryError,
   createPaymentWebhookSimulator,
   createSmsSimulator,
-} from "@somo/integrations";
+} from "@somo/integrations/simulators";
 import {
   readWorkerProcessConfig,
   startWorker,
@@ -254,6 +254,31 @@ describe("durable outbox worker", () => {
     ).toThrow("WORKER_HANDLER_PROVENANCE_REQUIRED");
   });
 
+  it("cannot hide a simulator in an empty-adapter handler wrapper in production", () => {
+    const priorNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() => {
+        const sms = createSmsSimulator({ environment: "test", fixtures: [] });
+        const hiddenSimulatorHandler = createOutboxHandler([], async () =>
+          sms.send({
+            idempotencyKey: "hidden-simulator",
+            phoneE164: "+233201234567",
+            template: "TEST",
+            variables: {},
+          }),
+        );
+        validateWorkerHandlerRegistry(
+          "production",
+          new Map([["notification.send", hiddenSimulatorHandler]]),
+        );
+      }).toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    }
+  });
+
   it("fails closed when production bootstrap configuration is incomplete", () => {
     expect(() => readWorkerProcessConfig({})).toThrow(
       "WORKER_DATABASE_URL_REQUIRED",
@@ -288,6 +313,13 @@ describe("durable outbox worker", () => {
         NODE_ENV: "prodution",
       }),
     ).toThrow("WORKER_NODE_ENV_INVALID");
+    expect(() =>
+      readWorkerProcessConfig({
+        DATABASE_URL: "postgresql://database",
+        WORKER_ID: "worker-one",
+        WORKER_HANDLERS_MODULE: "file:///deployment/worker-handlers.js",
+      }),
+    ).toThrow("WORKER_NODE_ENV_REQUIRED");
   });
 
   it("does not invoke a handler for a claim beyond max attempts", async () => {

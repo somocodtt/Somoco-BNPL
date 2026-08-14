@@ -230,7 +230,10 @@ function requiredEnvironmentValue(
 function workerEnvironment(
   value: string | undefined,
 ): WorkerProcessConfig["environment"] {
-  const environment = value ?? "development";
+  if (value === undefined || value.trim().length === 0) {
+    throw new Error("WORKER_NODE_ENV_REQUIRED");
+  }
+  const environment = value;
   if (!["development", "test", "production"].includes(environment)) {
     throw new Error("WORKER_NODE_ENV_INVALID");
   }
