@@ -1,0 +1,12 @@
+services:
+  somo-bnpl:
+    build: .
+    image: somo-bnpl-server
+    container_name: somo-bnpl
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3000

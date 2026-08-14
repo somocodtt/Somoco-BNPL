@@ -1,0 +1,1629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Somo BNPL — KYC &amp; Loan Onboarding</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#F7F5EF; --paper:#FFFFFF; --ink:#1F2430; --ink-soft:#5B5F6B;
+    --navy:#16283D; --navy-soft:#28405C; --gold:#C99A2E; --gold-soft:#F1E2BC;
+    --green:#1F7A4D; --green-soft:#E1EFE6; --brick:#A63A2E; --brick-soft:#F3E2DE;
+    --amber:#B9791A; --amber-soft:#F4E7D2; --purple:#5B3A8C; --purple-soft:#EAE2F5;
+    --teal:#1F7A6B; --teal-soft:#DCEFEA; --line:#E4DFD3; --radius:14px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{ background:var(--bg); color:var(--ink); font-family:'Inter',sans-serif; font-size:15px; line-height:1.5; }
+  h1,h2,h3,.display{ font-family:'Fraunces',serif; font-weight:600; letter-spacing:-0.01em; }
+  .mono{ font-family:'IBM Plex Mono', monospace; letter-spacing:0.01em; }
+  .eyebrow{ font-family:'IBM Plex Mono', monospace; font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-soft); }
+  button{ font-family:'Inter',sans-serif; cursor:pointer; }
+  input, select, textarea{ font-family:'Inter',sans-serif; }
+
+  .app{ max-width:1180px; margin:0 auto; padding:0 20px 80px; }
+  .topbar{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; padding:22px 0 18px; border-bottom:1px solid var(--line); margin-bottom:28px; }
+  .brand{ display:flex; align-items:center; gap:12px; }
+  .brand-mark{ width:38px; height:38px; border-radius:9px; background:var(--navy); display:flex; align-items:center; justify-content:center; flex-shrink:0; overflow:hidden; }
+  .brand-mark svg{ width:20px; height:20px; }
+  .brand-mark img{ width:100%; height:100%; object-fit:cover; }
+  .brand-text h1{ font-size:19px; margin:0; color:var(--navy); }
+  .brand-text .eyebrow{ margin-top:1px; }
+  .topbar-right{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .mode-toggle{ display:flex; flex-wrap:wrap; background:var(--paper); border:1px solid var(--line); border-radius:999px; padding:3px; gap:2px; }
+  .mode-toggle button{ border:none; background:transparent; padding:9px 14px; border-radius:999px; font-size:12.5px; font-weight:600; color:var(--ink-soft); transition:background .2s, color .2s; white-space:nowrap; }
+  .mode-toggle button.active{ background:var(--navy); color:#fff; }
+  .auth-area{ display:flex; align-items:center; gap:8px; }
+
+  .apply-grid{ display:grid; grid-template-columns:220px 1fr; gap:36px; align-items:start; }
+  .steps{ position:sticky; top:24px; display:flex; flex-direction:column; gap:2px; }
+  .step-item{ display:flex; align-items:center; gap:12px; padding:11px 12px; border-radius:10px; color:var(--ink-soft); font-size:13.5px; font-weight:500; }
+  .step-item .num{ width:24px; height:24px; border-radius:50%; border:1.5px solid var(--line); display:flex; align-items:center; justify-content:center; font-family:'IBM Plex Mono',monospace; font-size:11px; flex-shrink:0; background:var(--paper); color:var(--ink-soft); }
+  .step-item.active{ color:var(--navy); background:var(--gold-soft); }
+  .step-item.active .num{ background:var(--gold); border-color:var(--gold); color:var(--navy); }
+  .step-item.done .num{ background:var(--green); border-color:var(--green); color:#fff; }
+  .step-item.done{ color:var(--ink); }
+
+  .panel{ background:var(--paper); border:1px solid var(--line); border-radius:var(--radius); padding:32px; animation:rise .35s ease both; }
+  @keyframes rise{ from{ opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);} }
+  @media (prefers-reduced-motion: reduce){ .panel{animation:none;} }
+  .panel h2{ font-size:22px; margin:0 0 4px; color:var(--navy); }
+  .panel h3{ font-size:15px; color:var(--navy); }
+  .panel .sub{ color:var(--ink-soft); font-size:13.5px; margin-bottom:26px; }
+
+  .field-row{ display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-bottom:18px; }
+  .field{ display:flex; flex-direction:column; gap:6px; }
+  .field.full{ grid-column:1/-1; }
+  label{ font-size:12.5px; font-weight:600; color:var(--ink); }
+  label .req{ color:var(--brick); }
+  label .opt{ color:var(--ink-soft); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.05em; margin-left:4px;}
+  input[type=text], input[type=number], input[type=tel], input[type=date], select{
+    border:1px solid var(--line); border-radius:9px; padding:10px 12px; font-size:14px;
+    background:#FCFBF8; color:var(--ink); outline:none; transition:border-color .15s;
+  }
+  input:focus, select:focus{ border-color:var(--navy); }
+  input:disabled{ background:#EFEDE6; }
+  .hint{ font-size:11.5px; color:var(--ink-soft); }
+
+  .section-divider{ display:flex; align-items:center; gap:10px; margin:30px 0 18px; }
+  .section-divider .eyebrow{ white-space:nowrap; }
+  .section-divider .line{ height:1px; background:var(--line); flex:1; }
+
+  .doc-grid{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .doc-stub{ position:relative; border:1px solid var(--line); border-radius:10px; background:#FCFBF8; padding:16px 16px 16px 22px; display:flex; flex-direction:column; gap:10px; overflow:hidden; }
+  .doc-stub::before{ content:''; position:absolute; left:0; top:0; bottom:0; width:10px; background-image:radial-gradient(circle at 0 6px, transparent 4px, var(--bg) 4.5px); background-size:10px 12px; background-repeat:repeat-y; }
+  .doc-stub .doc-head{ display:flex; align-items:center; justify-content:space-between; }
+  .doc-stub .doc-name{ font-size:13.5px; font-weight:600; }
+  .doc-stub .doc-tag{ font-size:10px; font-family:'IBM Plex Mono',monospace; padding:3px 7px; border-radius:5px; text-transform:uppercase; letter-spacing:.05em;}
+  .tag-required{ background:var(--brick-soft); color:var(--brick); }
+  .tag-optional{ background:var(--line); color:var(--ink-soft); }
+  .doc-stub input[type=file]{ font-size:12px; }
+  .doc-file-info{ display:none; align-items:center; gap:8px; font-size:12.5px; color:var(--green); font-weight:600; }
+  .doc-file-info.show{ display:flex; }
+  .stamp{ position:absolute; right:12px; top:12px; border:1.5px solid var(--green); color:var(--green); font-family:'IBM Plex Mono',monospace; font-size:9.5px; padding:3px 6px; border-radius:5px; transform:rotate(6deg); letter-spacing:.05em; opacity:0; transition:opacity .2s; }
+  .doc-stub.uploaded .stamp{ opacity:1; }
+
+  .location-box{ border:1px solid var(--line); border-radius:10px; padding:16px; background:#FCFBF8; }
+
+  .footer-nav{ display:flex; justify-content:space-between; margin-top:30px; }
+  .btn{ border:none; border-radius:9px; padding:12px 22px; font-size:13.5px; font-weight:600; transition:transform .1s, opacity .15s; }
+  .btn:active{ transform:scale(.97); }
+  .btn-primary{ background:var(--navy); color:#fff; }
+  .btn-ghost{ background:transparent; color:var(--ink-soft); border:1px solid var(--line); }
+  .btn-gold{ background:var(--gold); color:var(--navy); }
+  .btn-green{ background:var(--green); color:#fff; }
+  .btn-brick{ background:var(--brick); color:#fff; }
+  .btn-amber{ background:var(--amber); color:#fff; }
+  .btn-sm{ padding:8px 14px; font-size:12.5px; }
+
+  .meter{ height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:8px 0 4px;}
+  .meter > div{ height:100%; background:var(--gold); transition:width .4s ease; }
+  .checklist{ display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+  .check-row{ display:flex; align-items:center; gap:10px; font-size:13.5px; }
+  .check-row .dot{ width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .dot-ok{ background:var(--green); }
+  .dot-bad{ background:var(--brick); }
+  .ref-box{ margin-top:22px; border:1px dashed var(--gold); background:var(--gold-soft); border-radius:10px; padding:18px 20px; display:none; }
+  .ref-box.show{ display:block; }
+  .ref-box .refcode{ font-size:20px; font-weight:600; color:var(--navy); }
+
+  .review-list{ display:flex; flex-direction:column; gap:12px; }
+  .app-card{ background:var(--paper); border:1px solid var(--line); border-radius:12px; padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; cursor:pointer; }
+  .app-card:hover{ border-color:var(--gold); }
+  .app-card .left{ display:flex; flex-direction:column; gap:4px; }
+  .app-card .ref{ font-size:14px; font-weight:600; }
+  .app-card .meta{ font-size:12px; color:var(--ink-soft); }
+  .badge{ font-size:10.5px; font-family:'IBM Plex Mono',monospace; padding:4px 9px; border-radius:99px; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap; }
+  .badge-submitted{ background:var(--gold-soft); color:#8a6a1f; }
+  .badge-cfo{ background:#DCE6F0; color:var(--navy-soft); }
+  .badge-md{ background:var(--purple-soft); color:var(--purple); }
+  .badge-agm{ background:var(--teal-soft); color:var(--teal); }
+  .badge-mdstage{ background:#E8ECF2; color:var(--navy); }
+  .badge-approved{ background:var(--green-soft); color:var(--green); }
+  .badge-finalized{ background:var(--navy); color:#fff; }
+  .badge-rejected{ background:var(--brick-soft); color:var(--brick); }
+  .badge-info{ background:var(--amber-soft); color:var(--amber); }
+  .empty-state{ text-align:center; padding:60px 20px; color:var(--ink-soft); }
+  .empty-state .display{ font-size:20px; color:var(--ink); margin-bottom:6px; }
+
+  .detail-overlay{ position:fixed; inset:0; background:rgba(22,40,61,.45); display:none; align-items:flex-start; justify-content:center; padding:40px 20px; overflow-y:auto; z-index:50; }
+  .detail-overlay.show{ display:flex; }
+  .detail-card{ background:var(--paper); border-radius:16px; max-width:760px; width:100%; padding:30px 34px 34px; animation:rise .3s ease both; }
+  .detail-top{ display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:18px; gap:12px; flex-wrap:wrap; }
+  .close-btn{ background:none; border:none; font-size:20px; color:var(--ink-soft); line-height:1; }
+  .kv-grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px 24px; margin:14px 0 6px; font-size:13.5px; }
+  .kv-grid .k{ color:var(--ink-soft); font-size:11px; text-transform:uppercase; letter-spacing:.04em; font-family:'IBM Plex Mono',monospace; }
+  .kv-grid a{ color:var(--navy); }
+  .person-block{ border-top:1px solid var(--line); padding-top:16px; margin-top:16px; }
+  .person-block h3{ margin:0 0 10px; }
+  .review-actions{ display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+  textarea.review-note{ width:100%; border:1px solid var(--line); border-radius:9px; padding:10px 12px; font-size:13.5px; margin-top:10px; min-height:60px; resize:vertical; }
+
+  .admin-tabs{ display:flex; flex-wrap:wrap; gap:6px; margin-top:18px; border-top:1px solid var(--line); padding-top:16px; }
+  .admin-tabs button{ border:1px solid var(--line); background:var(--paper); padding:8px 14px; border-radius:8px; font-size:12.5px; font-weight:600; color:var(--ink-soft); }
+  .admin-tabs button.active{ background:var(--navy); color:#fff; border-color:var(--navy); }
+
+  .kpi{ flex:1; min-width:150px; background:var(--paper); border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+  .kpi .display{ font-size:22px; margin-top:6px; }
+
+  .toast{ position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(20px); opacity:0; background:var(--navy); color:#fff; padding:12px 22px; border-radius:99px; font-size:13.5px; transition:opacity .25s, transform .25s; z-index:100; pointer-events:none; max-width:90vw; text-align:center; }
+  .toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+
+  @media (max-width: 800px){
+    .apply-grid{ grid-template-columns:1fr; }
+    .steps{ position:static; flex-direction:row; overflow-x:auto; gap:6px; padding-bottom:6px;}
+    .step-item{ flex-direction:column; gap:4px; font-size:10.5px; text-align:center; min-width:64px; padding:8px 4px;}
+    .field-row{ grid-template-columns:1fr; }
+    .doc-grid{ grid-template-columns:1fr; }
+    .panel{ padding:22px; }
+    .kv-grid{ grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-mark" id="brandMark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 17L9 7L12 13L15 8L20 17" stroke="#C99A2E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="brand-text"><h1>Somo BNPL</h1><div class="eyebrow">KYC · EV · Motorcycle · Tricycle Financing</div></div>
+    </div>
+    <div class="topbar-right">
+      <div class="mode-toggle" id="modeToggle"></div>
+      <div class="auth-area" id="authArea"></div>
+    </div>
+  </div>
+
+  <div id="applyWrap">
+    <div class="panel" style="margin-bottom:16px; padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+      <div class="hint">Already applied and asked for more information? Resume with your reference code.</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <input type="text" id="resumeRefInput" placeholder="SOMO-APP-2026-XXXXX" style="border:1px solid var(--line); border-radius:9px; padding:8px 10px; font-size:13px;">
+        <button class="btn btn-ghost btn-sm" id="btnResume">Resume</button>
+      </div>
+    </div>
+    <div class="apply-grid">
+      <div class="steps" id="stepsNav"></div>
+      <div id="panelHost"></div>
+    </div>
+  </div>
+
+  <div id="voWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">Verification Officer</div>
+      <h2>Verification Queue</h2>
+      <div class="sub">Confirm documents, coordinates, and phone verification, then forward to BSM.</div>
+      <div class="review-list" id="voList"></div>
+    </div>
+  </div>
+
+  <div id="bsmWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">BSM</div>
+      <h2>BSM Review Queue</h2>
+      <div class="sub">Handles two checkpoints: the initial review after Verification, and the final review that sends a summary to the MD.</div>
+      <div class="review-list" id="bsmList"></div>
+    </div>
+  </div>
+
+  <div id="agmWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">AGM</div>
+      <h2>AGM Review Queue</h2>
+      <div class="sub">Applications cleared by BSM, awaiting AGM sign-off.</div>
+      <div class="review-list" id="agmList"></div>
+    </div>
+  </div>
+
+  <div id="cfoWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">CFO</div>
+      <h2>Financial Review Queue</h2>
+      <div class="sub">Applications cleared by the AGM, awaiting CFO sign-off.</div>
+      <div class="review-list" id="cfoList"></div>
+    </div>
+  </div>
+
+  <div id="mdWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">Managing Director</div>
+      <h2>Final Approval Queue</h2>
+      <div class="sub">Last checkpoint before a loan is approved and finalized.</div>
+      <div class="review-list" id="mdList"></div>
+    </div>
+  </div>
+
+  <div id="dashboardWrap" style="display:none;"></div>
+
+  <div id="adminWrap" style="display:none;">
+    <div class="panel" style="margin-bottom:20px;">
+      <div class="eyebrow">Admin</div>
+      <h2>Somo BNPL — Admin Console</h2>
+      <div class="sub">Manage vehicle pricing, extra document requests, stakeholder emails, team accounts, branding, and finalize approved loans.</div>
+      <div class="admin-tabs" id="adminTabs">
+        <button data-tab="overview" class="active">Overview</button>
+        <button data-tab="vehicles">Vehicle Pricing</button>
+        <button data-tab="fields">Info Requests</button>
+        <button data-tab="emails">Stakeholder Emails</button>
+        <button data-tab="accounts">Team Accounts</button>
+        <button data-tab="branding">Branding</button>
+        <button data-tab="loans">Approved Loans</button>
+      </div>
+    </div>
+    <div id="adminTabContent"></div>
+  </div>
+
+</div>
+
+<div class="detail-overlay" id="detailOverlay"><div class="detail-card" id="detailCard"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* ============================================================ SERVER STORAGE POLYFILL ============================================================ */
+/* Replaces the Claude-artifact-only window.storage API with a version that talks to the small
+   Express API in server.js, so every browser hitting this server shares the same data — the
+   Applicant Portal, Verification Officer, BSM, AGM, CFO, MD, and Admin can be different people
+   on different machines. */
+(function(){
+  const API = '/api/storage';
+  window.storage = {
+    async get(key, shared){
+      const res = await fetch(`${API}/${encodeURIComponent(key)}`);
+      if(res.status === 404) return null;
+      if(!res.ok) throw new Error('storage get failed: '+res.status);
+      return res.json();
+    },
+    async set(key, value, shared){
+      const res = await fetch(`${API}/${encodeURIComponent(key)}`, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ value })
+      });
+      if(!res.ok) throw new Error('storage set failed: '+res.status);
+      return res.json();
+    },
+    async delete(key, shared){
+      const res = await fetch(`${API}/${encodeURIComponent(key)}`, { method:'DELETE' });
+      if(!res.ok) throw new Error('storage delete failed: '+res.status);
+      return res.json();
+    },
+    async list(prefix, shared){
+      const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
+      const res = await fetch(`${API}${q}`);
+      if(!res.ok) throw new Error('storage list failed: '+res.status);
+      return res.json();
+    }
+  };
+})();
+
+/* ============================================================ STORAGE ============================================================ */
+async function storageGet(key, shared=false){
+  try{ const r = await window.storage.get(key, shared); return r ? JSON.parse(r.value) : null; }
+  catch(e){ return null; }
+}
+async function storageSet(key, value, shared=false){
+  try{ await window.storage.set(key, JSON.stringify(value), shared); return true; }
+  catch(e){ console.error('storage set failed', e); return false; }
+}
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2800);
+}
+
+/* ============================================================ ADMIN DATA ============================================================ */
+const ADMIN = { vehicles:[], customFields:[], emails:{}, accounts:[], logo:null };
+
+async function loadAdminData(){
+  let vehicles = await storageGet('vehicle-list', true);
+  if(!vehicles){
+    vehicles = [
+      { id:'v1', category:'EV', model:'Opibus e-Rider', price:15000 },
+      { id:'v2', category:'Motorcycle', model:'Bajaj Boxer 150', price:9500 },
+      { id:'v3', category:'Tricycle', model:'Aboboyaa King Cargo', price:13500 },
+    ];
+    await storageSet('vehicle-list', vehicles, true);
+  }
+  ADMIN.vehicles = vehicles;
+  ADMIN.customFields = (await storageGet('custom-fields', true)) || [];
+  ADMIN.emails = (await storageGet('stakeholder-emails', true)) || {};
+  ADMIN.logo = await storageGet('brand-logo', true);
+
+  let accounts = await storageGet('team-accounts', true);
+  if(!accounts){
+    accounts = [{ id:'seed-admin', name:'System Admin', email:'admin@somobnpl.com', role:'Admin', passcode:'0000', active:true }];
+    await storageSet('team-accounts', accounts, true);
+  }
+  ADMIN.accounts = accounts;
+
+  const mark = document.getElementById('brandMark');
+  if(mark){
+    mark.innerHTML = ADMIN.logo ? `<img src="${ADMIN.logo}" alt="Logo">` : `<svg viewBox="0 0 24 24" fill="none"><path d="M4 17L9 7L12 13L15 8L20 17" stroke="#C99A2E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  }
+}
+
+/* ============================================================ AUTH ============================================================ */
+let currentUser = null;
+let currentActiveMode = 'apply';
+const ROLE_ACCESS = {
+  'Admin': ['apply','vo','bsm','agm','cfo','md','dashboard','admin'],
+  'Verification Officer': ['apply','vo','dashboard'],
+  'BSM': ['apply','bsm','dashboard'],
+  'AGM': ['apply','agm','dashboard'],
+  'CFO': ['apply','cfo','dashboard'],
+  'MD': ['apply','md','dashboard'],
+};
+const MODE_LABELS = [
+  ['apply','Applicant Portal'], ['vo','Verification Officer'], ['bsm','BSM'], ['agm','AGM'],
+  ['cfo','CFO'], ['md','MD'], ['dashboard','Dashboard'], ['admin','Admin'],
+];
+function renderModeToggle(){
+  const allowed = currentUser ? (ROLE_ACCESS[currentUser.role]||['apply']) : ['apply'];
+  const el = document.getElementById('modeToggle');
+  el.innerHTML = MODE_LABELS.filter(([key])=>allowed.includes(key))
+    .map(([key,label])=>`<button data-mode="${key}" class="${key===currentActiveMode?'active':''}">${label}</button>`).join('');
+}
+function renderAuthArea(){
+  const el = document.getElementById('authArea');
+  if(!currentUser){ el.innerHTML = `<button class="btn btn-ghost btn-sm" id="btnSignIn">Staff Sign In</button>`; document.getElementById('btnSignIn').addEventListener('click', openSignInModal); }
+  else{
+    el.innerHTML = `<span class="badge badge-submitted">${currentUser.role}</span><span class="hint">${currentUser.name}</span><button class="btn btn-ghost btn-sm" id="btnSignOut">Sign out</button>`;
+    document.getElementById('btnSignOut').addEventListener('click', ()=>{ currentUser=null; toast('Signed out.'); afterAuthChange(); });
+  }
+}
+function afterAuthChange(){
+  renderModeToggle(); renderAuthArea();
+  const allowed = currentUser ? (ROLE_ACCESS[currentUser.role]||['apply']) : ['apply'];
+  setMode(allowed.includes(currentActiveMode) ? currentActiveMode : 'apply');
+}
+async function openSignInModal(){
+  await loadAdminData();
+  const active = (ADMIN.accounts||[]).filter(a=>a.active);
+  const overlay = document.getElementById('detailOverlay');
+  const card = document.getElementById('detailCard');
+  card.innerHTML = `
+    <div class="detail-top"><h2 style="font-size:19px; margin:0;">Staff Sign In</h2><button class="close-btn" id="closeDetail">✕</button></div>
+    <div class="hint" style="margin-bottom:14px;">Demo authentication only — passcodes are stored in plain text in shared artifact storage, visible to anyone with this link. Do not reuse real passwords; wire up real SSO/auth for production.</div>
+    <div class="field full"><label>Account</label>
+      <select id="signInAccount"><option value="">Select your account</option>${active.map(a=>`<option value="${a.id}">${a.name} — ${a.role}</option>`).join('')}</select>
+    </div>
+    <div class="field full" style="margin-top:12px;"><label>Passcode</label><input type="text" id="signInPasscode" placeholder="••••"></div>
+    <div class="review-actions" style="margin-top:16px;"><button class="btn btn-primary btn-sm" id="btnDoSignIn">Sign in</button></div>`;
+  overlay.classList.add('show');
+  document.getElementById('closeDetail').addEventListener('click', ()=>overlay.classList.remove('show'));
+  document.getElementById('btnDoSignIn').addEventListener('click', ()=>{
+    const id = document.getElementById('signInAccount').value;
+    const pass = document.getElementById('signInPasscode').value.trim();
+    const acc = active.find(a=>a.id===id);
+    if(!acc){ toast('Select an account.'); return; }
+    if(String(acc.passcode) !== pass){ toast('Incorrect passcode.'); return; }
+    currentUser = { id:acc.id, name:acc.name, role:acc.role, email:acc.email };
+    overlay.classList.remove('show');
+    toast(`Signed in as ${acc.name} (${acc.role})`);
+    afterAuthChange();
+  });
+}
+
+/* ============================================================ APPLICANT STATE ============================================================ */
+function blankPerson(){
+  return {
+    name:'', phone:'', relationship:'',
+    ghanaCard:{ number:'', file:null },
+    license:{ number:'', file:null },
+    residence:{ type:'', file:null },
+    statement:{ type:'', file:null },
+    location:{ lat:'', lng:'', digitalAddress:'', landmark:'' },
+    otpSent:false, otpCode:'', phoneVerified:false,
+  };
+}
+let state = {
+  step:0,
+  product:{ category:'', vehicleId:'', model:'', price:'', downpayment:'', tenure:'' },
+  applicant:blankPerson(),
+  guarantor:blankPerson(),
+  customAnswers:{},
+};
+state.applicant.dob = '';
+let existingRefCode = null;
+let lastSubmittedRecord = null;
+
+const STEP_LABELS = ['Product', 'Applicant', 'Guarantor', 'Review & Submit'];
+const GHANA_CARD_RE = /^GHA-\d{9}-\d$/i;
+const PHONE_RE = /^(0[2-9]\d{8}|\+233[2-9]\d{8})$/;
+
+function personMandatoryOk(p, requireStatement){
+  const ghOk = GHANA_CARD_RE.test(p.ghanaCard.number.trim()) && !!p.ghanaCard.file;
+  const resOk = !!p.residence.type && !!p.residence.file;
+  const stOk = requireStatement ? !!p.statement.file : true;
+  const locOk = !!p.location.lat && !!p.location.lng;
+  return ghOk && resOk && stOk && locOk;
+}
+function customFieldsValid(){
+  return (ADMIN.customFields||[]).filter(f=>f.mandatory).every(f=>{
+    const a = state.customAnswers[f.id];
+    return a && a.value;
+  });
+}
+function stepValid(step){
+  if(step===0){
+    const p = state.product;
+    if(!p.category || !p.vehicleId || !p.tenure) return false;
+    if(p.vehicleId==='__manual__') return p.model.trim().length>0 && Number(p.price)>0 && p.downpayment!=='';
+    return Number(p.price)>0 && p.downpayment!=='';
+  }
+  if(step===1){
+    const a = state.applicant;
+    return a.name.trim().length>1 && !!a.dob && PHONE_RE.test(a.phone.trim()) && a.phoneVerified && personMandatoryOk(a, true) && customFieldsValid();
+  }
+  if(step===2){
+    const g = state.guarantor;
+    return g.name.trim().length>1 && PHONE_RE.test(g.phone.trim()) && !!g.relationship && personMandatoryOk(g, false);
+  }
+  return true;
+}
+
+/* ============================================================ STEP NAV ============================================================ */
+function renderStepsNav(){
+  const el = document.getElementById('stepsNav');
+  el.innerHTML = STEP_LABELS.map((label,i)=>{
+    let cls = 'step-item';
+    if(i===state.step) cls += ' active'; else if(i<state.step) cls += ' done';
+    return `<div class="${cls}" data-step="${i}"><div class="num">${i<state.step?'✓':i+1}</div><div>${label}</div></div>`;
+  }).join('');
+  el.querySelectorAll('.step-item').forEach(node=>{
+    node.addEventListener('click', ()=>{
+      const target = Number(node.dataset.step);
+      if(target <= state.step || [0,1,2].slice(0,target).every(s=>stepValid(s))){ state.step = target; renderAll(); }
+    });
+  });
+}
+
+/* ============================================================ DOC STUB ============================================================ */
+function docStub({key, label, mandatory, numberField, numberValue, filePlaceholder, personPath, docKey}){
+  return `
+  <div class="doc-stub" id="stub-${key}">
+    <div class="doc-head"><div class="doc-name">${label}</div><div class="doc-tag ${mandatory?'tag-required':'tag-optional'}">${mandatory?'Mandatory':'Optional'}</div></div>
+    ${numberField ? `<div><label style="font-size:11.5px;">${numberField}</label><input type="text" class="doc-number-input" data-person="${personPath}" data-doc="${docKey}" placeholder="${filePlaceholder||''}" value="${numberValue||''}" style="margin-top:4px; width:100%;"></div>` : ''}
+    <input type="file" class="doc-file-input" data-person="${personPath}" data-doc="${docKey}" accept="image/*,.pdf">
+    <div class="doc-file-info" id="fileinfo-${key}"></div>
+    <div class="stamp">✓ Logged</div>
+  </div>`;
+}
+function getPerson(path){
+  if(path==='applicant') return state.applicant;
+  if(path==='guarantor') return state.guarantor;
+}
+function wireDocInputs(container){
+  container.querySelectorAll('.doc-file-input').forEach(input=>{
+    input.addEventListener('change', (e)=>{
+      const person = e.target.dataset.person, doc = e.target.dataset.doc, file = e.target.files[0];
+      const target = getPerson(person);
+      if(file){
+        target[doc].file = { name:file.name, size:file.size, type:file.type };
+        const key = `${person}-${doc}`;
+        const stub = document.getElementById(`stub-${key}`);
+        const info = document.getElementById(`fileinfo-${key}`);
+        if(stub) stub.classList.add('uploaded');
+        if(info){ info.classList.add('show'); info.innerHTML = `✓ ${file.name} <span style="color:var(--ink-soft); font-weight:400;">(${(file.size/1024).toFixed(0)} KB)</span>`; }
+      }
+    });
+  });
+  container.querySelectorAll('.doc-number-input').forEach(input=>{
+    input.addEventListener('input', (e)=>{ getPerson(e.target.dataset.person)[e.target.dataset.doc].number = e.target.value.toUpperCase(); });
+  });
+}
+
+/* ============================================================ LOCATION BLOCK ============================================================ */
+function locationBlock(path){
+  const p = getPerson(path);
+  const loc = p.location;
+  return `
+  <div class="section-divider"><div class="eyebrow">House Location</div><div class="line"></div></div>
+  <div class="location-box">
+    <div class="field-row">
+      <div class="field"><label>Latitude <span class="req">*</span></label><input type="text" class="loc-input" data-person="${path}" data-field="lat" value="${loc.lat}" placeholder="e.g. 5.6037"></div>
+      <div class="field"><label>Longitude <span class="req">*</span></label><input type="text" class="loc-input" data-person="${path}" data-field="lng" value="${loc.lng}" placeholder="e.g. -0.1870"></div>
+      <div class="field"><label>GhanaPostGPS digital address <span class="opt">Optional</span></label><input type="text" class="loc-input" data-person="${path}" data-field="digitalAddress" value="${loc.digitalAddress||''}" placeholder="e.g. GA-492-8776"></div>
+      <div class="field"><label>Landmark <span class="opt">Optional</span></label><input type="text" class="loc-input" data-person="${path}" data-field="landmark" value="${loc.landmark||''}" placeholder="e.g. Near Shell filling station"></div>
+    </div>
+    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+      <button type="button" class="btn btn-ghost btn-sm" data-gps="${path}">📍 Use my current location</button>
+      ${loc.lat && loc.lng ? `<a class="hint" href="https://www.google.com/maps?q=${loc.lat},${loc.lng}" target="_blank" rel="noopener">View pinned location on map ↗</a>` : `<span class="hint">No coordinates captured yet.</span>`}
+    </div>
+  </div>`;
+}
+function wireLocationInputs(container){
+  container.querySelectorAll('.loc-input').forEach(inp=>{
+    inp.addEventListener('input', e=>{ getPerson(e.target.dataset.person).location[e.target.dataset.field] = e.target.value; });
+    inp.addEventListener('blur', ()=>renderPanel());
+  });
+  container.querySelectorAll('[data-gps]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const person = btn.dataset.gps;
+      if(!navigator.geolocation){ toast('Geolocation not supported here — enter coordinates manually.'); return; }
+      btn.textContent = 'Locating…';
+      navigator.geolocation.getCurrentPosition(pos=>{
+        getPerson(person).location.lat = pos.coords.latitude.toFixed(6);
+        getPerson(person).location.lng = pos.coords.longitude.toFixed(6);
+        renderPanel(); toast('Location captured.');
+      }, ()=>{ btn.textContent = '📍 Use my current location'; toast('Could not get location — enter coordinates manually.'); }, {timeout:10000});
+    });
+  });
+}
+
+/* ============================================================ OTP VERIFICATION ============================================================ */
+function otpBlock(){
+  const a = state.applicant;
+  return `
+  <div class="section-divider"><div class="eyebrow">Phone Verification</div><div class="line"></div></div>
+  <div class="location-box">
+    ${a.phoneVerified ? `<div class="hint" style="color:var(--green); font-weight:600;">✓ Phone number verified</div>` : `
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+      <button type="button" class="btn btn-ghost btn-sm" id="btnSendOtp">Send verification code</button>
+      ${a.otpSent ? `<div class="field" style="margin:0;"><label>Enter 6-digit code</label><input type="text" id="otpInput" maxlength="6" placeholder="000000"></div><button type="button" class="btn btn-primary btn-sm" id="btnVerifyOtp">Verify</button>` : ''}
+    </div>
+    <div class="hint" style="margin-top:8px;">Demo only — no SMS gateway is connected, so the code appears in a notification instead of a real text message.</div>`}
+  </div>`;
+}
+function wireOtp(container){
+  const sendBtn = container.querySelector('#btnSendOtp');
+  if(sendBtn) sendBtn.addEventListener('click', ()=>{
+    if(!PHONE_RE.test(state.applicant.phone.trim())){ toast('Enter a valid phone number first.'); return; }
+    const code = Math.floor(100000+Math.random()*900000).toString();
+    state.applicant.otpCode = code; state.applicant.otpSent = true;
+    renderPanel();
+    toast(`Demo OTP for ${state.applicant.phone}: ${code} (simulated SMS)`);
+  });
+  const verifyBtn = container.querySelector('#btnVerifyOtp');
+  if(verifyBtn) verifyBtn.addEventListener('click', ()=>{
+    const inputEl = container.querySelector('#otpInput');
+    if(inputEl.value.trim() === state.applicant.otpCode){ state.applicant.phoneVerified = true; renderPanel(); toast('Phone verified ✓'); }
+    else toast('Incorrect code — try again.');
+  });
+}
+
+/* ============================================================ CUSTOM FIELDS ============================================================ */
+function customFieldsHtml(){
+  if(!ADMIN.customFields || ADMIN.customFields.length===0) return '';
+  return `
+  <div class="section-divider"><div class="eyebrow">Additional Information Requested</div><div class="line"></div></div>
+  <div class="field-row">
+    ${ADMIN.customFields.map(f=>{
+      const ans = state.customAnswers[f.id];
+      return `<div class="field full">
+        <label>${f.label} ${f.mandatory?'<span class="req">*</span>':'<span class="opt">Optional</span>'}</label>
+        ${f.type==='file' ? `<input type="file" class="custom-file-input" data-field="${f.id}">` : `<input type="text" class="custom-text-input" data-field="${f.id}" value="${(ans&&ans.value)||''}">`}
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+function wireCustomFields(container){
+  container.querySelectorAll('.custom-text-input').forEach(inp=>{
+    inp.addEventListener('input', e=>{ state.customAnswers[e.target.dataset.field] = { type:'text', value:e.target.value }; });
+  });
+  container.querySelectorAll('.custom-file-input').forEach(inp=>{
+    inp.addEventListener('change', e=>{
+      const file = e.target.files[0];
+      if(file) state.customAnswers[e.target.dataset.field] = { type:'file', value:{ name:file.name, size:file.size, type:file.type } };
+    });
+  });
+}
+
+/* ============================================================ PANELS ============================================================ */
+function renderPanel(){
+  const host = document.getElementById('panelHost');
+  let html = '';
+  if(state.step===0) html = panelProduct();
+  else if(state.step===1) html = panelPerson('applicant','Applicant Details','Tell us about the person taking the BNPL agreement.', true);
+  else if(state.step===2) html = panelPerson('guarantor','Guarantor','The guarantor who co-signs and vouches for the applicant.', false);
+  else if(state.step===3) html = panelReview();
+
+  host.innerHTML = `<div class="panel">${html}</div>`;
+  wireDocInputs(host); wireLocationInputs(host); wireCommonInputs(host); wireFooter(host);
+  if(state.step===1){ wireCustomFields(host); wireOtp(host); }
+  if(state.step===3) renderReviewChecklist();
+}
+
+function panelProduct(){
+  const p = state.product;
+  const categories = ['EV','Motorcycle','Tricycle'];
+  const models = ADMIN.vehicles.filter(v=>v.category===p.category);
+  return `
+  <div class="eyebrow">Step 1 of 4</div>
+  <h2>Financing Details</h2>
+  <div class="sub">Select the vehicle and proposed BNPL terms. Prices are set by Somo BNPL admin.</div>
+  <div class="field-row">
+    <div class="field">
+      <label>Vehicle category <span class="req">*</span></label>
+      <select id="p-category">
+        <option value="">Select category</option>
+        ${categories.map(c=>`<option value="${c}" ${p.category===c?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field">
+      <label>Model <span class="req">*</span></label>
+      <select id="p-model" ${!p.category?'disabled':''}>
+        <option value="">${p.category ? 'Select model' : 'Select category first'}</option>
+        ${models.map(v=>`<option value="${v.id}" ${p.vehicleId===v.id?'selected':''}>${v.model} — GHS ${v.price}</option>`).join('')}
+        ${p.category ? `<option value="__manual__" ${p.vehicleId==='__manual__'?'selected':''}>Other / not listed</option>` : ''}
+      </select>
+    </div>
+    ${p.vehicleId==='__manual__' ? `
+    <div class="field"><label>Model name</label><input type="text" id="p-manual-model" value="${p.model||''}" placeholder="e.g. Custom import model"></div>
+    <div class="field"><label>Price (GHS) <span class="req">*</span></label><input type="number" id="p-manual-price" value="${p.price||''}" min="0"></div>
+    ` : `<div class="field"><label>Price (GHS)</label><input type="text" value="GHS ${p.price||0}" disabled></div>`}
+    <div class="field"><label>Down payment (GHS) <span class="req">*</span></label><input type="number" id="p-down" min="0" value="${p.downpayment}" placeholder="e.g. 3600"></div>
+    <div class="field full">
+      <label>Repayment tenure (months) <span class="req">*</span></label>
+      <select id="p-tenure">
+        <option value="">Select tenure</option>
+        ${['6','12','18','24'].map(t=>`<option value="${t}" ${p.tenure===t?'selected':''}>${t} months</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  ${footerHtml()}
+  `;
+}
+
+function personDocsHtml(path, requireStatement){
+  const p = getPerson(path);
+  return `<div class="doc-grid">
+    ${docStub({key:`${path}-ghanaCard`, label:'National ID — Ghana Card', mandatory:true, numberField:'Ghana Card number', numberValue:p.ghanaCard.number, filePlaceholder:'GHA-000000000-0', personPath:path, docKey:'ghanaCard'})}
+    ${docStub({key:`${path}-license`, label:"Driver's Licence", mandatory:false, numberField:'Licence number', numberValue:p.license.number, filePlaceholder:'Optional', personPath:path, docKey:'license'})}
+    ${docStub({key:`${path}-residence`, label:'Proof of Residence', mandatory:true, numberField:false, personPath:path, docKey:'residence'})}
+    ${docStub({key:`${path}-statement`, label:'Bank / MoMo Statement', mandatory:requireStatement, numberField:false, personPath:path, docKey:'statement'})}
+  </div>`;
+}
+
+function panelPerson(path, title, sub, isApplicant){
+  const p = getPerson(path);
+  return `
+  <div class="eyebrow">Step ${state.step+1} of 4</div>
+  <h2>${title}</h2>
+  <div class="sub">${sub}</div>
+  <div class="field-row">
+    <div class="field full"><label>Full name <span class="req">*</span></label><input type="text" id="f-name" value="${p.name}" placeholder="As it appears on Ghana Card"></div>
+    ${isApplicant ? `<div class="field"><label>Date of birth <span class="req">*</span></label><input type="date" id="f-dob" value="${state.applicant.dob}"></div>` : `
+    <div class="field"><label>Relationship to applicant <span class="req">*</span></label>
+      <select id="f-relationship"><option value="">Select</option>${['Parent','Sibling','Spouse','Employer','Business partner','Landlord','Friend (5+ yrs)','Other'].map(r=>`<option value="${r}" ${p.relationship===r?'selected':''}>${r}</option>`).join('')}</select>
+    </div>`}
+    <div class="field"><label>Phone number <span class="req">*</span></label><input type="tel" id="f-phone" value="${p.phone}" placeholder="024XXXXXXX"></div>
+  </div>
+  ${isApplicant ? otpBlock() : ''}
+  <div class="section-divider"><div class="eyebrow">Verification Ledger</div><div class="line"></div></div>
+  <div class="hint" style="margin-bottom:14px;">Ghana Card and Proof of Residence are mandatory. Coordinates for this person's house are also required.</div>
+  ${personDocsHtml(path, isApplicant)}
+  <div class="field full" style="margin-top:18px; max-width:340px;">
+    <label>Proof of residence type</label>
+    <select id="f-residence-type"><option value="">Select type</option>${['Utility bill (ECG/GWCL)','Tenancy agreement','Assembly member letter','Employer letter'].map(r=>`<option value="${r}" ${p.residence.type===r?'selected':''}>${r}</option>`).join('')}</select>
+  </div>
+  ${locationBlock(path)}
+  ${isApplicant ? customFieldsHtml() : ''}
+  ${footerHtml()}
+  `;
+}
+
+function footerHtml(){
+  const isLast = state.step===2;
+  return `<div class="footer-nav">
+    <button class="btn btn-ghost" id="btnBack" ${state.step===0?'style="visibility:hidden;"':''}>Back</button>
+    <button class="btn btn-primary" id="btnNext">${isLast? 'Review application' : 'Continue'}</button>
+  </div>`;
+}
+
+function wireCommonInputs(host){
+  const bindText = (id, setter)=>{ const el = host.querySelector(id); if(el) el.addEventListener('input', e=>setter(e.target.value)); };
+  const bindChange = (id, setter, rerender)=>{ const el = host.querySelector(id); if(el) el.addEventListener('change', e=>{ setter(e.target.value); if(rerender) renderPanel(); }); };
+
+  if(state.step===0){
+    bindChange('#p-category', v=>{ state.product.category=v; state.product.vehicleId=''; state.product.model=''; state.product.price=''; }, true);
+    bindChange('#p-model', v=>{
+      if(v==='__manual__'){ state.product.vehicleId='__manual__'; state.product.model=''; state.product.price=''; }
+      else{ const veh = ADMIN.vehicles.find(x=>x.id===v); state.product.vehicleId=v; state.product.model = veh?veh.model:''; state.product.price = veh?veh.price:''; }
+    }, true);
+    bindText('#p-manual-model', v=>state.product.model=v);
+    bindText('#p-manual-price', v=>state.product.price=v);
+    bindText('#p-down', v=>state.product.downpayment=v);
+    bindChange('#p-tenure', v=>state.product.tenure=v);
+  } else if(state.step===1 || state.step===2){
+    const path = state.step===1?'applicant':'guarantor';
+    const p = getPerson(path);
+    bindText('#f-name', v=>p.name=v);
+    bindText('#f-phone', v=>p.phone=v);
+    if(state.step===1) bindChange('#f-dob', v=>state.applicant.dob=v);
+    else bindChange('#f-relationship', v=>p.relationship=v);
+    bindChange('#f-residence-type', v=>p.residence.type=v);
+  }
+}
+
+function wireFooter(host){
+  const back = host.querySelector('#btnBack');
+  const next = host.querySelector('#btnNext');
+  if(back) back.addEventListener('click', ()=>{ state.step = Math.max(0,state.step-1); renderAll(); });
+  if(next) next.addEventListener('click', ()=>{
+    if(stepValid(state.step)){ state.step = Math.min(3, state.step+1); renderAll(); }
+    else toast('Please complete all mandatory fields, documents, phone verification, and location coordinates before continuing.');
+  });
+}
+
+/* ============================================================ RESUME APPLICATION ============================================================ */
+function loadRecordIntoState(rec){
+  existingRefCode = rec.refCode;
+  state.product = rec.product;
+  state.applicant = Object.assign(blankPerson(), rec.applicant, { dob: rec.applicant.dob });
+  state.guarantor = Object.assign(blankPerson(), rec.guarantor);
+  state.customAnswers = rec.customAnswers || {};
+  state.step = 0;
+}
+async function resumeApplication(){
+  const ref = document.getElementById('resumeRefInput').value.trim().toUpperCase();
+  if(!ref){ toast('Enter your application reference code.'); return; }
+  const rec = await storageGet(`application:${ref}`, true);
+  if(!rec){ toast('No application found with that reference.'); return; }
+  if(rec.status !== 'Needs more info'){ toast(`This application is currently "${rec.status}" and cannot be edited.`); return; }
+  loadRecordIntoState(rec);
+  renderAll();
+  toast('Application loaded — make your changes and resubmit.');
+}
+
+/* ============================================================ REVIEW & SUBMIT ============================================================ */
+function completenessData(){
+  const items = [
+    ['Product & terms selected', !!state.product.category && !!state.product.vehicleId && Number(state.product.price)>0 && !!state.product.tenure],
+    ['Applicant: Phone verified (OTP)', !!state.applicant.phoneVerified],
+    ['Applicant: Ghana Card', GHANA_CARD_RE.test(state.applicant.ghanaCard.number.trim()) && !!state.applicant.ghanaCard.file],
+    ['Applicant: Proof of residence', !!state.applicant.residence.type && !!state.applicant.residence.file],
+    ['Applicant: Bank / MoMo statement', !!state.applicant.statement.file],
+    ['Applicant: House coordinates', !!state.applicant.location.lat && !!state.applicant.location.lng],
+    ['Guarantor: Ghana Card', GHANA_CARD_RE.test(state.guarantor.ghanaCard.number.trim()) && !!state.guarantor.ghanaCard.file],
+    ['Guarantor: Proof of residence', !!state.guarantor.residence.type && !!state.guarantor.residence.file],
+    ['Guarantor: House coordinates', !!state.guarantor.location.lat && !!state.guarantor.location.lng],
+  ];
+  (ADMIN.customFields||[]).filter(f=>f.mandatory).forEach(f=>{
+    const ans = state.customAnswers[f.id];
+    items.push([`Additional: ${f.label}`, !!(ans && ans.value)]);
+  });
+  const passed = items.filter(i=>i[1]).length;
+  return { items, pct: Math.round(passed/items.length*100) };
+}
+
+function panelReview(){
+  return `
+  <div class="eyebrow">Step 4 of 4</div>
+  <h2>Review &amp; Submit</h2>
+  <div class="sub">Confirm every mandatory item before this file enters the Verification Officer queue.</div>
+  <div id="reviewChecklistHost"></div>
+  <div class="footer-nav">
+    <button class="btn btn-ghost" id="btnBack">Back</button>
+    <button class="btn btn-gold" id="btnSubmit">Submit for KYC review</button>
+  </div>
+  <div class="ref-box" id="refBox">
+    <div class="eyebrow">Application reference</div>
+    <div class="refcode mono" id="refCodeText"></div>
+    <div class="hint" style="margin-top:6px; margin-bottom:10px;">Save this reference. Switch to Verification Officer to see it enter the queue.</div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-ghost btn-sm" id="btnDownloadOwnPdf">Download as PDF</button>
+      <button class="btn btn-ghost btn-sm" id="btnDownloadOwnWord">Download as Word</button>
+    </div>
+  </div>`;
+}
+function renderReviewChecklist(){
+  const host = document.getElementById('reviewChecklistHost');
+  const { items, pct } = completenessData();
+  host.innerHTML = `
+    <div class="eyebrow">Completeness — ${pct}%</div>
+    <div class="meter"><div style="width:${pct}%"></div></div>
+    <div class="checklist">${items.map(([label, ok])=>`<div class="check-row"><div class="dot ${ok?'dot-ok':'dot-bad'}"></div>${label}</div>`).join('')}</div>`;
+  document.getElementById('btnBack').addEventListener('click', ()=>{ state.step=2; renderAll(); });
+  document.getElementById('btnSubmit').addEventListener('click', submitApplication);
+}
+
+function genRefCode(){ return `SOMO-APP-${new Date().getFullYear()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`; }
+
+async function submitApplication(){
+  const { pct } = completenessData();
+  if(pct < 100){ toast('All mandatory items must be complete before submitting.'); return; }
+  const refCode = existingRefCode || genRefCode();
+  const record = {
+    refCode, submittedAt:new Date().toISOString(), status:'Submitted',
+    approvals:{}, finalized:false, customerId:null, financing:null,
+    product: state.product, applicant: state.applicant, guarantor: state.guarantor,
+    customAnswers: state.customAnswers,
+  };
+  const ok = await storageSet(`application:${refCode}`, record, true);
+  if(!ok){ toast('Could not submit — please try again.'); return; }
+  if(!existingRefCode){
+    const index = (await storageGet('applications-index', true)) || [];
+    index.unshift(refCode);
+    await storageSet('applications-index', index, true);
+  }
+  existingRefCode = null;
+  lastSubmittedRecord = record;
+
+  document.getElementById('refBox').classList.add('show');
+  document.getElementById('refCodeText').textContent = refCode;
+  document.getElementById('btnSubmit').disabled = true;
+  document.getElementById('btnSubmit').textContent = 'Submitted ✓';
+  document.getElementById('btnDownloadOwnPdf').addEventListener('click', ()=>buildPdfDoc(record));
+  document.getElementById('btnDownloadOwnWord').addEventListener('click', ()=>buildWordDoc(record));
+  toast('Application submitted for KYC review.');
+}
+
+/* ============================================================ ROLE CONSOLES ============================================================ */
+function badgeClass(status){
+  switch(status){
+    case 'Submitted': return 'badge-submitted';
+    case 'BSM Review 1': return 'badge-cfo';
+    case 'AGM Review': return 'badge-agm';
+    case 'CFO Review': return 'badge-md';
+    case 'BSM Review 2': return 'badge-info';
+    case 'MD Review': return 'badge-mdstage';
+    case 'Approved': return 'badge-approved';
+    case 'Finalized': return 'badge-finalized';
+    case 'Rejected': return 'badge-rejected';
+    case 'Needs more info': return 'badge-info';
+    default: return 'badge-submitted';
+  }
+}
+async function fetchAllApplications(){
+  const index = (await storageGet('applications-index', true)) || [];
+  const records = [];
+  for(const ref of index){ const rec = await storageGet(`application:${ref}`, true); if(rec) records.push(rec); }
+  records.sort((a,b)=> new Date(b.submittedAt)-new Date(a.submittedAt));
+  return records;
+}
+async function renderRoleList(containerId, statuses, role){
+  const el = document.getElementById(containerId);
+  if(!el) return;
+  el.innerHTML = `<div class="empty-state">Loading…</div>`;
+  const records = await fetchAllApplications();
+  const filtered = statuses ? records.filter(r=>statuses.includes(r.status)) : records;
+  if(filtered.length===0){
+    el.innerHTML = `<div class="empty-state"><div class="display">Nothing here right now</div>Applications will appear once they reach this stage.</div>`;
+    return;
+  }
+  el.innerHTML = filtered.map(rec=>`
+    <div class="app-card" data-ref="${rec.refCode}">
+      <div class="left"><div class="ref mono">${rec.refCode}${rec.customerId?` · <span style="color:var(--green);">${rec.customerId}</span>`:''}</div>
+      <div class="meta">${rec.applicant.name||'Unnamed'} · ${rec.product.category||'—'}${rec.product.model?' · '+rec.product.model:''} · GHS ${rec.product.price||0} · ${new Date(rec.submittedAt).toLocaleDateString()}</div></div>
+      <div class="badge ${badgeClass(rec.status)}">${rec.status}</div>
+    </div>`).join('');
+  el.querySelectorAll('.app-card').forEach(card=>card.addEventListener('click', ()=>openDetail(card.dataset.ref, records, role)));
+}
+
+function personKvHtml(title, p, showRelationship){
+  const loc = p.location||{};
+  return `<div class="person-block"><h3>${title}</h3><div class="kv-grid">
+    <div><div class="k">Name</div>${p.name||'—'}</div>
+    <div><div class="k">Phone</div>${p.phone||'—'}${p.phoneVerified?' <span style="color:var(--green);">✓ verified</span>':''}</div>
+    ${showRelationship ? `<div><div class="k">Relationship</div>${p.relationship||'—'}</div>` : `<div><div class="k">Date of birth</div>${p.dob||'—'}</div>`}
+    <div><div class="k">Ghana Card No.</div>${p.ghanaCard.number||'—'} ${p.ghanaCard.file?'<span class="mono" style="color:var(--green);">✓ file</span>':'<span style="color:var(--brick);">missing</span>'}</div>
+    <div><div class="k">Driver's Licence</div>${p.license.file ? (p.license.number||'On file') : 'Not provided'}</div>
+    <div><div class="k">Proof of residence</div>${p.residence.type||'—'} ${p.residence.file?'<span class="mono" style="color:var(--green);">✓ file</span>':'<span style="color:var(--brick);">missing</span>'}</div>
+    <div><div class="k">Bank / MoMo statement</div>${p.statement.file ? '✓ file on record' : 'Not provided'}</div>
+    <div><div class="k">House coordinates</div>${loc.lat&&loc.lng? `<a href="https://www.google.com/maps?q=${loc.lat},${loc.lng}" target="_blank" rel="noopener">${loc.lat}, ${loc.lng} ↗</a>` : '<span style="color:var(--brick);">missing</span>'}</div>
+    <div><div class="k">Digital address / landmark</div>${loc.digitalAddress||'—'}${loc.landmark? ' · '+loc.landmark : ''}</div>
+  </div></div>`;
+}
+function customAnswersHtml(rec){
+  const fields = ADMIN.customFields||[];
+  if(fields.length===0) return '';
+  return `<div class="person-block"><h3>Additional Information</h3><div class="kv-grid">
+    ${fields.map(f=>{ const ans = rec.customAnswers ? rec.customAnswers[f.id] : null; let val='—';
+      if(ans) val = ans.type==='file' ? (ans.value?`✓ ${ans.value.name}`:'—') : (ans.value||'—');
+      return `<div><div class="k">${f.label}</div>${val}</div>`; }).join('')}
+  </div></div>`;
+}
+function approvalsLogHtml(rec){
+  const stages = [['vo','Verification Officer'],['bsm1','BSM (Initial)'],['agm','AGM'],['cfo','CFO'],['bsm2','BSM (Final)'],['md','MD']];
+  const rows = stages.filter(([k])=>rec.approvals && rec.approvals[k]).map(([k,label])=>{
+    const a = rec.approvals[k];
+    const ok = a.decision==='Approve' || a.decision==='Sent to MD';
+    return `<div class="check-row"><div class="dot ${ok?'dot-ok':'dot-bad'}"></div><strong>${label}</strong>: ${a.decision}${a.by?` — ${a.by}`:''}${a.note?` ("${a.note}")`:''}</div>`;
+  }).join('');
+  return rows ? `<div class="person-block"><h3>Approval Trail</h3><div class="checklist">${rows}</div></div>` : '';
+}
+function decisionForm(stageKey, actions){
+  return `<div class="section-divider"><div class="eyebrow">Decision</div><div class="line"></div></div>
+  <div class="field full"><label>Reviewed by</label><input type="text" id="reviewerName" placeholder="Your name" value="${currentUser?currentUser.name:''}"></div>
+  <textarea class="review-note" id="reviewNoteInput" placeholder="Note (optional)"></textarea>
+  <div class="review-actions">${actions.map(([decision,label,cls])=>`<button class="btn ${cls} btn-sm" data-stage="${stageKey}" data-decision="${decision}">${label}</button>`).join('')}</div>`;
+}
+function sendToMdHtml(){
+  return `<div class="section-divider"><div class="eyebrow">Send to MD for Final Approval</div><div class="line"></div></div>
+  <div class="hint" style="margin-bottom:12px;">This downloads a PDF summary of the application and opens your email client addressed to the MD. Please attach the downloaded file — mailto links can't attach files automatically.</div>
+  <div class="field full"><label>Your name</label><input type="text" id="reviewerName" value="${currentUser?currentUser.name:''}"></div>
+  <textarea class="review-note" id="reviewNoteInput" placeholder="Note to MD (optional)"></textarea>
+  <div class="review-actions"><button class="btn btn-green btn-sm" id="btnSendMdBtn">Download PDF &amp; email MD</button><button class="btn btn-brick btn-sm" data-stage="bsm2" data-decision="Reject">Reject</button></div>`;
+}
+function finalizeFormHtml(){
+  const today = new Date().toISOString().slice(0,10);
+  return `<div class="section-divider"><div class="eyebrow">Finalize Loan</div><div class="line"></div></div>
+  <div class="hint" style="margin-bottom:12px;">Set the repayment frequency to generate the customer ID, payment schedule, and Excel record.</div>
+  <div class="field-row">
+    <div class="field"><label>Repayment frequency <span class="req">*</span></label>
+      <select id="finFrequency"><option value="Monthly">Monthly</option><option value="Bi-weekly">Bi-weekly</option><option value="Weekly">Weekly</option><option value="Daily">Daily</option></select>
+    </div>
+    <div class="field"><label>Markup / service fee (%)</label><input type="number" id="finMarkup" value="0" min="0" step="0.5"></div>
+    <div class="field"><label>Schedule start date</label><input type="date" id="finStart" value="${today}"></div>
+  </div>
+  <div class="review-actions"><button class="btn btn-gold btn-sm" id="btnFinalize">Generate ID, schedule &amp; Excel</button></div>
+  <div id="finalizeResult"></div>`;
+}
+function scheduleTableHtml(rec){
+  const rows = rec.financing.schedule.map(inst=>`
+    <div class="app-card" style="cursor:default;">
+      <div class="left"><div class="ref">#${inst.no} — ${inst.dueDate}</div><div class="meta">GHS ${inst.amount}</div></div>
+      <button class="btn btn-sm ${inst.paid?'btn-green':'btn-ghost'}" data-mark-paid="${inst.no}">${inst.paid?'Paid ✓':'Mark paid'}</button>
+    </div>`).join('');
+  return `<div class="section-divider"><div class="eyebrow">Payment Schedule</div><div class="line"></div></div>
+  <div class="review-list" style="max-height:280px; overflow-y:auto;">${rows}</div>`;
+}
+const STAGE_CONFIG = [
+  { key:'vo', role:'vo', incoming:['Submitted','Needs more info'], approvedTo:'BSM Review 1', allowInfo:true, nextLabel:'Send to BSM' },
+  { key:'bsm1', role:'bsm', incoming:['BSM Review 1'], approvedTo:'AGM Review', nextLabel:'Send to AGM' },
+  { key:'agm', role:'agm', incoming:['AGM Review'], approvedTo:'CFO Review', nextLabel:'Send to CFO' },
+  { key:'cfo', role:'cfo', incoming:['CFO Review'], approvedTo:'BSM Review 2', nextLabel:'Send to BSM (final)' },
+  { key:'bsm2', role:'bsm', incoming:['BSM Review 2'], approvedTo:'MD Review', special:true },
+  { key:'md', role:'md', incoming:['MD Review'], approvedTo:'Approved', nextLabel:'Give final approval' },
+];
+function findStage(status, role){ return STAGE_CONFIG.find(s=>s.role===role && s.incoming.includes(status)); }
+
+function actionAreaHtml(rec, role){
+  const stage = findStage(rec.status, role);
+  if(stage){
+    if(stage.special) return sendToMdHtml();
+    const actions = [['Approve', stage.nextLabel, 'btn-green']];
+    if(stage.allowInfo) actions.push(['Needs more info','Request more info','btn-amber']);
+    actions.push(['Reject','Reject application','btn-brick']);
+    return decisionForm(stage.key, actions);
+  }
+  if(role==='admin' && rec.status==='Approved' && !rec.finalized) return finalizeFormHtml();
+  if(role==='admin' && rec.finalized){
+    return `<div class="section-divider"><div class="eyebrow">Finalized</div><div class="line"></div></div>
+    <div class="kv-grid">
+      <div><div class="k">Customer ID</div><span class="mono">${rec.customerId}</span></div>
+      <div><div class="k">Frequency</div>${rec.financing.frequency}</div>
+      <div><div class="k">Installment</div>GHS ${rec.financing.installment}</div>
+      <div><div class="k">Installments</div>${rec.financing.periods}</div>
+    </div>
+    <div class="review-actions">
+      <button class="btn btn-gold btn-sm" id="btnRedownload">Download Excel again</button>
+      <button class="btn btn-primary btn-sm" id="btnResend">Resend report to stakeholders</button>
+    </div>
+    ${scheduleTableHtml(rec)}`;
+  }
+  return `<div class="hint" style="margin-top:16px;">This application is awaiting action at the <strong>${rec.status}</strong> stage.</div>`;
+}
+
+function openDetail(ref, records, role){
+  const rec = records.find(r=>r.refCode===ref);
+  if(!rec) return;
+  const overlay = document.getElementById('detailOverlay');
+  const card = document.getElementById('detailCard');
+  card.innerHTML = `
+    <div class="detail-top">
+      <div><div class="eyebrow">Application · <span class="badge ${badgeClass(rec.status)}" style="margin-left:6px;">${rec.status}</span></div>
+      <h2 class="mono" style="font-size:20px; margin:4px 0 0;">${rec.refCode}</h2></div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="btn btn-ghost btn-sm" id="btnDetailPdf">PDF</button>
+        <button class="btn btn-ghost btn-sm" id="btnDetailWord">Word</button>
+        <button class="close-btn" id="closeDetail">✕</button>
+      </div>
+    </div>
+    <div class="kv-grid">
+      <div><div class="k">Category</div>${rec.product.category}</div>
+      <div><div class="k">Model</div>${rec.product.model||'—'}</div>
+      <div><div class="k">Price</div>GHS ${rec.product.price}</div>
+      <div><div class="k">Down payment</div>GHS ${rec.product.downpayment}</div>
+      <div><div class="k">Tenure</div>${rec.product.tenure} months</div>
+    </div>
+    ${personKvHtml('Applicant', rec.applicant, false)}
+    ${personKvHtml('Guarantor', rec.guarantor, true)}
+    ${customAnswersHtml(rec)}
+    ${approvalsLogHtml(rec)}
+    ${actionAreaHtml(rec, role)}
+  `;
+  overlay.classList.add('show');
+  document.getElementById('closeDetail').addEventListener('click', ()=>overlay.classList.remove('show'));
+  document.getElementById('btnDetailPdf').addEventListener('click', ()=>buildPdfDoc(rec));
+  document.getElementById('btnDetailWord').addEventListener('click', ()=>buildWordDoc(rec));
+
+  card.querySelectorAll('[data-stage][data-decision]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const stageKey = btn.dataset.stage, decision = btn.dataset.decision;
+      const name = document.getElementById('reviewerName').value.trim();
+      const note = document.getElementById('reviewNoteInput').value.trim();
+      if(!name){ toast('Please enter your name before recording a decision.'); return; }
+      rec.approvals = rec.approvals || {};
+      rec.approvals[stageKey] = { decision, by:name, note, at:new Date().toISOString() };
+      if(decision==='Approve'){
+        const cfg = STAGE_CONFIG.find(s=>s.key===stageKey);
+        rec.status = cfg.approvedTo;
+      } else if(decision==='Reject') rec.status = 'Rejected';
+      else rec.status = 'Needs more info';
+      await storageSet(`application:${rec.refCode}`, rec, true);
+      overlay.classList.remove('show');
+      toast(`${rec.refCode} → ${rec.status}`);
+      setMode(role);
+    });
+  });
+  const finBtn = card.querySelector('#btnFinalize');
+  if(finBtn) finBtn.addEventListener('click', ()=>finalizeLoan(rec));
+  const redl = card.querySelector('#btnRedownload');
+  if(redl) redl.addEventListener('click', ()=>downloadExcel(rec, rec.financing, rec.customerId));
+  const resend = card.querySelector('#btnResend');
+  if(resend) resend.addEventListener('click', ()=>sendReport(rec, rec.financing, rec.customerId));
+  const sendMdBtn = card.querySelector('#btnSendMdBtn');
+  if(sendMdBtn) sendMdBtn.addEventListener('click', async ()=>{
+    const name = document.getElementById('reviewerName').value.trim();
+    const note = document.getElementById('reviewNoteInput').value.trim();
+    if(!name){ toast('Enter your name first.'); return; }
+    buildPdfDoc(rec);
+    const mdEmail = (ADMIN.emails && ADMIN.emails.md) || '';
+    if(!mdEmail) toast('No MD email on file — add one in Admin → Stakeholder Emails.');
+    const subject = `Somo BNPL — Approval needed: ${rec.applicant.name} (${rec.refCode})`;
+    const body = `Dear MD,\n\nPlease find attached the application summary for ${rec.applicant.name} (${rec.refCode}) for your final approval.\n\nVehicle: ${rec.product.category} - ${rec.product.model}\nPrice: GHS ${rec.product.price}\n\nNote from BSM: ${note||'—'}\n\nRegards,\n${name}`;
+    window.open(`mailto:${mdEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
+    rec.approvals = rec.approvals || {};
+    rec.approvals['bsm2'] = { decision:'Sent to MD', by:name, note, at:new Date().toISOString() };
+    rec.status = 'MD Review';
+    await storageSet(`application:${rec.refCode}`, rec, true);
+    overlay.classList.remove('show');
+    toast('PDF downloaded and email opened — remember to attach the file.');
+    setMode(role);
+  });
+  card.querySelectorAll('[data-mark-paid]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const no = Number(btn.dataset.markPaid);
+      const inst = rec.financing.schedule.find(s=>s.no===no);
+      inst.paid = !inst.paid; inst.paidAt = inst.paid? new Date().toISOString() : null;
+      await storageSet(`application:${rec.refCode}`, rec, true);
+      openDetail(rec.refCode, records, role);
+    });
+  });
+}
+
+/* ============================================================ PDF & WORD EXPORT (with logo) ============================================================ */
+function buildPdfDoc(rec){
+  if(!window.jspdf){ toast('PDF library did not load — check your connection.'); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'a4' });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  let y = 40;
+  let titleX = 40;
+
+  if(ADMIN.logo){
+    try{ doc.addImage(ADMIN.logo, 40, y-10, 90, 40); titleX = 145; }catch(e){ /* skip bad image */ }
+  }
+  doc.setFontSize(16); doc.setTextColor(22,40,61);
+  doc.text('Somo BNPL', titleX, y+8);
+  doc.setFontSize(11); doc.setTextColor(91,95,107);
+  doc.text('Application Summary', titleX, y+24);
+  y += 55;
+  doc.setDrawColor(228,223,211); doc.line(40,y,pageWidth-40,y); y += 20;
+
+  const checkPage = (need)=>{ if(y > pageHeight - (need||60)){ doc.addPage(); y = 40; } };
+  const addKv = (label, value)=>{
+    checkPage(34);
+    doc.setFontSize(8.5); doc.setTextColor(91,95,107);
+    doc.text(String(label).toUpperCase(), 40, y);
+    doc.setFontSize(11); doc.setTextColor(31,36,48);
+    doc.text(String(value===undefined||value===null||value===''?'—':value), 40, y+13);
+    y += 28;
+  };
+  const addSectionTitle = (t)=>{
+    checkPage(50);
+    doc.setFontSize(13); doc.setTextColor(22,40,61); doc.text(t, 40, y); y += 16;
+    doc.setDrawColor(228,223,211); doc.line(40,y,pageWidth-40,y); y += 16;
+  };
+
+  addKv('Reference', rec.refCode);
+  addKv('Status', rec.status);
+  addKv('Submitted', new Date(rec.submittedAt).toLocaleString());
+  if(rec.customerId) addKv('Customer ID', rec.customerId);
+
+  addSectionTitle('Financing');
+  addKv('Category', rec.product.category);
+  addKv('Model', rec.product.model);
+  addKv('Price (GHS)', rec.product.price);
+  addKv('Down payment (GHS)', rec.product.downpayment);
+  addKv('Tenure (months)', rec.product.tenure);
+
+  const addPerson = (title, p, showRel)=>{
+    addSectionTitle(title);
+    addKv('Name', p.name);
+    addKv('Phone', p.phone + (p.phoneVerified ? ' (verified)' : ''));
+    addKv(showRel ? 'Relationship' : 'Date of birth', showRel ? p.relationship : p.dob);
+    addKv('Ghana Card', (p.ghanaCard.number||'—') + (p.ghanaCard.file ? ' — file on record' : ' — MISSING'));
+    addKv("Driver's Licence", p.license.file ? (p.license.number||'On file') : 'Not provided');
+    addKv('Proof of residence', (p.residence.type||'—') + (p.residence.file ? ' — file on record' : ' — MISSING'));
+    addKv('Bank/MoMo statement', p.statement.file ? 'On record' : 'Not provided');
+    addKv('House coordinates', (p.location.lat && p.location.lng) ? `${p.location.lat}, ${p.location.lng}` : 'MISSING');
+    addKv('Digital address / landmark', (p.location.digitalAddress||'—') + (p.location.landmark ? ' · '+p.location.landmark : ''));
+  };
+  addPerson('Applicant', rec.applicant, false);
+  addPerson('Guarantor', rec.guarantor, true);
+
+  if(ADMIN.customFields && ADMIN.customFields.length){
+    addSectionTitle('Additional Information');
+    ADMIN.customFields.forEach(f=>{
+      const ans = rec.customAnswers ? rec.customAnswers[f.id] : null;
+      let val = '—';
+      if(ans) val = ans.type==='file' ? (ans.value ? ('File: '+ans.value.name) : '—') : (ans.value||'—');
+      addKv(f.label, val);
+    });
+  }
+
+  const stages = [['vo','Verification Officer'],['bsm1','BSM (Initial)'],['agm','AGM'],['cfo','CFO'],['bsm2','BSM (Final)'],['md','MD']];
+  const approvalRows = stages.filter(([k])=>rec.approvals && rec.approvals[k]);
+  if(approvalRows.length){
+    addSectionTitle('Approval Trail');
+    approvalRows.forEach(([k,label])=>{
+      const a = rec.approvals[k];
+      addKv(label, `${a.decision}${a.by ? ' — '+a.by : ''}${a.note ? ' ("'+a.note+'")' : ''}`);
+    });
+  }
+
+  doc.save(`${rec.refCode}-application-summary.pdf`);
+}
+
+function wordKvTable(rows){
+  return `<table style="width:100%; border-collapse:collapse; margin-bottom:8px;">${rows.map(([k,v])=>`<tr><td style="padding:4px 8px; font-size:9px; text-transform:uppercase; color:#5B5F6B; width:190px; vertical-align:top;">${k}</td><td style="padding:4px 8px; font-size:12px; vertical-align:top;">${v!==undefined&&v!==null&&v!==''?v:'—'}</td></tr>`).join('')}</table>`;
+}
+function wordPersonSection(title, p, showRel){
+  const loc = p.location||{};
+  return `<h3>${title}</h3>${wordKvTable([
+    ['Name', p.name], ['Phone', p.phone + (p.phoneVerified?' (verified)':'')],
+    [showRel?'Relationship':'Date of birth', showRel? p.relationship : p.dob],
+    ['Ghana Card', (p.ghanaCard.number||'—') + (p.ghanaCard.file?' — file on record':' — MISSING')],
+    ["Driver's Licence", p.license.file ? (p.license.number||'On file') : 'Not provided'],
+    ['Proof of residence', (p.residence.type||'—') + (p.residence.file?' — file on record':' — MISSING')],
+    ['Bank/MoMo statement', p.statement.file?'On record':'Not provided'],
+    ['House coordinates', (loc.lat&&loc.lng)? `${loc.lat}, ${loc.lng}` : 'MISSING'],
+    ['Digital address / landmark', (loc.digitalAddress||'—') + (loc.landmark? ' · '+loc.landmark : '')],
+  ])}`;
+}
+function wordCustomAnswers(rec){
+  const fields = ADMIN.customFields||[];
+  if(!fields.length) return '';
+  return `<h3>Additional Information</h3>${wordKvTable(fields.map(f=>{
+    const ans = rec.customAnswers ? rec.customAnswers[f.id] : null;
+    let val = '—';
+    if(ans) val = ans.type==='file' ? (ans.value?('File: '+ans.value.name):'—') : (ans.value||'—');
+    return [f.label, val];
+  }))}`;
+}
+function wordApprovals(rec){
+  const stages = [['vo','Verification Officer'],['bsm1','BSM (Initial)'],['agm','AGM'],['cfo','CFO'],['bsm2','BSM (Final)'],['md','MD']];
+  const rows = stages.filter(([k])=>rec.approvals && rec.approvals[k]).map(([k,label])=>{
+    const a = rec.approvals[k];
+    return [label, `${a.decision}${a.by?' — '+a.by:''}${a.note?' ("'+a.note+'")':''}`];
+  });
+  if(!rows.length) return '';
+  return `<h3>Approval Trail</h3>${wordKvTable(rows)}`;
+}
+function buildWordDoc(rec){
+  const logoImg = ADMIN.logo ? `<img src="${ADMIN.logo}" style="height:50px; margin-bottom:10px;">` : '';
+  const html = `<!DOCTYPE html><html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+  <head><meta charset="utf-8"><title>${rec.refCode}</title>
+  <style>
+    body{font-family:Calibri,Arial,sans-serif;color:#1F2430;}
+    h1{font-size:18px;color:#16283D; margin-bottom:2px;}
+    h2{font-size:11px;color:#5B5F6B; font-weight:normal; margin-top:0;}
+    h3{font-size:14px;color:#16283D;margin-top:18px;border-top:1px solid #E4DFD3;padding-top:10px;}
+  </style></head>
+  <body>
+    ${logoImg}
+    <h1>Somo BNPL</h1>
+    <h2>Application Summary</h2>
+    ${wordKvTable([
+      ['Reference', rec.refCode],
+      ['Status', rec.status],
+      ['Submitted', new Date(rec.submittedAt).toLocaleString()],
+      rec.customerId ? ['Customer ID', rec.customerId] : null,
+    ].filter(Boolean))}
+    <h3>Financing</h3>
+    ${wordKvTable([
+      ['Category', rec.product.category], ['Model', rec.product.model],
+      ['Price (GHS)', rec.product.price], ['Down payment (GHS)', rec.product.downpayment],
+      ['Tenure (months)', rec.product.tenure],
+    ])}
+    ${wordPersonSection('Applicant', rec.applicant, false)}
+    ${wordPersonSection('Guarantor', rec.guarantor, true)}
+    ${wordCustomAnswers(rec)}
+    ${wordApprovals(rec)}
+  </body></html>`;
+  const blob = new Blob(['\ufeff', html], { type:'application/msword' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `${rec.refCode}-application-summary.doc`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ============================================================ FINALIZE: SCHEDULE, EXCEL, REPORT ============================================================ */
+function computeSchedule(rec, frequency, markupPct, startDate){
+  const principal = Number(rec.product.price) - Number(rec.product.downpayment);
+  const total = +(principal * (1 + (markupPct||0)/100)).toFixed(2);
+  const tenureMonths = Number(rec.product.tenure);
+  let periods, incrementDays;
+  if(frequency==='Daily'){ periods = tenureMonths*30; incrementDays=1; }
+  else if(frequency==='Weekly'){ periods = tenureMonths*4; incrementDays=7; }
+  else if(frequency==='Bi-weekly'){ periods = tenureMonths*2; incrementDays=14; }
+  else { periods = tenureMonths; incrementDays=30; }
+  const installment = +(total/periods).toFixed(2);
+  const schedule = []; let balance = total; let date = new Date(startDate);
+  for(let i=1;i<=periods;i++){
+    date = new Date(date.getTime() + incrementDays*86400000);
+    balance = +(balance - installment).toFixed(2);
+    schedule.push({ no:i, dueDate: date.toISOString().slice(0,10), amount: installment, balance: Math.max(balance,0), paid:false, paidAt:null });
+  }
+  return { principal, total, installment, periods, schedule };
+}
+function genCustomerId(){ return `SOMO-CUS-${new Date().getFullYear()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`; }
+
+async function finalizeLoan(rec){
+  const frequency = document.getElementById('finFrequency').value;
+  const markup = Number(document.getElementById('finMarkup').value)||0;
+  const start = document.getElementById('finStart').value;
+  const financing = computeSchedule(rec, frequency, markup, start);
+  financing.frequency = frequency; financing.markupPct = markup; financing.approvedDate = start;
+  const customerId = genCustomerId();
+  rec.financing = financing; rec.customerId = customerId; rec.finalized = true; rec.status = 'Finalized';
+  await storageSet(`application:${rec.refCode}`, rec, true);
+  downloadExcel(rec, financing, customerId);
+  const resultEl = document.getElementById('finalizeResult');
+  if(resultEl){
+    resultEl.innerHTML = `<div class="ref-box show" style="margin-top:16px;">
+      <div class="eyebrow">Customer ID generated</div><div class="refcode mono">${customerId}</div>
+      <div class="hint" style="margin:8px 0;">Excel workbook downloaded — customer record + payment schedule (${financing.periods} × GHS ${financing.installment}, ${frequency}).</div>
+      <button class="btn btn-primary btn-sm" id="btnSendNow">Send report to MD, CFO, BSM &amp; Verification Officer</button>
+    </div>`;
+    document.getElementById('btnSendNow').addEventListener('click', ()=>sendReport(rec, financing, customerId));
+  }
+  toast(`Loan finalized — ${customerId}`);
+}
+
+function downloadExcel(rec, financing, customerId){
+  if(typeof XLSX === 'undefined'){ toast('Excel library did not load — check your connection.'); return; }
+  const wb = XLSX.utils.book_new();
+  const customerSheet = XLSX.utils.aoa_to_sheet([
+    ['Somo BNPL — Customer Record'], [],
+    ['Unique Customer ID', customerId],
+    ['Application Reference', rec.refCode],
+    ['Full Name', rec.applicant.name],
+    ['Phone Number', rec.applicant.phone],
+    ['Ghana Card Number', rec.applicant.ghanaCard.number],
+    [],
+    ['Vehicle Category', rec.product.category],
+    ['Model', rec.product.model],
+    ['Vehicle Price (GHS)', rec.product.price],
+    ['Down Payment (GHS)', rec.product.downpayment],
+    ['Financed Amount (GHS)', financing.principal],
+    ['Markup Applied (%)', financing.markupPct],
+    ['Total Repayable (GHS)', financing.total],
+    ['Repayment Frequency', financing.frequency],
+    ['Number of Installments', financing.periods],
+    ['Installment Amount (GHS)', financing.installment],
+    ['Schedule Start Date', financing.approvedDate],
+  ]);
+  XLSX.utils.book_append_sheet(wb, customerSheet, 'Customer');
+  const rows = [['Installment #','Due Date','Amount (GHS)','Balance After (GHS)']];
+  financing.schedule.forEach(s=>rows.push([s.no, s.dueDate, s.amount, s.balance]));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), 'Payment Schedule');
+  XLSX.writeFile(wb, `${customerId}-somo-bnpl.xlsx`);
+}
+
+async function logOutbox(entry){
+  const log = (await storageGet('outbox-log', true)) || [];
+  log.unshift(entry);
+  await storageSet('outbox-log', log, true);
+}
+function sendReport(rec, financing, customerId){
+  const e = ADMIN.emails || {};
+  const recipients = [e.md, e.cfo, e.bsm, e.loanOfficer].filter(Boolean).join(',');
+  if(!recipients){ toast('Add stakeholder emails in Admin → Stakeholder Emails first.'); return; }
+  const subject = `Somo BNPL — Loan Approved: ${rec.applicant.name} (${customerId})`;
+  const body = `Customer: ${rec.applicant.name}\nPhone: ${rec.applicant.phone}\nCustomer ID: ${customerId}\nVehicle: ${rec.product.category} - ${rec.product.model}\nFinanced Amount: GHS ${financing.principal}\nRepayment: ${financing.frequency}, ${financing.periods} installments of GHS ${financing.installment}\nApplication Ref: ${rec.refCode}`;
+  window.open(`mailto:${recipients}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
+  logOutbox({ refCode:rec.refCode, customerId, recipients, at:new Date().toISOString() });
+  toast('Email client opened with report addressed to stakeholders.');
+}
+
+/* ============================================================ DASHBOARD ============================================================ */
+async function renderDashboard(){
+  const host = document.getElementById('dashboardWrap');
+  host.innerHTML = `<div class="panel"><div class="eyebrow">Loading dashboard…</div></div>`;
+  const records = await fetchAllApplications();
+  const finalized = records.filter(r=>r.finalized && r.financing);
+  let totalFinanced=0, totalCollected=0, totalOutstanding=0;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const upcoming=[]; const overdue=[];
+  finalized.forEach(r=>{
+    totalFinanced += r.financing.total;
+    r.financing.schedule.forEach(inst=>{
+      if(inst.paid){ totalCollected += inst.amount; }
+      else{
+        totalOutstanding += inst.amount;
+        const due = new Date(inst.dueDate);
+        const diffDays = (due-today)/86400000;
+        const row = { ...inst, customerId:r.customerId, name:r.applicant.name, refCode:r.refCode };
+        if(diffDays < 0) overdue.push(row);
+        else if(diffDays <= 7) upcoming.push(row);
+      }
+    });
+  });
+  overdue.sort((a,b)=> new Date(a.dueDate)-new Date(b.dueDate));
+  upcoming.sort((a,b)=> new Date(a.dueDate)-new Date(b.dueDate));
+
+  const kpi = (label,val)=>`<div class="kpi"><div class="eyebrow">${label}</div><div class="display">${val}</div></div>`;
+  const inReview = records.filter(r=>!['Approved','Finalized','Rejected','Needs more info'].includes(r.status)).length;
+
+  host.innerHTML = `
+  <div class="panel" style="margin-bottom:20px;">
+    <div class="eyebrow">Dashboard</div>
+    <h2>Portfolio Overview</h2>
+    <div style="display:flex; flex-wrap:wrap; gap:14px; margin-top:16px;">
+      ${kpi('Total applications', records.length)}
+      ${kpi('In review', inReview)}
+      ${kpi('Finalized loans', finalized.length)}
+      ${kpi('Rejected', records.filter(r=>r.status==='Rejected').length)}
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:14px; margin-top:14px;">
+      ${kpi('Total financed (GHS)', totalFinanced.toLocaleString())}
+      ${kpi('Collected (GHS)', totalCollected.toLocaleString())}
+      ${kpi('Outstanding (GHS)', totalOutstanding.toLocaleString())}
+      ${kpi('Overdue installments', overdue.length)}
+    </div>
+  </div>
+  <div class="panel" style="margin-bottom:20px;">
+    <h3 style="margin-top:0;">Overdue payments</h3>
+    ${overdue.length? overdue.slice(0,25).map(i=>`<div class="app-card" style="cursor:default; border-color:var(--brick);"><div class="left"><div class="ref">${i.customerId} — ${i.name}</div><div class="meta">Installment #${i.no} · due ${i.dueDate} · ${i.refCode}</div></div><div class="badge badge-rejected">GHS ${i.amount}</div></div>`).join('') : '<div class="empty-state">No overdue payments 🎉</div>'}
+  </div>
+  <div class="panel">
+    <h3 style="margin-top:0;">Upcoming payments (next 7 days)</h3>
+    ${upcoming.length? upcoming.slice(0,25).map(i=>`<div class="app-card" style="cursor:default;"><div class="left"><div class="ref">${i.customerId} — ${i.name}</div><div class="meta">Installment #${i.no} · due ${i.dueDate} · ${i.refCode}</div></div><div class="badge badge-submitted">GHS ${i.amount}</div></div>`).join('') : '<div class="empty-state">Nothing due in the next 7 days.</div>'}
+  </div>`;
+}
+
+/* ============================================================ ADMIN CONSOLE ============================================================ */
+let adminTab = 'overview';
+async function renderAdmin(){
+  document.querySelectorAll('#adminTabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===adminTab));
+  const host = document.getElementById('adminTabContent');
+  if(adminTab==='overview'){ host.innerHTML = `<div class="panel"><div id="ovList" class="review-list"></div></div>`; renderRoleList('ovList', null, 'admin'); }
+  else if(adminTab==='vehicles'){ host.innerHTML = vehiclesTabHtml(); wireVehiclesTab(); }
+  else if(adminTab==='fields'){ host.innerHTML = fieldsTabHtml(); wireFieldsTab(); }
+  else if(adminTab==='emails'){ host.innerHTML = emailsTabHtml(); wireEmailsTab(); }
+  else if(adminTab==='accounts'){ host.innerHTML = accountsTabHtml(); wireAccountsTab(); }
+  else if(adminTab==='branding'){ host.innerHTML = brandingTabHtml(); wireBrandingTab(); }
+  else if(adminTab==='loans'){
+    host.innerHTML = `<div class="panel"><div class="eyebrow" style="margin-bottom:10px;">Approved — awaiting finalize</div><div id="loansList" class="review-list"></div>
+    <div class="eyebrow" style="margin:22px 0 10px;">Finalized history</div><div id="finalizedList" class="review-list"></div></div>`;
+    renderRoleList('loansList', ['Approved'], 'admin');
+    renderRoleList('finalizedList', ['Finalized'], 'admin');
+  }
+}
+function vehiclesTabHtml(){
+  return `<div class="panel">
+    <h3 style="margin-top:0;">Add a vehicle</h3>
+    <div class="field-row">
+      <div class="field"><label>Category</label><select id="newVehCategory"><option value="EV">EV</option><option value="Motorcycle">Motorcycle</option><option value="Tricycle">Tricycle</option></select></div>
+      <div class="field"><label>Model name</label><input type="text" id="newVehModel" placeholder="e.g. Bajaj Boxer 150"></div>
+      <div class="field"><label>Price (GHS)</label><input type="number" id="newVehPrice" min="0" placeholder="e.g. 9500"></div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btnAddVehicle">Add vehicle</button>
+    <div class="section-divider"><div class="eyebrow">Current price list</div><div class="line"></div></div>
+    <div class="review-list">
+      ${ADMIN.vehicles.map(v=>`<div class="app-card" style="cursor:default;"><div class="left"><div class="ref">${v.model}</div><div class="meta">${v.category} · GHS ${v.price}</div></div><button class="btn btn-ghost btn-sm" data-del-vehicle="${v.id}">Remove</button></div>`).join('') || '<div class="empty-state">No vehicles added yet.</div>'}
+    </div>
+  </div>`;
+}
+function wireVehiclesTab(){
+  document.getElementById('btnAddVehicle').addEventListener('click', async ()=>{
+    const category = document.getElementById('newVehCategory').value;
+    const model = document.getElementById('newVehModel').value.trim();
+    const price = Number(document.getElementById('newVehPrice').value);
+    if(!model || !(price>0)){ toast('Enter a model name and price.'); return; }
+    ADMIN.vehicles.push({ id:'v'+Date.now(), category, model, price });
+    await storageSet('vehicle-list', ADMIN.vehicles, true);
+    toast('Vehicle added.'); renderAdmin();
+  });
+  document.querySelectorAll('[data-del-vehicle]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      ADMIN.vehicles = ADMIN.vehicles.filter(v=>v.id!==btn.dataset.delVehicle);
+      await storageSet('vehicle-list', ADMIN.vehicles, true);
+      renderAdmin();
+    });
+  });
+}
+function fieldsTabHtml(){
+  return `<div class="panel">
+    <h3 style="margin-top:0;">Request additional information</h3>
+    <div class="hint" style="margin-bottom:14px;">Anything added here appears as an extra field on the Applicant Portal.</div>
+    <div class="field-row">
+      <div class="field full"><label>Field label</label><input type="text" id="newFieldLabel" placeholder="e.g. Business registration certificate"></div>
+      <div class="field"><label>Type</label><select id="newFieldType"><option value="text">Text answer</option><option value="file">File upload</option></select></div>
+      <div class="field" style="justify-content:flex-end;"><label style="display:flex; align-items:center; gap:8px;"><input type="checkbox" id="newFieldMandatory"> Mandatory</label></div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btnAddField">Add field</button>
+    <div class="section-divider"><div class="eyebrow">Current requests</div><div class="line"></div></div>
+    <div class="review-list">
+      ${(ADMIN.customFields||[]).map(f=>`<div class="app-card" style="cursor:default;"><div class="left"><div class="ref">${f.label}</div><div class="meta">${f.type==='file'?'File upload':'Text answer'} · ${f.mandatory?'Mandatory':'Optional'}</div></div><button class="btn btn-ghost btn-sm" data-del-field="${f.id}">Remove</button></div>`).join('') || '<div class="empty-state">No extra requests configured.</div>'}
+    </div>
+  </div>`;
+}
+function wireFieldsTab(){
+  document.getElementById('btnAddField').addEventListener('click', async ()=>{
+    const label = document.getElementById('newFieldLabel').value.trim();
+    if(!label){ toast('Enter a field label.'); return; }
+    const type = document.getElementById('newFieldType').value;
+    const mandatory = document.getElementById('newFieldMandatory').checked;
+    ADMIN.customFields = ADMIN.customFields || [];
+    ADMIN.customFields.push({ id:'f'+Date.now(), label, type, mandatory });
+    await storageSet('custom-fields', ADMIN.customFields, true);
+    toast('Field added.'); renderAdmin();
+  });
+  document.querySelectorAll('[data-del-field]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      ADMIN.customFields = (ADMIN.customFields||[]).filter(f=>f.id!==btn.dataset.delField);
+      await storageSet('custom-fields', ADMIN.customFields, true);
+      renderAdmin();
+    });
+  });
+}
+function emailsTabHtml(){
+  const e = ADMIN.emails||{};
+  return `<div class="panel">
+    <h3 style="margin-top:0;">Stakeholder report recipients</h3>
+    <div class="hint" style="margin-bottom:14px;">These addresses receive the loan report once a loan is finalized. Sending opens your email client with the report pre-filled — wire up a real email service here for automatic delivery in production.</div>
+    <div class="field-row">
+      <div class="field"><label>MD email</label><input type="text" id="emMd" value="${e.md||''}" placeholder="md@somobnpl.com"></div>
+      <div class="field"><label>CFO email</label><input type="text" id="emCfo" value="${e.cfo||''}" placeholder="cfo@somobnpl.com"></div>
+      <div class="field"><label>BSM email</label><input type="text" id="emBsm" value="${e.bsm||''}" placeholder="bsm@somobnpl.com"></div>
+      <div class="field"><label>Verification Officer email</label><input type="text" id="emLo" value="${e.loanOfficer||''}" placeholder="verification@somobnpl.com"></div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btnSaveEmails">Save recipients</button>
+  </div>`;
+}
+function wireEmailsTab(){
+  document.getElementById('btnSaveEmails').addEventListener('click', async ()=>{
+    ADMIN.emails = {
+      md: document.getElementById('emMd').value.trim(), cfo: document.getElementById('emCfo').value.trim(),
+      bsm: document.getElementById('emBsm').value.trim(), loanOfficer: document.getElementById('emLo').value.trim(),
+    };
+    await storageSet('stakeholder-emails', ADMIN.emails, true);
+    toast('Recipients saved.');
+  });
+}
+function accountsTabHtml(){
+  return `<div class="panel">
+    <h3 style="margin-top:0;">Add a stakeholder account</h3>
+    <div class="field-row">
+      <div class="field"><label>Full name</label><input type="text" id="newAccName" placeholder="e.g. Ama Serwaa"></div>
+      <div class="field"><label>Email</label><input type="text" id="newAccEmail" placeholder="name@somobnpl.com"></div>
+      <div class="field"><label>Role</label><select id="newAccRole">${['Verification Officer','BSM','AGM','CFO','MD','Admin'].map(r=>`<option value="${r}">${r}</option>`).join('')}</select></div>
+      <div class="field"><label>Passcode (4–6 digits)</label><input type="text" id="newAccPasscode" placeholder="e.g. 1234"></div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btnAddAccount">Create account</button>
+    <div class="hint" style="margin-top:10px;">Demo-only auth: passcodes are stored in plain text in shared storage, visible to anyone with this artifact link. Do not reuse real passwords.</div>
+    <div class="section-divider"><div class="eyebrow">Team accounts</div><div class="line"></div></div>
+    <div class="review-list">
+      ${(ADMIN.accounts||[]).map(a=>`<div class="app-card" style="cursor:default;"><div class="left"><div class="ref">${a.name}</div><div class="meta">${a.email||'—'} · ${a.role} · ${a.active?'Active':'Disabled'}</div></div>
+      <div style="display:flex; gap:8px;"><button class="btn btn-ghost btn-sm" data-toggle-account="${a.id}">${a.active?'Disable':'Enable'}</button><button class="btn btn-ghost btn-sm" data-del-account="${a.id}">Remove</button></div></div>`).join('') || '<div class="empty-state">No accounts yet.</div>'}
+    </div>
+  </div>`;
+}
+function wireAccountsTab(){
+  document.getElementById('btnAddAccount').addEventListener('click', async ()=>{
+    const name = document.getElementById('newAccName').value.trim();
+    const email = document.getElementById('newAccEmail').value.trim();
+    const role = document.getElementById('newAccRole').value;
+    const passcode = document.getElementById('newAccPasscode').value.trim();
+    if(!name || !passcode){ toast('Enter a name and passcode.'); return; }
+    ADMIN.accounts = ADMIN.accounts || [];
+    ADMIN.accounts.push({ id:'acc'+Date.now(), name, email, role, passcode, active:true });
+    await storageSet('team-accounts', ADMIN.accounts, true);
+    toast('Account created.'); renderAdmin();
+  });
+  document.querySelectorAll('[data-toggle-account]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const acc = ADMIN.accounts.find(a=>a.id===btn.dataset.toggleAccount);
+      acc.active = !acc.active;
+      await storageSet('team-accounts', ADMIN.accounts, true);
+      renderAdmin();
+    });
+  });
+  document.querySelectorAll('[data-del-account]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      ADMIN.accounts = ADMIN.accounts.filter(a=>a.id!==btn.dataset.delAccount);
+      await storageSet('team-accounts', ADMIN.accounts, true);
+      renderAdmin();
+    });
+  });
+}
+function brandingTabHtml(){
+  return `<div class="panel">
+    <h3 style="margin-top:0;">Company logo</h3>
+    <div class="hint" style="margin-bottom:14px;">Upload a logo (PNG or JPG, under ~900KB, ideally on a white or transparent background). It appears in the top bar and on every generated PDF and Word application summary.</div>
+    ${ADMIN.logo ? `<img src="${ADMIN.logo}" style="max-height:70px; max-width:220px; display:block; margin-bottom:14px; border:1px solid var(--line); border-radius:8px; padding:8px;">` : '<div class="empty-state" style="padding:24px;">No logo uploaded yet.</div>'}
+    <input type="file" id="logoUploadInput" accept="image/png,image/jpeg">
+    <div class="review-actions">
+      <button class="btn btn-primary btn-sm" id="btnUploadLogo">Save logo</button>
+      ${ADMIN.logo ? `<button class="btn btn-ghost btn-sm" id="btnRemoveLogo">Remove logo</button>` : ''}
+    </div>
+    <div class="hint" style="margin-top:14px;">Note: Excel exports currently stay logo-free — the spreadsheet library used here doesn't support embedding images.</div>
+  </div>`;
+}
+function wireBrandingTab(){
+  document.getElementById('btnUploadLogo').addEventListener('click', ()=>{
+    const file = document.getElementById('logoUploadInput').files[0];
+    if(!file){ toast('Choose an image first.'); return; }
+    if(file.size > 900*1024){ toast('Please use a smaller image (under ~900KB).'); return; }
+    const reader = new FileReader();
+    reader.onload = async ()=>{
+      ADMIN.logo = reader.result;
+      const ok = await storageSet('brand-logo', ADMIN.logo, true);
+      if(ok){
+        toast('Logo saved.');
+        const mark = document.getElementById('brandMark');
+        if(mark) mark.innerHTML = `<img src="${ADMIN.logo}" alt="Logo">`;
+        renderAdmin();
+      } else toast('Could not save logo — try a smaller image.');
+    };
+    reader.readAsDataURL(file);
+  });
+  const rm = document.getElementById('btnRemoveLogo');
+  if(rm) rm.addEventListener('click', async ()=>{
+    ADMIN.logo = null;
+    await storageSet('brand-logo', null, true);
+    const mark = document.getElementById('brandMark');
+    if(mark) mark.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M4 17L9 7L12 13L15 8L20 17" stroke="#C99A2E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    toast('Logo removed.'); renderAdmin();
+  });
+}
+document.getElementById('adminTabs').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-tab]'); if(!btn) return;
+  adminTab = btn.dataset.tab; renderAdmin();
+});
+
+/* ============================================================ MODE SWITCHING + INIT ============================================================ */
+function renderAll(){ renderStepsNav(); renderPanel(); }
+
+const MODE_WRAPS = { apply:'applyWrap', vo:'voWrap', bsm:'bsmWrap', agm:'agmWrap', cfo:'cfoWrap', md:'mdWrap', dashboard:'dashboardWrap', admin:'adminWrap' };
+async function setMode(mode){
+  const allowed = currentUser ? (ROLE_ACCESS[currentUser.role]||['apply']) : ['apply'];
+  if(!allowed.includes(mode)) mode = 'apply';
+  currentActiveMode = mode;
+  Object.entries(MODE_WRAPS).forEach(([m,id])=>{ document.getElementById(id).style.display = (m===mode)?'':'none'; });
+  renderModeToggle();
+  if(mode==='apply'){ await loadAdminData(); renderAll(); }
+  else if(mode==='vo') renderRoleList('voList', ['Submitted','Needs more info'], 'vo');
+  else if(mode==='bsm') renderRoleList('bsmList', ['BSM Review 1','BSM Review 2'], 'bsm');
+  else if(mode==='agm') renderRoleList('agmList', ['AGM Review'], 'agm');
+  else if(mode==='cfo') renderRoleList('cfoList', ['CFO Review'], 'cfo');
+  else if(mode==='md') renderRoleList('mdList', ['MD Review'], 'md');
+  else if(mode==='admin'){ await loadAdminData(); renderAdmin(); }
+  else if(mode==='dashboard') renderDashboard();
+}
+document.getElementById('modeToggle').addEventListener('click', e=>{
+  const btn = e.target.closest('button[data-mode]'); if(!btn) return;
+  setMode(btn.dataset.mode);
+});
+document.getElementById('btnResume').addEventListener('click', resumeApplication);
+
+(async function init(){
+  await loadAdminData();
+  renderModeToggle();
+  renderAuthArea();
+  renderAll();
+})();
+</script>
+</body>
+</html>
