@@ -1,3 +1,4 @@
+import { asc, eq } from "drizzle-orm";
 import { auditEvent } from "../schema/audit.js";
 import type { Database } from "../client.js";
 import {
@@ -19,4 +20,15 @@ export async function appendAuditEvent(
     throw new Error("AUDIT_EVENT_APPEND_FAILED");
   }
   return inserted;
+}
+
+export async function listAuditEventsByActor(
+  db: Database | DatabaseTransaction,
+  staffUserId: string,
+) {
+  return getInternalExecutor(db)
+    .select()
+    .from(auditEvent)
+    .where(eq(auditEvent.actorStaffUserId, staffUserId))
+    .orderBy(asc(auditEvent.recordedAt));
 }

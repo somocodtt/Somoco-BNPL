@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   check,
   index,
   integer,
@@ -25,6 +26,12 @@ export const staffRole = pgEnum("staff_role", [
   "CFO",
   "MD",
   "PRODUCT_ADMIN",
+  "INVENTORY_OFFICER",
+  "FINANCE_OFFICER",
+  "RECOVERY_OFFICER",
+  "COMPLIANCE_AUDITOR",
+  "CUSTOMER_SUPPORT",
+  "SYSTEM_ADMIN",
 ]);
 
 export const staffUser = pgTable(
@@ -102,6 +109,7 @@ export const staffSession = pgTable(
       .notNull()
       .references(() => staffUser.id, { onDelete: "cascade" }),
     tokenHash: text("token_hash").notNull(),
+    mfaVerified: boolean("mfa_verified").notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -111,5 +119,13 @@ export const staffSession = pgTable(
   (table) => [
     uniqueIndex("staff_session_token_hash_unique").on(table.tokenHash),
     index("staff_session_user_idx").on(table.staffUserId),
+    check(
+      "staff_session_token_hash_sha256",
+      sql`${table.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "staff_session_expiry_after_creation",
+      sql`${table.expiresAt} > ${table.createdAt}`,
+    ),
   ],
 );

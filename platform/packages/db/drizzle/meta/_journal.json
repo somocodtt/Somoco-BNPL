@@ -15,6 +15,13 @@
       "when": 1786714073507,
       "tag": "0001_fresh_talon",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786721089658,
+      "tag": "0002_lovely_maginty",
+      "breakpoints": true
     }
   ]
 }

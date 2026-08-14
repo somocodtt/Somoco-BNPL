@@ -18,10 +18,32 @@ export {
   type OutboxMessage,
 } from "./outbox.js";
 export {
+  createStaffSession,
+  createStaffUser,
+  createStaffUserInTransaction,
+  findActiveStaffSessionByTokenHash,
+  findStaffUserByEmail,
+  findStaffUserById,
+  revokeAllStaffSessions,
+  revokeStaffSession,
+  updateStaffUserAccess,
+  type ActiveStaffSession,
+  type DatabaseStaffRole,
+  type DatabaseStaffUserStatus,
+  type NewStaffSession,
+  type NewStaffUser,
+  type StaffUserRecord,
+  type UpdateStaffUserAccess,
+} from "./repositories/access.js";
+export {
   applicationRepo,
   type NewApplication,
 } from "./repositories/applications.js";
-export { appendAuditEvent, type NewAuditEvent } from "./repositories/audit.js";
+export {
+  appendAuditEvent,
+  listAuditEventsByActor,
+  type NewAuditEvent,
+} from "./repositories/audit.js";
 export {
   completeOwnershipTransfer,
   type CompleteOwnershipTransferCommand,
@@ -33,3 +55,4 @@ export {
   type NewPaymentTransaction,
 } from "./repositories/payments.js";
 export { withTransaction, type DatabaseTransaction } from "./transaction.js";
+export { migrateDatabase } from "./schema/migration.js";
