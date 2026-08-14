@@ -1,6 +1,10 @@
 import { sql } from "drizzle-orm";
+import type { Database } from "./client.js";
 import { outboxMessage } from "./schema/integrations.js";
-import type { DatabaseExecutor } from "./transaction.js";
+import {
+  getInternalExecutor,
+  type DatabaseTransaction,
+} from "./transaction.js";
 
 export interface OutboxMessage {
   id: string;
@@ -23,10 +27,13 @@ export interface ClaimOutboxBatchOptions {
 }
 
 export async function enqueueOutbox(
-  db: DatabaseExecutor,
+  db: Database | DatabaseTransaction,
   message: NewOutboxMessage,
 ): Promise<OutboxMessage> {
-  const [inserted] = await db.insert(outboxMessage).values(message).returning();
+  const [inserted] = await getInternalExecutor(db)
+    .insert(outboxMessage)
+    .values(message)
+    .returning();
   if (inserted === undefined) {
     throw new Error("OUTBOX_ENQUEUE_FAILED");
   }
@@ -34,7 +41,7 @@ export async function enqueueOutbox(
 }
 
 export async function claimOutboxBatch(
-  db: DatabaseExecutor,
+  db: Database | DatabaseTransaction,
   options: ClaimOutboxBatchOptions,
 ): Promise<OutboxMessage[]> {
   if (
@@ -46,7 +53,7 @@ export async function claimOutboxBatch(
   }
 
   const staleBefore = options.staleBefore ?? new Date(Date.now() - 5 * 60_000);
-  const result = await db.execute<{
+  const result = await getInternalExecutor(db).execute<{
     id: string;
     topic: string;
     aggregate_type: string;

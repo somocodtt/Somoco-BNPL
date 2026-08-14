@@ -13,6 +13,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import type { Database } from "../client.js";
+import { getInternalDatabase } from "../client.js";
 
 export const migrationBatch = pgTable(
   "migration_batch",
@@ -81,5 +82,5 @@ const migrationsFolder = fileURLToPath(
 );
 
 export async function migrateDatabase(db: Database): Promise<void> {
-  await migrate(db, { migrationsFolder });
+  await migrate(getInternalDatabase(db), { migrationsFolder });
 }

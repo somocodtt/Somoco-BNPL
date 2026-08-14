@@ -1,6 +1,35 @@
 CREATE TYPE "public"."registration_owner" AS ENUM('SOMOCO', 'CUSTOMER');--> statement-breakpoint
 CREATE TYPE "public"."payment_channel" AS ENUM('USSD', 'MOBILE_MONEY');--> statement-breakpoint
 CREATE TYPE "public"."payment_provider" AS ENUM('SOMOCO_PAYMENTS');--> statement-breakpoint
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM registration_record
+    WHERE registered_owner NOT IN ('SOMOCO', 'CUSTOMER')
+  ) THEN
+    RAISE EXCEPTION 'legacy registration owner is incompatible with registration_owner'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM payment_transaction
+    WHERE provider <> 'SOMOCO_PAYMENTS'
+  ) THEN
+    RAISE EXCEPTION 'legacy payment provider is incompatible with payment_provider'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM payment_transaction
+    WHERE provider_payload->>'channel' IS NULL
+       OR provider_payload->>'channel' NOT IN ('USSD', 'MOBILE_MONEY')
+  ) THEN
+    RAISE EXCEPTION 'legacy payment channel is missing or incompatible'
+      USING ERRCODE = '23514';
+  END IF;
+END
+$$;
+--> statement-breakpoint
 ALTER TABLE "installment" DROP CONSTRAINT "installment_repayment_schedule_id_repayment_schedule_id_fk";
 --> statement-breakpoint
 ALTER TABLE "ledger_entry" DROP CONSTRAINT "ledger_entry_payment_transaction_id_payment_transaction_id_fk";
@@ -10,11 +39,24 @@ ALTER TABLE "ledger_entry" DROP CONSTRAINT "ledger_entry_installment_id_installm
 ALTER TABLE "registration_record" ALTER COLUMN "registered_owner" SET DEFAULT 'SOMOCO'::"public"."registration_owner";--> statement-breakpoint
 ALTER TABLE "registration_record" ALTER COLUMN "registered_owner" SET DATA TYPE "public"."registration_owner" USING "registered_owner"::"public"."registration_owner";--> statement-breakpoint
 ALTER TABLE "payment_transaction" ALTER COLUMN "provider" SET DATA TYPE "public"."payment_provider" USING "provider"::"public"."payment_provider";--> statement-breakpoint
-ALTER TABLE "installment" ADD COLUMN "contract_id" uuid NOT NULL;--> statement-breakpoint
+ALTER TABLE "installment" ADD COLUMN "contract_id" uuid;--> statement-breakpoint
 ALTER TABLE "inbox_message" ADD COLUMN "processing_token" uuid;--> statement-breakpoint
 ALTER TABLE "inbox_message" ADD COLUMN "processing_started_at" timestamp with time zone;--> statement-breakpoint
-ALTER TABLE "ledger_entry" ADD COLUMN "posting_key" text NOT NULL;--> statement-breakpoint
-ALTER TABLE "payment_transaction" ADD COLUMN "channel" "payment_channel" NOT NULL;--> statement-breakpoint
+ALTER TABLE "ledger_entry" ADD COLUMN "posting_key" text;--> statement-breakpoint
+ALTER TABLE "payment_transaction" ADD COLUMN "channel" "payment_channel";--> statement-breakpoint
+UPDATE installment AS target
+SET contract_id = schedule.contract_id
+FROM repayment_schedule AS schedule
+WHERE schedule.id = target.repayment_schedule_id;--> statement-breakpoint
+ALTER TABLE ledger_entry DISABLE TRIGGER ledger_entry_append_only;--> statement-breakpoint
+UPDATE ledger_entry
+SET posting_key = 'legacy:ledger:' || id::text;--> statement-breakpoint
+ALTER TABLE ledger_entry ENABLE TRIGGER ledger_entry_append_only;--> statement-breakpoint
+UPDATE payment_transaction
+SET channel = (provider_payload->>'channel')::payment_channel;--> statement-breakpoint
+ALTER TABLE "installment" ALTER COLUMN "contract_id" SET NOT NULL;--> statement-breakpoint
+ALTER TABLE "ledger_entry" ALTER COLUMN "posting_key" SET NOT NULL;--> statement-breakpoint
+ALTER TABLE "payment_transaction" ALTER COLUMN "channel" SET NOT NULL;--> statement-breakpoint
 CREATE UNIQUE INDEX "installment_id_contract_unique" ON "installment" USING btree ("id","contract_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "repayment_schedule_id_contract_unique" ON "repayment_schedule" USING btree ("id","contract_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "payment_transaction_id_contract_unique" ON "payment_transaction" USING btree ("id","contract_id");--> statement-breakpoint
@@ -55,6 +97,10 @@ DECLARE
   agreement_status contract_status;
   agreement_balance bigint;
 BEGIN
+  IF NEW.status <> 'COMPLETED' THEN
+    RETURN NEW;
+  END IF;
+
   SELECT status, outstanding_balance_minor_units
     INTO agreement_status, agreement_balance
     FROM contract

@@ -1,15 +1,22 @@
 import type { ApplicationStatus } from "@somo/domain/src/application-state.js";
 import { and, eq } from "drizzle-orm";
 import { application } from "../schema/applications.js";
-import type { DatabaseTransaction } from "../transaction.js";
+import {
+  getInternalTransaction,
+  type DatabaseTransaction,
+} from "../transaction.js";
 import { persistWriteEffects, type WriteEffects } from "./effects.js";
 
 export type NewApplication = typeof application.$inferInsert;
 
 export function applicationRepo(db: DatabaseTransaction) {
+  const executor = getInternalTransaction(db);
   return {
     async insert(input: NewApplication, effects: WriteEffects) {
-      const [inserted] = await db.insert(application).values(input).returning();
+      const [inserted] = await executor
+        .insert(application)
+        .values(input)
+        .returning();
       if (inserted === undefined) {
         throw new Error("APPLICATION_INSERT_FAILED");
       }
@@ -18,7 +25,7 @@ export function applicationRepo(db: DatabaseTransaction) {
     },
 
     async findById(id: string) {
-      const [record] = await db
+      const [record] = await executor
         .select()
         .from(application)
         .where(eq(application.id, id))
@@ -33,7 +40,7 @@ export function applicationRepo(db: DatabaseTransaction) {
       effects: WriteEffects,
       updatedAt = new Date(),
     ) {
-      const [updated] = await db
+      const [updated] = await executor
         .update(application)
         .set({
           status,

@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
+import type { Database } from "./client.js";
 import { inboxMessage } from "./schema/integrations.js";
-import type { DatabaseExecutor } from "./transaction.js";
+import {
+  getInternalExecutor,
+  type DatabaseTransaction,
+} from "./transaction.js";
 
 export interface InboxMessageInput {
   id?: string;
@@ -19,11 +23,12 @@ export type InboxReceipt = InboxMessage & {
 };
 
 export async function receiveInboxMessage(
-  db: DatabaseExecutor,
+  db: Database | DatabaseTransaction,
   message: InboxMessageInput,
 ): Promise<InboxReceipt> {
+  const executor = getInternalExecutor(db);
   const processingToken = randomUUID();
-  const [inserted] = await db
+  const [inserted] = await executor
     .insert(inboxMessage)
     .values({
       ...message,
@@ -39,7 +44,7 @@ export async function receiveInboxMessage(
     return { ...inserted, inserted: true };
   }
 
-  const [existing] = await db
+  const [existing] = await executor
     .select()
     .from(inboxMessage)
     .where(
@@ -57,13 +62,13 @@ export async function receiveInboxMessage(
 }
 
 export async function completeInboxMessage(
-  db: DatabaseExecutor,
+  db: Database | DatabaseTransaction,
   id: string,
   processingToken: string,
   result: unknown,
   processedAt = new Date(),
 ): Promise<InboxMessage> {
-  const [updated] = await db
+  const [updated] = await getInternalExecutor(db)
     .update(inboxMessage)
     .set({
       processedAt,

@@ -1,4 +1,8 @@
-export { createDatabase, type DatabaseConnection } from "./client.js";
+export {
+  createDatabase,
+  type Database,
+  type DatabaseConnection,
+} from "./client.js";
 export {
   completeInboxMessage,
   receiveInboxMessage,

@@ -1,7 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Database } from "../client.js";
 import { ownershipTransfer } from "../schema/contracts.js";
-import { withTransaction } from "../transaction.js";
+import { getInternalTransaction, withTransaction } from "../transaction.js";
 import { persistWriteEffects, type WriteEffects } from "./effects.js";
 
 export interface CompleteOwnershipTransferCommand {
@@ -18,7 +18,8 @@ export async function completeOwnershipTransfer(
   command: CompleteOwnershipTransferCommand,
 ) {
   return withTransaction(db, async (tx) => {
-    const locked = await tx.execute<{
+    const executor = getInternalTransaction(tx);
+    const locked = await executor.execute<{
       version: number;
       contract_status: string;
       outstanding_balance_minor_units: string;
@@ -45,7 +46,7 @@ export async function completeOwnershipTransfer(
       throw new Error("CONTRACT_NOT_SETTLED");
     }
 
-    const [updated] = await tx
+    const [updated] = await executor
       .update(ownershipTransfer)
       .set({
         status: "COMPLETED",

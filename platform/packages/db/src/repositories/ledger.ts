@@ -1,14 +1,18 @@
 import { eq } from "drizzle-orm";
 import { ledgerEntry } from "../schema/payments.js";
-import type { DatabaseTransaction } from "../transaction.js";
+import {
+  getInternalTransaction,
+  type DatabaseTransaction,
+} from "../transaction.js";
 import { persistWriteEffects, type WriteEffects } from "./effects.js";
 
 export type NewLedgerEntry = typeof ledgerEntry.$inferInsert;
 
 export function ledgerRepo(db: DatabaseTransaction) {
+  const executor = getInternalTransaction(db);
   return {
     async append(entry: NewLedgerEntry, effects: WriteEffects) {
-      const [inserted] = await db
+      const [inserted] = await executor
         .insert(ledgerEntry)
         .values(entry)
         .onConflictDoNothing({ target: ledgerEntry.postingKey })
@@ -18,7 +22,7 @@ export function ledgerRepo(db: DatabaseTransaction) {
         return inserted;
       }
 
-      const [existing] = await db
+      const [existing] = await executor
         .select()
         .from(ledgerEntry)
         .where(eq(ledgerEntry.postingKey, entry.postingKey))

@@ -10,7 +10,7 @@
     "db:generate": "drizzle-kit generate --config drizzle.config.ts",
     "db:migrate:test": "drizzle-kit migrate --config drizzle.config.ts",
     "lint": "eslint src",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.public-api.json",
     "test": "vitest run"
   },
   "dependencies": {

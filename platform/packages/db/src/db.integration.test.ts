@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
+import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   applicationBuilder,
@@ -8,7 +11,12 @@ import {
   outboxBuilder,
 } from "../../testkit/src/builders.js";
 import { resetTestDatabase } from "../../testkit/src/database.js";
-import { createDatabase, type Database } from "./client.js";
+import {
+  createDatabase,
+  getInternalDatabase,
+  type Database,
+  type InternalDatabase,
+} from "./client.js";
 import { completeInboxMessage, receiveInboxMessage } from "./inbox.js";
 import { claimOutboxBatch, enqueueOutbox } from "./outbox.js";
 import { applicationRepo } from "./repositories/applications.js";
@@ -45,16 +53,20 @@ if (databaseUrl === undefined) {
 }
 
 describe("PostgreSQL persistence", () => {
-  let db: Database;
+  let database: Database;
+  let db: InternalDatabase;
   let close: () => Promise<void>;
 
   beforeAll(async () => {
-    ({ db, close } = createDatabase(databaseUrl));
+    const connection = createDatabase(databaseUrl);
+    database = connection.db;
+    db = getInternalDatabase(database);
+    close = connection.close;
   });
 
   beforeEach(async () => {
     await resetTestDatabase(databaseUrl);
-    await migrateDatabase(db);
+    await migrateDatabase(database);
   });
 
   afterAll(async () => {
@@ -63,7 +75,7 @@ describe("PostgreSQL persistence", () => {
 
   it("rejects an application whose person does not exist", async () => {
     await expect(
-      withTransaction(db, async (tx) =>
+      withTransaction(database, async (tx) =>
         applicationRepo(tx).insert(
           applicationBuilder({ applicantPersonId: randomUUID() }),
           writeEffects(randomUUID()),
@@ -76,8 +88,8 @@ describe("PostgreSQL persistence", () => {
     const event = inboxBuilder({ providerEventId: "evt-1001" });
 
     const [first, duplicate] = await Promise.all([
-      receiveInboxMessage(db, event),
-      receiveInboxMessage(db, event),
+      receiveInboxMessage(database, event),
+      receiveInboxMessage(database, event),
     ]);
     const owner = first.inserted ? first : duplicate;
     const observer = first.inserted ? duplicate : first;
@@ -88,11 +100,11 @@ describe("PostgreSQL persistence", () => {
     expect(observer.processingToken).toBeNull();
     expect(await countRows(db, "inbox_message")).toBe(1);
 
-    await completeInboxMessage(db, owner.id, owner.processingToken!, {
+    await completeInboxMessage(database, owner.id, owner.processingToken!, {
       accepted: true,
     });
     await expect(
-      completeInboxMessage(db, owner.id, owner.processingToken!, {
+      completeInboxMessage(database, owner.id, owner.processingToken!, {
         accepted: false,
       }),
     ).rejects.toThrow("INBOX_COMPLETION_NOT_OWNED");
@@ -102,7 +114,7 @@ describe("PostgreSQL persistence", () => {
     const personId = await insertPerson(db);
     const applicationId = randomUUID();
 
-    await withTransaction(db, async (tx) => {
+    await withTransaction(database, async (tx) => {
       await applicationRepo(tx).insert(
         applicationBuilder({
           id: applicationId,
@@ -122,7 +134,7 @@ describe("PostgreSQL persistence", () => {
     const applicationId = randomUUID();
 
     await expect(
-      withTransaction(db, async (tx) => {
+      withTransaction(database, async (tx) => {
         await applicationRepo(tx).insert(
           applicationBuilder({
             id: applicationId,
@@ -142,7 +154,7 @@ describe("PostgreSQL persistence", () => {
   it("rejects stale optimistic aggregate updates", async () => {
     const personId = await insertPerson(db);
     const applicationId = randomUUID();
-    const inserted = await withTransaction(db, (tx) =>
+    const inserted = await withTransaction(database, (tx) =>
       applicationRepo(tx).insert(
         applicationBuilder({
           id: applicationId,
@@ -152,7 +164,7 @@ describe("PostgreSQL persistence", () => {
       ),
     );
 
-    const updated = await withTransaction(db, (tx) =>
+    const updated = await withTransaction(database, (tx) =>
       applicationRepo(tx).updateStatus(
         inserted.id,
         1,
@@ -165,7 +177,7 @@ describe("PostgreSQL persistence", () => {
     expect(await countRows(db, "outbox_message")).toBe(2);
 
     await expect(
-      withTransaction(db, (tx) =>
+      withTransaction(database, (tx) =>
         applicationRepo(tx).updateStatus(
           inserted.id,
           1,
@@ -177,11 +189,11 @@ describe("PostgreSQL persistence", () => {
   });
 
   it("uses skip-locked claims so concurrent workers receive disjoint messages", async () => {
-    const message = await enqueueOutbox(db, outboxBuilder());
+    const message = await enqueueOutbox(database, outboxBuilder());
 
     const [workerOne, workerTwo] = await Promise.all([
-      claimOutboxBatch(db, { workerId: "worker-one", limit: 1 }),
-      claimOutboxBatch(db, { workerId: "worker-two", limit: 1 }),
+      claimOutboxBatch(database, { workerId: "worker-one", limit: 1 }),
+      claimOutboxBatch(database, { workerId: "worker-two", limit: 1 }),
     ]);
 
     const claimed = [...workerOne, ...workerTwo];
@@ -217,7 +229,7 @@ describe("PostgreSQL persistence", () => {
   });
 
   it("blocks audit mutation and installs append-only controls for audit and ledger", async () => {
-    const event = await appendAuditEvent(db, auditBuilder());
+    const event = await appendAuditEvent(database, auditBuilder());
 
     await expect(
       db.execute(
@@ -291,7 +303,7 @@ describe("PostgreSQL persistence", () => {
     const graph = await insertFinancialGraph(db, { includePayment: false });
     const paymentId = randomUUID();
 
-    await withTransaction(db, (tx) =>
+    await withTransaction(database, (tx) =>
       paymentRepo(tx).insert(
         {
           id: paymentId,
@@ -329,10 +341,10 @@ describe("PostgreSQL persistence", () => {
       occurredAt: new Date("2026-08-14T12:00:00.000Z"),
     };
 
-    const first = await withTransaction(db, (tx) =>
+    const first = await withTransaction(database, (tx) =>
       ledgerRepo(tx).append(entry, writeEffects(entryId, "LEDGER_POSTED")),
     );
-    const duplicate = await withTransaction(db, (tx) =>
+    const duplicate = await withTransaction(database, (tx) =>
       ledgerRepo(tx).append(
         { ...entry, id: randomUUID() },
         writeEffects(entryId, "LEDGER_POSTED"),
@@ -395,6 +407,25 @@ describe("PostgreSQL persistence", () => {
     ).rejects.toMatchObject({ cause: { code: "23514" } });
   });
 
+  it("allows pending and approved ownership workflow before settlement", async () => {
+    const graph = await insertFinancialGraph(db, {
+      contractStatus: "ACTIVE",
+      outstandingBalanceMinorUnits: 100_000n,
+    });
+
+    const [pending] = await db
+      .insert(ownershipTransfer)
+      .values({ contractId: graph.contractId, status: "PENDING" })
+      .returning();
+    const [approved] = await db
+      .update(ownershipTransfer)
+      .set({ status: "APPROVED" })
+      .where(sql`${ownershipTransfer.id} = ${pending!.id}`)
+      .returning();
+
+    expect(approved?.status).toBe("APPROVED");
+  });
+
   it("completes ownership transfer through a locked audited transition", async () => {
     const graph = await insertFinancialGraph(db, {
       contractStatus: "SETTLED",
@@ -406,7 +437,7 @@ describe("PostgreSQL persistence", () => {
       contractId: graph.contractId,
     });
 
-    const completed = await completeOwnershipTransfer(db, {
+    const completed = await completeOwnershipTransfer(database, {
       id: transferId,
       expectedVersion: 1,
       evidence: { documentId: randomUUID() },
@@ -453,6 +484,118 @@ describe("PostgreSQL persistence", () => {
   });
 });
 
+describe("populated legacy schema migration", () => {
+  let pool: Pool;
+
+  beforeAll(() => {
+    pool = new Pool({ connectionString: databaseUrl, max: 1 });
+  });
+
+  beforeEach(async () => {
+    await resetTestDatabase(databaseUrl);
+    await applyMigrationFile(pool, "0000_worthless_glorian.sql");
+  });
+
+  afterAll(async () => {
+    await pool.end();
+  });
+
+  it("backfills compatible populated rows without changing financial values", async () => {
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+    });
+
+    await applyMigrationFile(pool, "0001_fresh_talon.sql");
+
+    const upgraded = await pool.query<{
+      contract_id: string;
+      posting_key: string;
+      channel: string;
+      installment_amount: string;
+      installment_paid: string;
+      payment_amount: string;
+      ledger_amount: string;
+      balance_after_minor_units: string;
+    }>(
+      `
+      select installment.contract_id,
+             ledger.posting_key,
+             payment.channel,
+             installment.amount_minor_units as installment_amount,
+             installment.paid_minor_units as installment_paid,
+             payment.amount_minor_units as payment_amount,
+             ledger.amount_minor_units as ledger_amount,
+             ledger.balance_after_minor_units
+      from installment
+      join ledger_entry as ledger on ledger.installment_id = installment.id
+      join payment_transaction as payment on payment.id = ledger.payment_transaction_id
+      where installment.id = $1
+    `,
+      [legacy.installmentId],
+    );
+
+    expect(upgraded.rows[0]).toEqual({
+      contract_id: legacy.contractId,
+      posting_key: `legacy:ledger:${legacy.ledgerEntryId}`,
+      channel: "MOBILE_MONEY",
+      installment_amount: "100000",
+      installment_paid: "10000",
+      payment_amount: "10000",
+      ledger_amount: "10000",
+      balance_after_minor_units: "90000",
+    });
+  });
+
+  it("fails clearly and atomically for an incompatible legacy provider", async () => {
+    await insertLegacyFinancialGraph(pool, {
+      provider: "CASH",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+    });
+
+    await expect(
+      applyMigrationFile(pool, "0001_fresh_talon.sql"),
+    ).rejects.toMatchObject({
+      code: "23514",
+      message: expect.stringContaining("legacy payment provider"),
+    });
+    await expectLegacySchemaUnchanged(pool);
+  });
+
+  it("fails clearly rather than inventing a missing legacy payment channel", async () => {
+    await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      registeredOwner: "SOMOCO",
+    });
+
+    await expect(
+      applyMigrationFile(pool, "0001_fresh_talon.sql"),
+    ).rejects.toMatchObject({
+      code: "23514",
+      message: expect.stringContaining("legacy payment channel"),
+    });
+    await expectLegacySchemaUnchanged(pool);
+  });
+
+  it("fails clearly and atomically for an incompatible registration owner", async () => {
+    await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "USSD",
+      registeredOwner: "THIRD_PARTY",
+    });
+
+    await expect(
+      applyMigrationFile(pool, "0001_fresh_talon.sql"),
+    ).rejects.toMatchObject({
+      code: "23514",
+      message: expect.stringContaining("legacy registration owner"),
+    });
+    await expectLegacySchemaUnchanged(pool);
+  });
+});
+
 function writeEffects(aggregateId: string, action = "APPLICATION_CREATED") {
   return {
     audit: auditBuilder({ aggregateId, action }),
@@ -467,7 +610,7 @@ interface FinancialGraphOptions {
 }
 
 async function insertFinancialGraph(
-  db: Database,
+  db: InternalDatabase,
   options: FinancialGraphOptions = {},
 ) {
   const personId = await insertPerson(db);
@@ -580,7 +723,7 @@ async function insertFinancialGraph(
   return { contractId, installmentIds, paymentTransactionId, vehicleUnitId };
 }
 
-async function insertPerson(db: Database): Promise<string> {
+async function insertPerson(db: InternalDatabase): Promise<string> {
   const record = {
     id: randomUUID(),
     phoneE164: `+2332${randomUUID().replaceAll("-", "").slice(0, 8).replace(/[a-f]/g, "1")}`,
@@ -591,9 +734,179 @@ async function insertPerson(db: Database): Promise<string> {
   return record.id;
 }
 
-async function countRows(db: Database, table: string): Promise<number> {
+async function countRows(db: InternalDatabase, table: string): Promise<number> {
   const result = await db.execute(
     `select count(*)::int as count from ${table}`,
   );
   return Number(result.rows[0]?.count);
+}
+
+const migrationsFolder = fileURLToPath(new URL("../drizzle/", import.meta.url));
+
+async function applyMigrationFile(pool: Pool, filename: string): Promise<void> {
+  const migration = await readFile(`${migrationsFolder}${filename}`, "utf8");
+  const statements = migration
+    .split("--> statement-breakpoint")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    for (const statement of statements) {
+      await client.query(statement);
+    }
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+interface LegacyGraphOptions {
+  provider: string;
+  channel?: "USSD" | "MOBILE_MONEY";
+  registeredOwner: string;
+}
+
+async function insertLegacyFinancialGraph(
+  pool: Pool,
+  options: LegacyGraphOptions,
+) {
+  const personId = randomUUID();
+  const applicationId = randomUUID();
+  const vehicleModelId = randomUUID();
+  const productId = randomUUID();
+  const ruleId = randomUUID();
+  const offerId = randomUUID();
+  const offerVersionId = randomUUID();
+  const vehicleUnitId = randomUUID();
+  const contractId = randomUUID();
+  const scheduleId = randomUUID();
+  const installmentId = randomUUID();
+  const paymentTransactionId = randomUUID();
+  const ledgerEntryId = randomUUID();
+  const suffix = randomUUID();
+
+  await pool.query(
+    `insert into privacy.person (id, phone_e164) values ($1, $2)`,
+    [personId, `+23320${suffix.replaceAll("-", "").slice(0, 7)}`],
+  );
+  await pool.query(
+    `insert into application (id, applicant_person_id) values ($1, $2)`,
+    [applicationId, personId],
+  );
+  await pool.query(
+    `insert into vehicle_model (id, manufacturer, model_name, model_year)
+     values ($1, 'Maker', 'Pilot', 2026)`,
+    [vehicleModelId],
+  );
+  await pool.query(
+    `insert into product (id, code, name, vehicle_model_id)
+     values ($1, $2, 'Pilot product', $3)`,
+    [productId, `PRODUCT-${suffix}`, vehicleModelId],
+  );
+  await pool.query(
+    `insert into financing_rule_version
+       (id, product_id, version_number, minimum_deposit_minor_units,
+        annual_rate_bps, allowed_tenures_months, repayment_frequencies,
+        calculation_method)
+     values ($1, $2, 1, 10000, 1200, '[12]'::jsonb,
+             '["MONTHLY"]'::jsonb, 'DECLINING_BALANCE')`,
+    [ruleId, productId],
+  );
+  await pool.query(`insert into offer (id, application_id) values ($1, $2)`, [
+    offerId,
+    applicationId,
+  ]);
+  await pool.query(
+    `insert into offer_version
+       (id, offer_id, financing_rule_version_id, version_number,
+        principal_minor_units, deposit_minor_units, total_payable_minor_units,
+        terms)
+     values ($1, $2, $3, 1, 100000, 10000, 110000, '{}'::jsonb)`,
+    [offerVersionId, offerId, ruleId],
+  );
+  await pool.query(
+    `insert into vehicle_unit (id, vehicle_model_id, vin, chassis_number)
+     values ($1, $2, $3, $4)`,
+    [vehicleUnitId, vehicleModelId, `VIN-${suffix}`, `CHASSIS-${suffix}`],
+  );
+  await pool.query(
+    `insert into contract
+       (id, reference, application_id, offer_version_id, vehicle_unit_id,
+        status, outstanding_balance_minor_units)
+     values ($1, $2, $3, $4, $5, 'ACTIVE', 100000)`,
+    [
+      contractId,
+      `CONTRACT-${suffix}`,
+      applicationId,
+      offerVersionId,
+      vehicleUnitId,
+    ],
+  );
+  await pool.query(
+    `insert into repayment_schedule
+       (id, contract_id, version_number, total_minor_units, first_due_date)
+     values ($1, $2, 1, 100000, '2026-09-01')`,
+    [scheduleId, contractId],
+  );
+  await pool.query(
+    `insert into installment
+       (id, repayment_schedule_id, installment_number, due_date,
+        amount_minor_units, paid_minor_units)
+     values ($1, $2, 1, '2026-09-01', 100000, 10000)`,
+    [installmentId, scheduleId],
+  );
+  await pool.query(
+    `insert into payment_transaction
+       (id, provider, provider_transaction_id, contract_id, payer_reference,
+        amount_minor_units, provider_payload, occurred_at)
+     values ($1, $2, $3, $4, '+233201234567', 10000, $5::jsonb,
+             '2026-08-14T12:00:00.000Z')`,
+    [
+      paymentTransactionId,
+      options.provider,
+      `TXN-${suffix}`,
+      contractId,
+      JSON.stringify(
+        options.channel === undefined ? {} : { channel: options.channel },
+      ),
+    ],
+  );
+  await pool.query(
+    `insert into ledger_entry
+       (id, contract_id, payment_transaction_id, installment_id, entry_type,
+        direction, amount_minor_units, balance_after_minor_units, occurred_at)
+     values ($1, $2, $3, $4, 'REPAYMENT', 'CREDIT', 10000, 90000,
+             '2026-08-14T12:00:00.000Z')`,
+    [ledgerEntryId, contractId, paymentTransactionId, installmentId],
+  );
+  await pool.query(
+    `insert into registration_record
+       (vehicle_unit_id, registration_number, registered_owner, valid_from)
+     values ($1, $2, $3, '2026-08-14')`,
+    [vehicleUnitId, `REG-${suffix}`, options.registeredOwner],
+  );
+
+  return { contractId, installmentId, ledgerEntryId };
+}
+
+async function expectLegacySchemaUnchanged(pool: Pool): Promise<void> {
+  const columns = await pool.query<{
+    column_name: string;
+    data_type: string;
+  }>(`
+    select column_name, data_type
+    from information_schema.columns
+    where table_schema = 'public'
+      and ((table_name = 'installment' and column_name = 'contract_id')
+        or (table_name = 'ledger_entry' and column_name = 'posting_key')
+        or (table_name = 'payment_transaction' and column_name in ('provider', 'channel')))
+    order by column_name
+  `);
+  expect(columns.rows).toEqual([
+    { column_name: "provider", data_type: "text" },
+  ]);
 }
