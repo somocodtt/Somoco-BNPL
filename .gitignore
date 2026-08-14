@@ -1,2 +1,12 @@
 node_modules/
 .worktrees/
+platform/node_modules/
+platform/**/dist/
+platform/**/coverage/
+platform/**/.env
+platform/**/.env.*
+!platform/**/.env.example
+platform/playwright-report/
+platform/test-results/
+data/store.json
+data/*.tmp
