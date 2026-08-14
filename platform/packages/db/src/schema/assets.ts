@@ -25,6 +25,11 @@ export const vehicleStatus = pgEnum("vehicle_status", [
   "TRANSFERRED",
 ]);
 
+export const registrationOwner = pgEnum("registration_owner", [
+  "SOMOCO",
+  "CUSTOMER",
+]);
+
 export const vehicleUnit = pgTable(
   "vehicle_unit",
   {
@@ -105,7 +110,9 @@ export const registrationRecord = pgTable(
       .notNull()
       .references(() => vehicleUnit.id, { onDelete: "restrict" }),
     registrationNumber: text("registration_number").notNull(),
-    registeredOwner: text("registered_owner").notNull(),
+    registeredOwner: registrationOwner("registered_owner")
+      .notNull()
+      .default("SOMOCO"),
     validFrom: date("valid_from").notNull(),
     validTo: date("valid_to"),
     evidenceDocumentId: uuid("evidence_document_id"),

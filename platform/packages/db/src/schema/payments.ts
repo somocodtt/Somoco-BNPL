@@ -3,6 +3,7 @@ import {
   bigint,
   check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -25,6 +26,13 @@ export const paymentStatus = pgEnum("payment_status", [
   "REJECTED",
 ]);
 
+export const paymentProvider = pgEnum("payment_provider", ["SOMOCO_PAYMENTS"]);
+
+export const paymentChannel = pgEnum("payment_channel", [
+  "USSD",
+  "MOBILE_MONEY",
+]);
+
 export const ledgerDirection = pgEnum("ledger_direction", ["DEBIT", "CREDIT"]);
 
 export const ledgerEntryType = pgEnum("ledger_entry_type", [
@@ -39,7 +47,8 @@ export const paymentTransaction = pgTable(
   "payment_transaction",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    provider: text("provider").notNull(),
+    provider: paymentProvider("provider").notNull(),
+    channel: paymentChannel("channel").notNull(),
     providerTransactionId: text("provider_transaction_id").notNull(),
     contractId: uuid("contract_id").references(() => contract.id, {
       onDelete: "restrict",
@@ -63,6 +72,10 @@ export const paymentTransaction = pgTable(
       .notNull(),
   },
   (table) => [
+    uniqueIndex("payment_transaction_id_contract_unique").on(
+      table.id,
+      table.contractId,
+    ),
     uniqueIndex("payment_provider_transaction_unique").on(
       table.provider,
       table.providerTransactionId,
@@ -78,16 +91,12 @@ export const ledgerEntry = pgTable(
   "ledger_entry",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    postingKey: text("posting_key").notNull(),
     contractId: uuid("contract_id")
       .notNull()
       .references(() => contract.id, { onDelete: "restrict" }),
-    paymentTransactionId: uuid("payment_transaction_id").references(
-      () => paymentTransaction.id,
-      { onDelete: "restrict" },
-    ),
-    installmentId: uuid("installment_id").references(() => installment.id, {
-      onDelete: "restrict",
-    }),
+    paymentTransactionId: uuid("payment_transaction_id"),
+    installmentId: uuid("installment_id"),
     entryType: ledgerEntryType("entry_type").notNull(),
     direction: ledgerDirection("direction").notNull(),
     currency: text("currency").notNull().default("GHS"),
@@ -108,6 +117,7 @@ export const ledgerEntry = pgTable(
       .notNull(),
   },
   (table) => [
+    uniqueIndex("ledger_posting_key_unique").on(table.postingKey),
     index("ledger_contract_occurred_idx").on(
       table.contractId,
       table.occurredAt,
@@ -118,6 +128,16 @@ export const ledgerEntry = pgTable(
       "ledger_balance_nonnegative",
       sql`${table.balanceAfterMinorUnits} >= 0`,
     ),
+    foreignKey({
+      columns: [table.paymentTransactionId, table.contractId],
+      foreignColumns: [paymentTransaction.id, paymentTransaction.contractId],
+      name: "ledger_payment_contract_fk",
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [table.installmentId, table.contractId],
+      foreignColumns: [installment.id, installment.contractId],
+      name: "ledger_installment_contract_fk",
+    }).onDelete("restrict"),
   ],
 );
 

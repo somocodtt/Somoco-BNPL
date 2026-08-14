@@ -1,4 +1,5 @@
-import { and, eq } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, eq, isNull } from "drizzle-orm";
 import { inboxMessage } from "./schema/integrations.js";
 import type { DatabaseExecutor } from "./transaction.js";
 
@@ -12,21 +13,30 @@ export interface InboxMessageInput {
 }
 
 export type InboxMessage = typeof inboxMessage.$inferSelect;
+export type InboxReceipt = InboxMessage & {
+  inserted: boolean;
+  processingToken: string | null;
+};
 
 export async function receiveInboxMessage(
   db: DatabaseExecutor,
   message: InboxMessageInput,
-): Promise<InboxMessage> {
+): Promise<InboxReceipt> {
+  const processingToken = randomUUID();
   const [inserted] = await db
     .insert(inboxMessage)
-    .values(message)
+    .values({
+      ...message,
+      processingToken,
+      processingStartedAt: new Date(),
+    })
     .onConflictDoNothing({
       target: [inboxMessage.provider, inboxMessage.providerEventId],
     })
     .returning();
 
   if (inserted !== undefined) {
-    return inserted;
+    return { ...inserted, inserted: true };
   }
 
   const [existing] = await db
@@ -43,22 +53,34 @@ export async function receiveInboxMessage(
   if (existing === undefined) {
     throw new Error("INBOX_DEDUPLICATION_FAILED");
   }
-  return existing;
+  return { ...existing, inserted: false, processingToken: null };
 }
 
 export async function completeInboxMessage(
   db: DatabaseExecutor,
   id: string,
+  processingToken: string,
   result: unknown,
   processedAt = new Date(),
 ): Promise<InboxMessage> {
   const [updated] = await db
     .update(inboxMessage)
-    .set({ processedAt, result })
-    .where(eq(inboxMessage.id, id))
+    .set({
+      processedAt,
+      result,
+      processingToken: null,
+      processingStartedAt: null,
+    })
+    .where(
+      and(
+        eq(inboxMessage.id, id),
+        eq(inboxMessage.processingToken, processingToken),
+        isNull(inboxMessage.processedAt),
+      ),
+    )
     .returning();
   if (updated === undefined) {
-    throw new Error("INBOX_MESSAGE_NOT_FOUND");
+    throw new Error("INBOX_COMPLETION_NOT_OWNED");
   }
   return updated;
 }

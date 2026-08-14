@@ -23,6 +23,10 @@ export const inboxMessage = pgTable(
     result: jsonb("result").$type<unknown>(),
     receivedAt: timestamp("received_at", { withTimezone: true }).notNull(),
     processedAt: timestamp("processed_at", { withTimezone: true }),
+    processingToken: uuid("processing_token"),
+    processingStartedAt: timestamp("processing_started_at", {
+      withTimezone: true,
+    }),
   },
   (table) => [
     uniqueIndex("inbox_provider_event_unique").on(
@@ -32,6 +36,10 @@ export const inboxMessage = pgTable(
     index("inbox_unprocessed_idx")
       .on(table.receivedAt)
       .where(sql`${table.processedAt} is null`),
+    check(
+      "inbox_processing_lease_consistent",
+      sql`(${table.processingToken} is null) = (${table.processingStartedAt} is null)`,
+    ),
   ],
 );
 

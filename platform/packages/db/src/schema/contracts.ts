@@ -3,6 +3,7 @@ import {
   bigint,
   check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -90,6 +91,10 @@ export const repaymentSchedule = pgTable(
       .notNull(),
   },
   (table) => [
+    uniqueIndex("repayment_schedule_id_contract_unique").on(
+      table.id,
+      table.contractId,
+    ),
     uniqueIndex("repayment_schedule_contract_version_unique").on(
       table.contractId,
       table.versionNumber,
@@ -109,9 +114,8 @@ export const installment = pgTable(
   "installment",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    repaymentScheduleId: uuid("repayment_schedule_id")
-      .notNull()
-      .references(() => repaymentSchedule.id, { onDelete: "restrict" }),
+    contractId: uuid("contract_id").notNull(),
+    repaymentScheduleId: uuid("repayment_schedule_id").notNull(),
     installmentNumber: integer("installment_number").notNull(),
     dueDate: date("due_date").notNull(),
     amountMinorUnits: bigint("amount_minor_units", {
@@ -124,6 +128,10 @@ export const installment = pgTable(
     version: integer("version").notNull().default(1),
   },
   (table) => [
+    uniqueIndex("installment_id_contract_unique").on(
+      table.id,
+      table.contractId,
+    ),
     uniqueIndex("installment_schedule_number_unique").on(
       table.repaymentScheduleId,
       table.installmentNumber,
@@ -135,7 +143,16 @@ export const installment = pgTable(
       sql`${table.amountMinorUnits} >= 0`,
     ),
     check("installment_paid_nonnegative", sql`${table.paidMinorUnits} >= 0`),
+    check(
+      "installment_paid_not_above_amount",
+      sql`${table.paidMinorUnits} <= ${table.amountMinorUnits}`,
+    ),
     check("installment_version_positive", sql`${table.version} > 0`),
+    foreignKey({
+      columns: [table.repaymentScheduleId, table.contractId],
+      foreignColumns: [repaymentSchedule.id, repaymentSchedule.contractId],
+      name: "installment_schedule_contract_fk",
+    }).onDelete("restrict"),
   ],
 );
 
