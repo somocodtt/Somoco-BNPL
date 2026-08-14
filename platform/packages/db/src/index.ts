@@ -12,9 +12,18 @@ export {
 } from "./inbox.js";
 export {
   claimOutboxBatch,
+  completeOutboxAttempt,
   enqueueOutbox,
+  exceptOutboxAttempt,
+  heartbeatOutboxClaim,
+  listOutboxAttempts,
+  scheduleOutboxRetry,
   type ClaimOutboxBatchOptions,
+  type CompleteOutboxAttemptInput,
+  type FailOutboxAttemptInput,
+  type HeartbeatOutboxClaimInput,
   type NewOutboxMessage,
+  type OutboxAttemptRecord,
   type OutboxMessage,
 } from "./outbox.js";
 export {

@@ -55,7 +55,12 @@ export const outboxMessage = pgTable(
     attempts: integer("attempts").notNull().default(0),
     claimedBy: text("claimed_by"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    availableAt: timestamp("available_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
+    exceptionAt: timestamp("exception_at", { withTimezone: true }),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -64,10 +69,59 @@ export const outboxMessage = pgTable(
   (table) => [
     index("outbox_dispatch_idx").on(
       table.publishedAt,
+      table.exceptionAt,
+      table.availableAt,
       table.claimedAt,
       table.occurredAt,
     ),
     check("outbox_attempts_nonnegative", sql`${table.attempts} >= 0`),
+    check(
+      "outbox_claim_consistent",
+      sql`(${table.claimedBy} is null) = (${table.claimedAt} is null)`,
+    ),
+    check(
+      "outbox_terminal_state_exclusive",
+      sql`not (${table.publishedAt} is not null and ${table.exceptionAt} is not null)`,
+    ),
+  ],
+);
+
+export const outboxAttempt = pgTable(
+  "outbox_attempt",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    outboxMessageId: uuid("outbox_message_id")
+      .notNull()
+      .references(() => outboxMessage.id, { onDelete: "restrict" }),
+    attemptNumber: integer("attempt_number").notNull(),
+    workerId: text("worker_id").notNull(),
+    attemptedAt: timestamp("attempted_at", { withTimezone: true }).notNull(),
+    outcome: text("outcome").notNull(),
+    failureCode: text("failure_code"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("outbox_attempt_number_unique").on(
+      table.outboxMessageId,
+      table.attemptNumber,
+    ),
+    check("outbox_attempt_number_positive", sql`${table.attemptNumber} > 0`),
+    check(
+      "outbox_attempt_outcome_allowed",
+      sql`${table.outcome} in ('PUBLISHED', 'RETRY_SCHEDULED', 'EXCEPTION')`,
+    ),
+    check(
+      "outbox_attempt_failure_code_safe",
+      sql`${table.failureCode} is null or ${table.failureCode} ~ '^[A-Z][A-Z0-9_]{0,63}$'`,
+    ),
+    check(
+      "outbox_attempt_outcome_consistent",
+      sql`(
+        (${table.outcome} = 'PUBLISHED' and ${table.failureCode} is null and ${table.nextAttemptAt} is null)
+        or (${table.outcome} = 'RETRY_SCHEDULED' and ${table.failureCode} is not null and ${table.nextAttemptAt} is not null)
+        or (${table.outcome} = 'EXCEPTION' and ${table.failureCode} is not null and ${table.nextAttemptAt} is null)
+      )`,
+    ),
   ],
 );
 

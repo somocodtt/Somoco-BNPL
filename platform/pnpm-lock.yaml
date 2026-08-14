@@ -54,6 +54,22 @@ importers:
         specifier: ^5.11.3
         version: 5.11.3
 
+  apps/worker:
+    dependencies:
+      '@somo/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@somo/integrations':
+        specifier: workspace:*
+        version: link:../../packages/integrations
+    devDependencies:
+      '@somo/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
+
   packages/contracts:
     dependencies:
       zod:
@@ -83,6 +99,8 @@ importers:
         version: 0.31.10
 
   packages/domain: {}
+
+  packages/integrations: {}
 
   packages/testkit:
     dependencies:

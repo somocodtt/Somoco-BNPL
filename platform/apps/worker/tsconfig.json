@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "../..",
+    "paths": {
+      "@somo/db": ["../../packages/db/src/index.ts"],
+      "@somo/integrations": ["../../packages/integrations/src/index.ts"],
+      "@somo/testkit": ["../../packages/testkit/src/index.ts"]
+    },
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
