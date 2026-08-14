@@ -17,6 +17,15 @@ describe("money", () => {
     expect(() => ghs(-1n)).toThrowError("MONEY_VALUE_OUT_OF_RANGE");
   });
 
+  it("rejects non-bigint values at construction", () => {
+    expect(() => ghs(0.5 as unknown as bigint)).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
+    expect(() => ghs(Number.NaN as unknown as bigint)).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
+  });
+
   it("adds minor units without floating point", () => {
     expect(addMoney(ghs(10_005n), ghs(995n))).toEqual(ghs(11_000n));
   });
@@ -56,6 +65,26 @@ describe("money", () => {
       currency: "GHS",
       minorUnits: "12345",
     });
+  });
+
+  it("rejects externally supplied non-bigint values at public boundaries", () => {
+    const malformedMoney = {
+      currency: "GHS",
+      minorUnits: 0.5,
+    } as unknown as ReturnType<typeof ghs>;
+
+    expect(() => toMoneyDto(malformedMoney)).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
+    expect(() => addMoney(malformedMoney, ghs(1n))).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
+    expect(() => subtractMoney(malformedMoney, ghs(1n))).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
+    expect(() => compareMoney(malformedMoney, ghs(1n))).toThrowError(
+      "MONEY_VALUE_OUT_OF_RANGE",
+    );
   });
 
   it("converts decimal DTO minor units back to bigint", () => {

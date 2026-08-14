@@ -18,7 +18,11 @@ function assertMoney(money: Money): void {
     throw new Error("MONEY_CURRENCY_NOT_SUPPORTED");
   }
 
-  if (money.minorUnits < 0n || money.minorUnits > MAX_SIGNED_64_BIT) {
+  if (
+    typeof money.minorUnits !== "bigint" ||
+    money.minorUnits < 0n ||
+    money.minorUnits > MAX_SIGNED_64_BIT
+  ) {
     throw new Error("MONEY_VALUE_OUT_OF_RANGE");
   }
 }
