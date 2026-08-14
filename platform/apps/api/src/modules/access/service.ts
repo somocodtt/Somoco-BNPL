@@ -1,7 +1,7 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import {
   appendAuditEvent,
-  createStaffSession,
+  createStaffSessionForAccessVersion,
   createStaffUserInTransaction,
   findActiveStaffSessionByTokenHash,
   findStaffUserByEmail,
@@ -115,14 +115,12 @@ export async function createAccessService(options: {
         input.password,
       );
       if (user === null || !passwordVerified || user.status !== "ACTIVE") {
-        if (user !== null) {
-          await auditAuthenticationDenial(
-            database,
-            user.id,
-            input.requestId,
-            "CREDENTIALS_REJECTED",
-          );
-        }
+        await auditAuthenticationDenial(
+          database,
+          email,
+          config.auditTargetHmacSecret,
+          input.requestId,
+        );
         throw authenticationError();
       }
 
@@ -134,9 +132,9 @@ export async function createAccessService(options: {
       if (!mfaVerified) {
         await auditAuthenticationDenial(
           database,
-          user.id,
+          email,
+          config.auditTargetHmacSecret,
           input.requestId,
-          "MFA_REJECTED",
         );
         throw authenticationError();
       }
@@ -144,24 +142,39 @@ export async function createAccessService(options: {
       const token = randomBytes(32).toString("base64url");
       const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1_000);
       const now = new Date();
-      const session = await withTransaction(database, async (tx) => {
-        const created = await createStaffSession(tx, {
-          staffUserId: user.id,
-          tokenHash: hashSessionToken(token),
-          mfaVerified,
-          expiresAt,
+      let session;
+      try {
+        session = await withTransaction(database, async (tx) => {
+          const created = await createStaffSessionForAccessVersion(tx, {
+            staffUserId: user.id,
+            expectedStaffUserVersion: user.version,
+            tokenHash: hashSessionToken(token),
+            mfaVerified,
+            expiresAt,
+          });
+          await appendAuditEvent(tx, {
+            aggregateType: "staff_session",
+            aggregateId: created.id,
+            action: "STAFF_SESSION_CREATED",
+            actorStaffUserId: user.id,
+            requestId: input.requestId,
+            data: { mfaVerified: true },
+            occurredAt: now,
+          });
+          return created;
         });
-        await appendAuditEvent(tx, {
-          aggregateType: "staff_session",
-          aggregateId: created.id,
-          action: "STAFF_SESSION_CREATED",
-          actorStaffUserId: user.id,
-          requestId: input.requestId,
-          data: { mfaVerified: true },
-          occurredAt: now,
-        });
-        return created;
-      });
+      } catch (error) {
+        if (!isStaffUserAccessChanged(error)) {
+          throw error;
+        }
+        await auditAuthenticationDenial(
+          database,
+          email,
+          config.auditTargetHmacSecret,
+          input.requestId,
+        );
+        throw authenticationError();
+      }
       return {
         principal: {
           kind: "staff",
@@ -352,19 +365,32 @@ function authenticationError(): AppError {
 
 async function auditAuthenticationDenial(
   database: Database,
-  staffUserId: string,
+  normalizedEmail: string,
+  hmacSecret: string,
   requestId: string,
-  reason: string,
 ): Promise<void> {
   await appendAuditEvent(database, {
-    aggregateType: "staff_user",
-    aggregateId: staffUserId,
+    aggregateType: "staff_authentication_target",
+    aggregateId: authenticationAuditTargetId(normalizedEmail, hmacSecret),
     action: "STAFF_SESSION_DENIED",
-    actorStaffUserId: staffUserId,
     requestId,
-    data: { reason },
+    data: { reason: "AUTHENTICATION_REJECTED" },
     occurredAt: new Date(),
   });
+}
+
+function authenticationAuditTargetId(
+  normalizedEmail: string,
+  hmacSecret: string,
+): string {
+  const digest = createHmac("sha256", hmacSecret)
+    .update(normalizedEmail)
+    .digest()
+    .subarray(0, 16);
+  digest[6] = (digest[6]! & 0x0f) | 0x80;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = digest.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function databaseErrorCode(error: unknown): string | undefined {
@@ -379,4 +405,10 @@ function databaseErrorCode(error: unknown): string | undefined {
     current = "cause" in current ? current.cause : undefined;
   }
   return undefined;
+}
+
+function isStaffUserAccessChanged(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message === "STAFF_USER_ACCESS_CHANGED"
+  );
 }

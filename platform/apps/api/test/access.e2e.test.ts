@@ -2,11 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import {
   createDatabase,
+  createStaffSessionForAccessVersion,
   createStaffUser,
   findActiveStaffSessionByTokenHash,
   findStaffUserByEmail,
   listAuditEventsByActor,
+  listAuditEventsByRequestId,
   migrateDatabase,
+  updateStaffUserAccess,
+  withTransaction,
   type Database,
 } from "@somo/db";
 import argon2 from "argon2";
@@ -19,6 +23,7 @@ import {
   type StaffPrincipal,
 } from "../src/modules/access/policy.js";
 import type { StaffAction } from "../src/modules/access/actions.js";
+import { createAccessService } from "../src/modules/access/service.js";
 import { resetTestDatabase } from "../../../packages/testkit/src/database.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -35,6 +40,7 @@ const testConfig: AppConfig = {
   allowedOrigins: ["https://staff.test.somo.example"],
   cookieName: "somo_staff_session",
   cookieSecret: "test-cookie-secret-with-at-least-32-characters",
+  auditTargetHmacSecret: "test-audit-target-secret-with-at-least-32-characters",
   cookieSecure: true,
   bodyLimitBytes: 1_024,
   rateLimitMax: 2,
@@ -256,6 +262,60 @@ describe("staff credentials and sessions", () => {
     expect(response.statusCode).toBe(401);
     expect(response.headers["set-cookie"]).toBeUndefined();
     expect(response.json()).toMatchObject({ code: "AUTHENTICATION_FAILED" });
+  });
+
+  it("records uniform null-actor denial audits for known and unknown emails", async () => {
+    await seedStaff("known-denial@somo.example", ["CUSTOMER_SUPPORT"]);
+    const password = "definitely wrong password";
+    const assertion = "denial-mfa-assertion";
+    const known = await app.inject({
+      method: "POST",
+      url: "/v1/staff/sessions",
+      remoteAddress: "203.0.113.25",
+      payload: {
+        email: "known-denial@somo.example",
+        password,
+        mfaAssertion: assertion,
+      },
+    });
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/v1/staff/sessions",
+      remoteAddress: "203.0.113.26",
+      payload: {
+        email: "unknown-denial@somo.example",
+        password,
+        mfaAssertion: assertion,
+      },
+    });
+
+    expect(known.statusCode).toBe(401);
+    expect(unknown.statusCode).toBe(401);
+    const knownAudits = await listAuditEventsByRequestId(
+      database,
+      known.json<{ requestId: string }>().requestId,
+    );
+    const unknownAudits = await listAuditEventsByRequestId(
+      database,
+      unknown.json<{ requestId: string }>().requestId,
+    );
+    expect(knownAudits).toHaveLength(1);
+    expect(unknownAudits).toHaveLength(1);
+    expect(auditDenialShape(knownAudits[0]!)).toEqual(
+      auditDenialShape(unknownAudits[0]!),
+    );
+    expect(auditDenialShape(knownAudits[0]!)).toEqual({
+      aggregateType: "staff_authentication_target",
+      action: "STAFF_SESSION_DENIED",
+      actorStaffUserId: null,
+      data: { reason: "AUTHENTICATION_REJECTED" },
+    });
+    expect(knownAudits[0]!.aggregateId).not.toBe(unknownAudits[0]!.aggregateId);
+    const persisted = JSON.stringify([...knownAudits, ...unknownAudits]);
+    expect(persisted).not.toContain("known-denial@somo.example");
+    expect(persisted).not.toContain("unknown-denial@somo.example");
+    expect(persisted).not.toContain(password);
+    expect(persisted).not.toContain(assertion);
   });
 
   it("stores only a hash of a verified session token and sets a hardened cookie", async () => {
@@ -577,6 +637,148 @@ describe("staff account administration", () => {
   });
 });
 
+describe("staff access-version concurrency", () => {
+  it("rejects a session insert when a privilege update commits first", async () => {
+    const target = await seedStaff("update-first@somo.example", ["MD"]);
+    const updateApplied = deferred<void>();
+    const releaseUpdate = deferred<void>();
+    const updated = withTransaction(database, async (tx) => {
+      const result = await updateStaffUserAccess(tx, {
+        staffUserId: target.id,
+        expectedVersion: 1,
+        roles: ["CFO"],
+        changedAt: new Date(),
+      });
+      updateApplied.resolve();
+      await releaseUpdate.promise;
+      return result;
+    });
+    await updateApplied.promise;
+
+    const loginStarted = deferred<void>();
+    const tokenHash = createHash("sha256")
+      .update("update-first-session-token")
+      .digest("hex");
+    const inserted = withTransaction(database, async (tx) => {
+      loginStarted.resolve();
+      return createStaffSessionForAccessVersion(tx, {
+        staffUserId: target.id,
+        expectedStaffUserVersion: 1,
+        tokenHash,
+        mfaVerified: true,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+    });
+    const insertedOutcome = settle(inserted);
+    await loginStarted.promise;
+    releaseUpdate.resolve();
+
+    await updated;
+    const outcome = await insertedOutcome;
+    if (outcome.status === "fulfilled") {
+      throw new Error("Expected the stale session insert to be rejected");
+    }
+    expect(outcome.error).toMatchObject({
+      message: "STAFF_USER_ACCESS_CHANGED",
+    });
+    expect(
+      await findActiveStaffSessionByTokenHash(database, tokenHash, new Date()),
+    ).toBeNull();
+  });
+
+  it("lets a later privilege update revoke a session inserted first", async () => {
+    const target = await seedStaff("login-first@somo.example", ["MD"]);
+    const sessionInserted = deferred<void>();
+    const releaseLogin = deferred<void>();
+    const tokenHash = createHash("sha256")
+      .update("login-first-session-token")
+      .digest("hex");
+    const inserted = withTransaction(database, async (tx) => {
+      const session = await createStaffSessionForAccessVersion(tx, {
+        staffUserId: target.id,
+        expectedStaffUserVersion: 1,
+        tokenHash,
+        mfaVerified: true,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      sessionInserted.resolve();
+      await releaseLogin.promise;
+      return session;
+    });
+    const insertedOutcome = settle(inserted);
+    const insertionState = await Promise.race([
+      sessionInserted.promise.then(() => "inserted" as const),
+      insertedOutcome.then(() => "settled" as const),
+    ]);
+    expect(insertionState).toBe("inserted");
+
+    const updateStarted = deferred<void>();
+    const updated = withTransaction(database, async (tx) => {
+      updateStarted.resolve();
+      return updateStaffUserAccess(tx, {
+        staffUserId: target.id,
+        expectedVersion: 1,
+        roles: ["CFO"],
+        changedAt: new Date(),
+      });
+    });
+    await updateStarted.promise;
+    releaseLogin.resolve();
+
+    await inserted;
+    await updated;
+    expect(
+      await findActiveStaffSessionByTokenHash(database, tokenHash, new Date()),
+    ).toBeNull();
+  });
+
+  it("rejects login when access changes during slow MFA", async () => {
+    const target = await seedStaff("mfa-race@somo.example", ["MD"]);
+    const mfaStarted = deferred<void>();
+    const releaseMfa = deferred<void>();
+    const service = await createAccessService({
+      config: testConfig,
+      database,
+      mfaVerifier: {
+        kind: "test",
+        async verify() {
+          mfaStarted.resolve();
+          await releaseMfa.promise;
+          return true;
+        },
+      },
+    });
+    const requestId = randomUUID();
+    const loginAttempt = service.createSession({
+      email: target.email,
+      password: "correct horse battery staple",
+      mfaAssertion: "slow-mfa-assertion",
+      requestId,
+    });
+    await mfaStarted.promise;
+
+    await withTransaction(database, (tx) =>
+      updateStaffUserAccess(tx, {
+        staffUserId: target.id,
+        expectedVersion: 1,
+        roles: ["CFO"],
+        changedAt: new Date(),
+      }),
+    );
+    releaseMfa.resolve();
+
+    await expect(loginAttempt).rejects.toThrow("AUTHENTICATION_FAILED");
+    const audits = await listAuditEventsByRequestId(database, requestId);
+    expect(audits).toHaveLength(1);
+    expect(auditDenialShape(audits[0]!)).toEqual({
+      aggregateType: "staff_authentication_target",
+      action: "STAFF_SESSION_DENIED",
+      actorStaffUserId: null,
+      data: { reason: "AUTHENTICATION_REJECTED" },
+    });
+  });
+});
+
 describe("fail-closed configuration and logging", () => {
   it("rejects missing production environment configuration", () => {
     expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(
@@ -588,6 +790,7 @@ describe("fail-closed configuration and logging", () => {
     ["database URL", { databaseUrl: "" }],
     ["allowed origins", { allowedOrigins: [] }],
     ["cookie secret", { cookieSecret: "too-short" }],
+    ["audit target secret", { auditTargetHmacSecret: "too-short" }],
     ["secure cookie", { cookieSecure: false }],
     ["verified MFA", { requireVerifiedMfa: false }],
   ] as const)("rejects production without %s", (_label, override) => {
@@ -646,6 +849,56 @@ describe("fail-closed configuration and logging", () => {
 });
 
 describe("staff action policy", () => {
+  it("distinguishes the BSM initial and final approval phases", () => {
+    const principal: StaffPrincipal = {
+      kind: "staff",
+      staffUserId: randomUUID(),
+      roles: ["BSM"],
+      sessionId: randomUUID(),
+    };
+
+    expect(() =>
+      authorize(principal, "application.approve.bsm.initial"),
+    ).not.toThrow();
+    expect(() =>
+      authorize(principal, "application.approve.bsm.final"),
+    ).not.toThrow();
+  });
+
+  it("preserves both BSM approval phases in authorization audits", async () => {
+    const bsm = await seedStaff("bsm-audit@somo.example", ["BSM"]);
+    const principal: StaffPrincipal = {
+      kind: "staff",
+      staffUserId: bsm.id,
+      roles: ["BSM"],
+      sessionId: randomUUID(),
+    };
+    const service = await createAccessService({
+      config: testConfig,
+      database,
+      mfaVerifier: deterministicMfaVerifier,
+    });
+
+    await service.authorizePrivileged({
+      principal,
+      action: "application.approve.bsm.initial",
+      requestId: randomUUID(),
+    });
+    await service.authorizePrivileged({
+      principal,
+      action: "application.approve.bsm.final",
+      requestId: randomUUID(),
+    });
+
+    const actions = (await listAuditEventsByActor(database, bsm.id))
+      .filter((event) => event.action === "ACCESS_ALLOWED")
+      .map((event) => event.data.action);
+    expect(actions).toEqual([
+      "application.approve.bsm.initial",
+      "application.approve.bsm.final",
+    ]);
+  });
+
   it("prevents a system administrator from approving a loan", () => {
     expect(() =>
       authorize(systemAdminPrincipal(), "application.approve.md"),
@@ -777,4 +1030,36 @@ function authenticatedMutationHeaders(response: InjectionResponse): {
     cookie: cookieHeader(response),
     "x-csrf-token": response.json<{ csrfToken: string }>().csrfToken,
   };
+}
+
+function auditDenialShape(event: {
+  aggregateType: string;
+  action: string;
+  actorStaffUserId: string | null;
+  data: Record<string, unknown>;
+}) {
+  return {
+    aggregateType: event.aggregateType,
+    action: event.action,
+    actorStaffUserId: event.actorStaffUserId,
+    data: event.data,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function settle<T>(promise: Promise<T>) {
+  try {
+    return { status: "fulfilled" as const, value: await promise };
+  } catch (error) {
+    return { status: "rejected" as const, error };
+  }
 }

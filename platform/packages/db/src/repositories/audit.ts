@@ -32,3 +32,14 @@ export async function listAuditEventsByActor(
     .where(eq(auditEvent.actorStaffUserId, staffUserId))
     .orderBy(asc(auditEvent.recordedAt));
 }
+
+export async function listAuditEventsByRequestId(
+  db: Database | DatabaseTransaction,
+  requestId: string,
+) {
+  return getInternalExecutor(db)
+    .select()
+    .from(auditEvent)
+    .where(eq(auditEvent.requestId, requestId))
+    .orderBy(asc(auditEvent.recordedAt));
+}

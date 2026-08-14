@@ -41,6 +41,10 @@ export interface NewStaffSession {
   expiresAt: Date;
 }
 
+export interface NewStaffSessionForAccessVersion extends NewStaffSession {
+  expectedStaffUserVersion: number;
+}
+
 export interface ActiveStaffSession {
   id: string;
   staffUserId: string;
@@ -118,6 +122,31 @@ export async function createStaffSession(
     throw new Error("STAFF_SESSION_CREATE_FAILED");
   }
   return inserted;
+}
+
+export async function createStaffSessionForAccessVersion(
+  tx: DatabaseTransaction,
+  input: NewStaffSessionForAccessVersion,
+) {
+  const [user] = await getInternalExecutor(tx)
+    .select({ version: staffUser.version, status: staffUser.status })
+    .from(staffUser)
+    .where(eq(staffUser.id, input.staffUserId))
+    .limit(1)
+    .for("update");
+  if (
+    user === undefined ||
+    user.status !== "ACTIVE" ||
+    user.version !== input.expectedStaffUserVersion
+  ) {
+    throw new Error("STAFF_USER_ACCESS_CHANGED");
+  }
+  return createStaffSession(tx, {
+    staffUserId: input.staffUserId,
+    tokenHash: input.tokenHash,
+    mfaVerified: input.mfaVerified,
+    expiresAt: input.expiresAt,
+  });
 }
 
 export async function findActiveStaffSessionByTokenHash(

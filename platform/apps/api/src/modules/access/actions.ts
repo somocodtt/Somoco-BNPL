@@ -1,6 +1,7 @@
 export type StaffAction =
   | "application.verify"
-  | "application.approve.bsm"
+  | "application.approve.bsm.initial"
+  | "application.approve.bsm.final"
   | "application.approve.agm"
   | "application.approve.cfo"
   | "application.approve.md"

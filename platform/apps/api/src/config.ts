@@ -8,6 +8,7 @@ export interface AppConfig {
   allowedOrigins: readonly string[];
   cookieName: string;
   cookieSecret: string;
+  auditTargetHmacSecret: string;
   cookieSecure: boolean;
   bodyLimitBytes: number;
   rateLimitMax: number;
@@ -41,6 +42,10 @@ export function loadConfig(
       .map((origin) => origin.trim()),
     cookieName: required(env.STAFF_COOKIE_NAME, "STAFF_COOKIE_NAME"),
     cookieSecret: required(env.COOKIE_SECRET, "COOKIE_SECRET"),
+    auditTargetHmacSecret: required(
+      env.AUDIT_TARGET_HMAC_SECRET,
+      "AUDIT_TARGET_HMAC_SECRET",
+    ),
     cookieSecure: boolean(env.COOKIE_SECURE, "COOKIE_SECURE"),
     bodyLimitBytes: integer(env.BODY_LIMIT_BYTES, "BODY_LIMIT_BYTES"),
     rateLimitMax: integer(env.RATE_LIMIT_MAX, "RATE_LIMIT_MAX"),
@@ -93,6 +98,9 @@ export function validateConfig(config: AppConfig): AppConfig {
   }
   if (config.cookieSecret.length < 32) {
     throw new Error("cookieSecret must be at least 32 characters");
+  }
+  if (config.auditTargetHmacSecret.length < 32) {
+    throw new Error("auditTargetHmacSecret must be at least 32 characters");
   }
   if (config.environment === "test" && config.port === 0) {
     // Port zero is an explicit synthetic-test sentinel; production never accepts it.

@@ -19,6 +19,7 @@ export {
 } from "./outbox.js";
 export {
   createStaffSession,
+  createStaffSessionForAccessVersion,
   createStaffUser,
   createStaffUserInTransaction,
   findActiveStaffSessionByTokenHash,
@@ -31,6 +32,7 @@ export {
   type DatabaseStaffRole,
   type DatabaseStaffUserStatus,
   type NewStaffSession,
+  type NewStaffSessionForAccessVersion,
   type NewStaffUser,
   type StaffUserRecord,
   type UpdateStaffUserAccess,
@@ -42,6 +44,7 @@ export {
 export {
   appendAuditEvent,
   listAuditEventsByActor,
+  listAuditEventsByRequestId,
   type NewAuditEvent,
 } from "./repositories/audit.js";
 export {

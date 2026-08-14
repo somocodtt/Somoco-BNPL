@@ -29,7 +29,8 @@ export interface CustomerPrincipal {
 
 const actionRoles = {
   "application.verify": ["VERIFICATION_OFFICER"],
-  "application.approve.bsm": ["BSM"],
+  "application.approve.bsm.initial": ["BSM"],
+  "application.approve.bsm.final": ["BSM"],
   "application.approve.agm": ["AGM"],
   "application.approve.cfo": ["CFO"],
   "application.approve.md": ["MD"],
