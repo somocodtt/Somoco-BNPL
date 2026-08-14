@@ -45,61 +45,55 @@ describe("PostgreSQL-backed outbox worker", () => {
 
   it("persists retry visibility and final exception across a database restart", async () => {
     const message = await enqueue(database);
-    let nowMs = initialTime;
     const handler: OutboxHandler = async () => {
       throw new IntegrationTemporaryError("ERP_UNAVAILABLE");
     };
 
-    await dispatch(database, "worker-one", () => new Date(nowMs), handler, 2);
-    expect(await listOutboxAttempts(database, message.id)).toEqual([
+    await dispatch(database, "worker-one", () => new Date(), handler, 2);
+    expect(await listOutboxAttempts(database, message.id)).toMatchObject([
       {
         attemptNumber: 1,
         workerId: "worker-one",
-        attemptedAt: new Date(initialTime),
+        attemptedAt: expect.any(Date),
+        finishedAt: expect.any(Date),
         outcome: "RETRY_SCHEDULED",
         failureCode: "ERP_UNAVAILABLE",
-        nextAttemptAt: new Date(initialTime + 1_000),
+        nextAttemptAt: expect.any(Date),
       },
     ]);
 
     await close();
     ({ db: database, close } = createDatabase(databaseUrl));
-    nowMs += 999;
     expect(
-      await dispatch(database, "worker-two", () => new Date(nowMs), handler, 2),
+      await dispatch(database, "worker-two", () => new Date(), handler, 2),
     ).toBe(0);
 
-    nowMs += 1;
+    await new Promise((resolve) => setTimeout(resolve, 550));
     expect(
-      await dispatch(database, "worker-two", () => new Date(nowMs), handler, 2),
+      await dispatch(database, "worker-two", () => new Date(), handler, 2),
     ).toBe(1);
-    expect(await listOutboxAttempts(database, message.id)).toEqual([
+    expect(await listOutboxAttempts(database, message.id)).toMatchObject([
       {
         attemptNumber: 1,
         workerId: "worker-one",
-        attemptedAt: new Date(initialTime),
+        attemptedAt: expect.any(Date),
+        finishedAt: expect.any(Date),
         outcome: "RETRY_SCHEDULED",
         failureCode: "ERP_UNAVAILABLE",
-        nextAttemptAt: new Date(initialTime + 1_000),
+        nextAttemptAt: expect.any(Date),
       },
       {
         attemptNumber: 2,
         workerId: "worker-two",
-        attemptedAt: new Date(initialTime + 1_000),
+        attemptedAt: expect.any(Date),
+        finishedAt: expect.any(Date),
         outcome: "EXCEPTION",
         failureCode: "ERP_UNAVAILABLE",
         nextAttemptAt: null,
       },
     ]);
-    nowMs += 60_000;
     expect(
-      await dispatch(
-        database,
-        "worker-three",
-        () => new Date(nowMs),
-        handler,
-        2,
-      ),
+      await dispatch(database, "worker-three", () => new Date(), handler, 2),
     ).toBe(0);
   });
 
@@ -126,11 +120,12 @@ describe("PostgreSQL-backed outbox worker", () => {
       ),
     ).toBe(0);
     expect(handled).toEqual([message.id]);
-    expect(await listOutboxAttempts(database, message.id)).toEqual([
+    expect(await listOutboxAttempts(database, message.id)).toMatchObject([
       {
         attemptNumber: 1,
         workerId: "worker-one",
-        attemptedAt: new Date(initialTime),
+        attemptedAt: expect.any(Date),
+        finishedAt: expect.any(Date),
         outcome: "PUBLISHED",
         failureCode: null,
         nextAttemptAt: null,
@@ -144,15 +139,15 @@ describe("PostgreSQL-backed outbox worker", () => {
     const [first] = await store.claim({
       workerId: "worker-one",
       limit: 1,
-      claimedAt: new Date(initialTime),
-      staleBefore: new Date(initialTime - 1),
+      claimLeaseMs: 100,
+      maxAttempts: 3,
     });
     expect(first?.id).toBe(message.id);
     expect(
       await store.heartbeat({
         messageId: message.id,
         workerId: "worker-one",
-        heartbeatAt: new Date(initialTime + 1_000),
+        leaseToken: first?.leaseToken ?? "missing",
       }),
     ).toBe(true);
 
@@ -160,16 +155,17 @@ describe("PostgreSQL-backed outbox worker", () => {
       await store.claim({
         workerId: "worker-two",
         limit: 1,
-        claimedAt: new Date(initialTime + 1_500),
-        staleBefore: new Date(initialTime + 900),
+        claimLeaseMs: 100,
+        maxAttempts: 3,
       }),
     ).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 110));
     expect(
       await store.claim({
         workerId: "worker-two",
         limit: 1,
-        claimedAt: new Date(initialTime + 2_001),
-        staleBefore: new Date(initialTime + 1_001),
+        claimLeaseMs: 100,
+        maxAttempts: 3,
       }),
     ).toMatchObject([{ id: message.id, attempts: 2 }]);
   });
@@ -181,8 +177,8 @@ describe("PostgreSQL-backed outbox worker", () => {
       store.claim({
         workerId,
         limit: 1,
-        claimedAt: new Date(initialTime),
-        staleBefore: new Date(initialTime - 1),
+        claimLeaseMs: 30_000,
+        maxAttempts: 3,
       });
 
     const [workerOne, workerTwo] = await Promise.all([
@@ -193,6 +189,110 @@ describe("PostgreSQL-backed outbox worker", () => {
     expect(workerOne).toHaveLength(1);
     expect(workerTwo).toHaveLength(1);
     expect(workerOne[0]?.id).not.toBe(workerTwo[0]?.id);
+  });
+
+  it("denies a stale claimant with the same worker id after lease reclaim", async () => {
+    const message = await enqueue(database);
+    const store = createDatabaseOutboxStore(database);
+    const [first] = await store.claim({
+      workerId: "reused-worker",
+      limit: 1,
+      claimLeaseMs: 5,
+      maxAttempts: 3,
+    });
+    expect(first?.leaseToken).toEqual(expect.any(String));
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const [reclaimed] = await store.claim({
+      workerId: "reused-worker",
+      limit: 1,
+      claimLeaseMs: 5,
+      maxAttempts: 3,
+    });
+    expect(reclaimed).toMatchObject({ id: message.id, attempts: 2 });
+    expect(reclaimed?.leaseToken).not.toBe(first?.leaseToken);
+
+    const staleOwnership = {
+      messageId: message.id,
+      workerId: "reused-worker",
+      leaseToken: first?.leaseToken ?? "missing",
+    };
+    expect(await store.heartbeat(staleOwnership)).toBe(false);
+    expect(await store.complete(staleOwnership)).toBe(false);
+    expect(
+      await store.retry({
+        ...staleOwnership,
+        failureCode: "ERP_UNAVAILABLE",
+        retryDelayMs: 1,
+      }),
+    ).toBe(false);
+    expect(
+      await store.except({
+        ...staleOwnership,
+        failureCode: "ERP_UNAVAILABLE",
+      }),
+    ).toBe(false);
+    expect(
+      await store.complete({
+        messageId: message.id,
+        workerId: "reused-worker",
+        leaseToken: reclaimed?.leaseToken ?? "missing",
+      }),
+    ).toBe(true);
+  });
+
+  it("records crash-abandoned attempts and never claims beyond max attempts", async () => {
+    const message = await enqueue(database);
+    const firstStore = createDatabaseOutboxStore(database);
+    const [first] = await firstStore.claim({
+      workerId: "worker-one",
+      limit: 1,
+      claimLeaseMs: 5,
+      maxAttempts: 2,
+    });
+    expect(first).toMatchObject({ id: message.id, attempts: 1 });
+    let providerCalls = 1;
+
+    await close();
+    ({ db: database, close } = createDatabase(databaseUrl));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const secondStore = createDatabaseOutboxStore(database);
+    const [second] = await secondStore.claim({
+      workerId: "worker-two",
+      limit: 1,
+      claimLeaseMs: 5,
+      maxAttempts: 2,
+    });
+    expect(second).toMatchObject({ id: message.id, attempts: 2 });
+    providerCalls += 1;
+
+    await close();
+    ({ db: database, close } = createDatabase(databaseUrl));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const thirdStore = createDatabaseOutboxStore(database);
+    expect(
+      await thirdStore.claim({
+        workerId: "worker-three",
+        limit: 1,
+        claimLeaseMs: 5,
+        maxAttempts: 2,
+      }),
+    ).toEqual([]);
+    expect(providerCalls).toBe(2);
+    expect(await listOutboxAttempts(database, message.id)).toMatchObject([
+      {
+        attemptNumber: 1,
+        workerId: "worker-one",
+        outcome: "ABANDONED",
+        failureCode: "OUTBOX_CLAIM_EXPIRED",
+      },
+      {
+        attemptNumber: 2,
+        workerId: "worker-two",
+        outcome: "EXCEPTION",
+        failureCode: "OUTBOX_MAX_ATTEMPTS_REACHED",
+      },
+    ]);
   });
 });
 
@@ -221,7 +321,7 @@ function dispatch(
     handlers: new Map([["erp.publish", handler]]),
     concurrency: 1,
     maxAttempts,
-    retryBaseDelayMs: 1_000,
+    retryBaseDelayMs: 500,
     heartbeatIntervalMs: 10_000,
     claimLeaseMs: 30_000,
     now,

@@ -1,4 +1,5 @@
-import type { OutboxMessage } from "@somo/db";
+import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
+import { isSimulatorAdapter } from "@somo/integrations";
 
 const failureCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -12,39 +13,60 @@ export interface WorkerLogger {
 export interface ClaimOutboxOptions {
   workerId: string;
   limit: number;
-  claimedAt: Date;
-  staleBefore: Date;
+  claimLeaseMs: number;
+  maxAttempts: number;
 }
 
 export interface HeartbeatOutboxClaim {
   messageId: string;
   workerId: string;
-  heartbeatAt: Date;
+  leaseToken: string;
 }
 
 export interface CompleteOutboxAttempt {
   messageId: string;
   workerId: string;
-  attemptedAt: Date;
-  publishedAt: Date;
+  leaseToken: string;
 }
 
 export interface FailOutboxAttempt {
   messageId: string;
   workerId: string;
-  attemptedAt: Date;
+  leaseToken: string;
   failureCode: string;
 }
 
 export interface OutboxClaimStore {
-  claim(options: ClaimOutboxOptions): Promise<OutboxMessage[]>;
+  claim(options: ClaimOutboxOptions): Promise<ClaimedOutboxMessage[]>;
   heartbeat(input: HeartbeatOutboxClaim): Promise<boolean>;
   complete(input: CompleteOutboxAttempt): Promise<boolean>;
-  retry(input: FailOutboxAttempt & { nextAttemptAt: Date }): Promise<boolean>;
-  except(input: FailOutboxAttempt & { exceptionAt: Date }): Promise<boolean>;
+  retry(input: FailOutboxAttempt & { retryDelayMs: number }): Promise<boolean>;
+  except(input: FailOutboxAttempt): Promise<boolean>;
 }
 
 export type OutboxHandler = (message: OutboxMessage) => Promise<unknown>;
+
+const handlerProvenance = new WeakMap<OutboxHandler, boolean>();
+
+export function createOutboxHandler(
+  adapters: readonly object[],
+  handler: OutboxHandler,
+): OutboxHandler {
+  const registered: OutboxHandler = (message) => handler(message);
+  handlerProvenance.set(
+    registered,
+    adapters.some((adapter) => isSimulatorAdapter(adapter)),
+  );
+  return registered;
+}
+
+export function inspectOutboxHandlerProvenance(
+  handler: OutboxHandler,
+): "UNDECLARED" | "PRODUCTION" | "SIMULATOR" {
+  const simulator = handlerProvenance.get(handler);
+  if (simulator === undefined) return "UNDECLARED";
+  return simulator ? "SIMULATOR" : "PRODUCTION";
+}
 
 export interface DispatchOutboxOptions {
   store: OutboxClaimStore;
@@ -82,12 +104,11 @@ export async function dispatchOutboxBatch(
   options: DispatchOutboxOptions,
 ): Promise<number> {
   validateDispatchOutboxOptions(options);
-  const claimedAt = options.now();
   const messages = await options.store.claim({
     workerId: options.workerId,
     limit: options.concurrency,
-    claimedAt,
-    staleBefore: new Date(claimedAt.getTime() - options.claimLeaseMs),
+    claimLeaseMs: options.claimLeaseMs,
+    maxAttempts: options.maxAttempts,
   });
 
   if (messages.length === 0) return 0;
@@ -105,20 +126,42 @@ export async function dispatchOutboxBatch(
 
 async function dispatchMessage(
   options: DispatchOutboxOptions,
-  message: OutboxMessage,
+  message: ClaimedOutboxMessage,
 ): Promise<void> {
   const handler = options.handlers.get(message.topic);
   try {
+    if (message.attempts > options.maxAttempts) {
+      const persisted = await options.store.except({
+        messageId: message.id,
+        workerId: options.workerId,
+        leaseToken: message.leaseToken,
+        failureCode: "OUTBOX_MAX_ATTEMPTS_REACHED",
+      });
+      if (!persisted) {
+        logClaimLost(options, message);
+      } else {
+        options.logger.error({
+          event: "outbox.dispatch_failed",
+          workerId: options.workerId,
+          outboxMessageId: message.id,
+          topic: message.topic,
+          attempt: message.attempts,
+          failureCode: "OUTBOX_MAX_ATTEMPTS_REACHED",
+          outcome: "EXCEPTION",
+        });
+      }
+      return;
+    }
     if (handler === undefined) {
       throw new PermanentWorkerError("OUTBOX_HANDLER_NOT_FOUND");
     }
-    await runWithHeartbeat(options, message, () => handler(message));
-    const attemptedAt = options.now();
+    await runWithHeartbeat(options, message, () =>
+      handler(toHandlerMessage(message)),
+    );
     const persisted = await options.store.complete({
       messageId: message.id,
       workerId: options.workerId,
-      attemptedAt,
-      publishedAt: attemptedAt,
+      leaseToken: message.leaseToken,
     });
     if (!persisted) {
       logClaimLost(options, message);
@@ -136,9 +179,21 @@ async function dispatchMessage(
   }
 }
 
+function toHandlerMessage(message: ClaimedOutboxMessage): OutboxMessage {
+  return {
+    id: message.id,
+    topic: message.topic,
+    aggregateType: message.aggregateType,
+    aggregateId: message.aggregateId,
+    payload: message.payload,
+    occurredAt: message.occurredAt,
+    attempts: message.attempts,
+  };
+}
+
 async function runWithHeartbeat(
   options: DispatchOutboxOptions,
-  message: OutboxMessage,
+  message: ClaimedOutboxMessage,
   operation: () => Promise<unknown>,
 ): Promise<void> {
   let heartbeatChain = Promise.resolve();
@@ -148,7 +203,7 @@ async function runWithHeartbeat(
         const persisted = await options.store.heartbeat({
           messageId: message.id,
           workerId: options.workerId,
-          heartbeatAt: options.now(),
+          leaseToken: message.leaseToken,
         });
         if (!persisted) logClaimLost(options, message);
       })
@@ -173,28 +228,23 @@ async function runWithHeartbeat(
 
 async function persistFailure(
   options: DispatchOutboxOptions,
-  message: OutboxMessage,
+  message: ClaimedOutboxMessage,
   failure: SanitizedFailure,
 ): Promise<void> {
-  const attemptedAt = options.now();
   const exception =
     !failure.retryable || message.attempts >= options.maxAttempts;
   const persisted = exception
     ? await options.store.except({
         messageId: message.id,
         workerId: options.workerId,
-        attemptedAt,
-        exceptionAt: attemptedAt,
+        leaseToken: message.leaseToken,
         failureCode: failure.code,
       })
     : await options.store.retry({
         messageId: message.id,
         workerId: options.workerId,
-        attemptedAt,
-        nextAttemptAt: new Date(
-          attemptedAt.getTime() +
-            retryDelayMs(message.attempts, options.retryBaseDelayMs),
-        ),
+        leaseToken: message.leaseToken,
+        retryDelayMs: retryDelayMs(message.attempts, options.retryBaseDelayMs),
         failureCode: failure.code,
       });
 
@@ -236,7 +286,7 @@ export function sanitizeFailure(cause: unknown): SanitizedFailure {
 
 function logClaimLost(
   options: DispatchOutboxOptions,
-  message: OutboxMessage,
+  message: ClaimedOutboxMessage,
 ): void {
   options.logger.error({
     event: "outbox.claim_lost",

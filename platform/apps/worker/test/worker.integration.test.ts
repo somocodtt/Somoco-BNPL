@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { OutboxMessage } from "@somo/db";
+import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
 import {
   IntegrationTemporaryError,
+  createPaymentWebhookSimulator,
   createSmsSimulator,
 } from "@somo/integrations";
-import { readWorkerProcessConfig, startWorker } from "../src/main.js";
 import {
+  readWorkerProcessConfig,
+  startWorker,
+  validateWorkerHandlerRegistry,
+} from "../src/main.js";
+import {
+  createOutboxHandler,
   dispatchOutboxBatch,
   type ClaimOutboxOptions,
   type CompleteOutboxAttempt,
@@ -24,6 +30,7 @@ interface StoredMessage {
   state: StoredState;
   availableAt: Date;
   claimedBy?: string;
+  leaseToken?: string;
   heartbeatAt?: Date;
   publishedAt?: Date;
   exceptionAt?: Date;
@@ -34,6 +41,8 @@ interface StoredMessage {
 class DurableTestOutbox implements OutboxClaimStore {
   readonly records: StoredMessage[];
   heartbeatCount = 0;
+  now = () => new Date();
+  private tokenSequence = 0;
 
   constructor(messages: readonly OutboxMessage[]) {
     this.records = messages.map((message) => ({
@@ -44,83 +53,108 @@ class DurableTestOutbox implements OutboxClaimStore {
     }));
   }
 
-  async claim(options: ClaimOutboxOptions): Promise<OutboxMessage[]> {
+  async claim(options: ClaimOutboxOptions): Promise<ClaimedOutboxMessage[]> {
+    const claimedAt = this.now();
+    const staleBefore = new Date(claimedAt.getTime() - options.claimLeaseMs);
     const claimed = this.records
       .filter(
         (record) =>
           (record.state === "PENDING" &&
-            record.availableAt <= options.claimedAt) ||
+            record.availableAt <= claimedAt &&
+            record.message.attempts < options.maxAttempts) ||
           (record.state === "CLAIMED" &&
             record.heartbeatAt !== undefined &&
-            record.heartbeatAt < options.staleBefore),
+            record.heartbeatAt < staleBefore &&
+            record.message.attempts < options.maxAttempts),
       )
       .slice(0, options.limit);
 
     return claimed.map((record) => {
       record.state = "CLAIMED";
       record.claimedBy = options.workerId;
-      record.heartbeatAt = options.claimedAt;
+      record.leaseToken = `lease-${String(++this.tokenSequence)}`;
+      record.heartbeatAt = claimedAt;
       record.message = {
         ...record.message,
         attempts: record.message.attempts + 1,
       };
-      return { ...record.message };
+      return { ...record.message, leaseToken: record.leaseToken };
     });
   }
 
   async heartbeat(input: HeartbeatOutboxClaim): Promise<boolean> {
-    const record = this.owned(input.messageId, input.workerId);
+    const record = this.owned(
+      input.messageId,
+      input.workerId,
+      input.leaseToken,
+    );
     if (record === undefined) return false;
-    record.heartbeatAt = input.heartbeatAt;
+    record.heartbeatAt = this.now();
     this.heartbeatCount += 1;
     return true;
   }
 
   async complete(input: CompleteOutboxAttempt): Promise<boolean> {
-    const record = this.owned(input.messageId, input.workerId);
+    const record = this.owned(
+      input.messageId,
+      input.workerId,
+      input.leaseToken,
+    );
     if (record === undefined) return false;
     record.state = "PUBLISHED";
-    record.publishedAt = input.publishedAt;
-    record.attemptedAt.push(input.attemptedAt);
+    record.publishedAt = this.now();
+    record.attemptedAt.push(this.now());
     delete record.claimedBy;
+    delete record.leaseToken;
     return true;
   }
 
   async retry(
-    input: FailOutboxAttempt & { nextAttemptAt: Date },
+    input: FailOutboxAttempt & { retryDelayMs: number },
   ): Promise<boolean> {
-    const record = this.owned(input.messageId, input.workerId);
+    const record = this.owned(
+      input.messageId,
+      input.workerId,
+      input.leaseToken,
+    );
     if (record === undefined) return false;
     record.state = "PENDING";
-    record.availableAt = input.nextAttemptAt;
+    const attemptedAt = this.now();
+    record.availableAt = new Date(attemptedAt.getTime() + input.retryDelayMs);
     record.failureCode = input.failureCode;
-    record.attemptedAt.push(input.attemptedAt);
+    record.attemptedAt.push(attemptedAt);
     delete record.claimedBy;
+    delete record.leaseToken;
     return true;
   }
 
-  async except(
-    input: FailOutboxAttempt & { exceptionAt: Date },
-  ): Promise<boolean> {
-    const record = this.owned(input.messageId, input.workerId);
+  async except(input: FailOutboxAttempt): Promise<boolean> {
+    const record = this.owned(
+      input.messageId,
+      input.workerId,
+      input.leaseToken,
+    );
     if (record === undefined) return false;
     record.state = "EXCEPTION";
-    record.exceptionAt = input.exceptionAt;
+    record.exceptionAt = this.now();
     record.failureCode = input.failureCode;
-    record.attemptedAt.push(input.attemptedAt);
+    record.attemptedAt.push(this.now());
     delete record.claimedBy;
+    delete record.leaseToken;
     return true;
   }
 
   private owned(
     messageId: string,
     workerId: string,
+    leaseToken: string,
   ): StoredMessage | undefined {
     return this.records.find(
       (record) =>
         record.message.id === messageId &&
         record.state === "CLAIMED" &&
-        record.claimedBy === workerId,
+        record.claimedBy === workerId &&
+        record.leaseToken === leaseToken,
     );
   }
 }
@@ -148,6 +182,7 @@ function dispatcher(input: {
   maxAttempts?: number;
   retryBaseDelayMs?: number;
 }) {
+  input.store.now = input.now;
   return dispatchOutboxBatch({
     store: input.store,
     workerId: input.workerId ?? "worker-one",
@@ -176,6 +211,49 @@ async function eventually(
 }
 
 describe("durable outbox worker", () => {
+  it("rejects simulator-backed handlers at the production bootstrap boundary", () => {
+    const sms = createSmsSimulator({ environment: "test", fixtures: [] });
+    const payment = createPaymentWebhookSimulator({
+      environment: "test",
+      fixtures: [],
+    });
+    const handlers = new Map<string, OutboxHandler>([
+      ["notification.send", createSendNotificationHandler(sms)],
+      ["payment.verify", createOutboxHandler([payment], async () => undefined)],
+    ]);
+
+    expect(() => validateWorkerHandlerRegistry("production", handlers)).toThrow(
+      "WORKER_SIMULATOR_HANDLER_FORBIDDEN",
+    );
+  });
+
+  it("accepts provenance-declared production adapters in production", () => {
+    const productionPaymentVerifier = {
+      async verify() {
+        throw new Error("PROVIDER_NOT_CONFIGURED");
+      },
+    };
+    const handlers = new Map<string, OutboxHandler>([
+      [
+        "payment.verify",
+        createOutboxHandler([productionPaymentVerifier], async () => undefined),
+      ],
+    ]);
+
+    expect(() =>
+      validateWorkerHandlerRegistry("production", handlers),
+    ).not.toThrow();
+  });
+
+  it("rejects undeclared handler provenance in production", () => {
+    expect(() =>
+      validateWorkerHandlerRegistry(
+        "production",
+        new Map([["opaque.handler", async () => undefined]]),
+      ),
+    ).toThrow("WORKER_HANDLER_PROVENANCE_REQUIRED");
+  });
+
   it("fails closed when production bootstrap configuration is incomplete", () => {
     expect(() => readWorkerProcessConfig({})).toThrow(
       "WORKER_DATABASE_URL_REQUIRED",
@@ -194,12 +272,77 @@ describe("durable outbox worker", () => {
         DATABASE_URL: "postgresql://database",
         WORKER_ID: "worker-one",
         WORKER_HANDLERS_MODULE: "file:///deployment/worker-handlers.js",
+        NODE_ENV: "production",
       }),
     ).toEqual({
       databaseUrl: "postgresql://database",
       workerId: "worker-one",
       handlersModule: "file:///deployment/worker-handlers.js",
+      environment: "production",
     });
+    expect(() =>
+      readWorkerProcessConfig({
+        DATABASE_URL: "postgresql://database",
+        WORKER_ID: "worker-one",
+        WORKER_HANDLERS_MODULE: "file:///deployment/worker-handlers.js",
+        NODE_ENV: "prodution",
+      }),
+    ).toThrow("WORKER_NODE_ENV_INVALID");
+  });
+
+  it("does not invoke a handler for a claim beyond max attempts", async () => {
+    let handlerCalls = 0;
+    let exceptionCalls = 0;
+    const claim = {
+      ...outboxMessage("over-limit-message"),
+      attempts: 3,
+      leaseToken: "opaque-lease",
+    };
+    const store: OutboxClaimStore = {
+      async claim() {
+        return [claim];
+      },
+      async heartbeat() {
+        return true;
+      },
+      async complete() {
+        return true;
+      },
+      async retry() {
+        return true;
+      },
+      async except(input) {
+        exceptionCalls += 1;
+        expect(input).toMatchObject({
+          leaseToken: "opaque-lease",
+          failureCode: "OUTBOX_MAX_ATTEMPTS_REACHED",
+        });
+        return true;
+      },
+    };
+
+    await dispatchOutboxBatch({
+      store,
+      workerId: "worker-one",
+      handlers: new Map([
+        [
+          "erp.publish",
+          async () => {
+            handlerCalls += 1;
+          },
+        ],
+      ]),
+      concurrency: 1,
+      maxAttempts: 2,
+      retryBaseDelayMs: 1_000,
+      heartbeatIntervalMs: 10_000,
+      claimLeaseMs: 30_000,
+      now: () => new Date(initialTime),
+      logger: { info() {}, error() {} },
+    });
+
+    expect(handlerCalls).toBe(0);
+    expect(exceptionCalls).toBe(1);
   });
 
   it("rejects invalid configuration before entering the worker loop", () => {
@@ -219,16 +362,19 @@ describe("durable outbox worker", () => {
   it("marks a successfully dispatched message as published", async () => {
     const store = new DurableTestOutbox([outboxMessage("message-1")]);
     const handled: string[] = [];
+    let handlerSawLeaseToken = false;
 
     await dispatcher({
       store,
       now: () => new Date(initialTime),
       handler: async (message) => {
         handled.push(message.id);
+        handlerSawLeaseToken = "leaseToken" in message;
       },
     });
 
     expect(handled).toEqual(["message-1"]);
+    expect(handlerSawLeaseToken).toBe(false);
     expect(store.records[0]).toMatchObject({
       state: "PUBLISHED",
       attemptedAt: [new Date(initialTime)],

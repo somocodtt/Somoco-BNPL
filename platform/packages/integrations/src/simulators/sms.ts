@@ -1,5 +1,6 @@
 import type { SmsPort } from "../sms.js";
 import { assertSimulatorAllowed, type SimulatorEnvironment } from "./guard.js";
+import { markSimulatorAdapter } from "../provenance.js";
 
 type SmsInput = Parameters<SmsPort["send"]>[0];
 type SmsResult = Awaited<ReturnType<SmsPort["send"]>>;
@@ -16,23 +17,25 @@ export function createSmsSimulator(options: {
   assertSimulatorAllowed(options.environment);
   const acceptedByKey = new Map<string, SmsResult>();
 
-  return Object.freeze({
-    async send(input: SmsInput): Promise<SmsResult> {
-      const accepted = acceptedByKey.get(input.idempotencyKey);
-      if (accepted !== undefined) {
-        return accepted;
-      }
-      const fixture = options.fixtures.find((candidate) =>
-        smsInputMatches(candidate.input, input),
-      );
-      if (fixture === undefined) {
-        throw new Error("SIMULATOR_FIXTURE_NOT_FOUND");
-      }
-      const result = Object.freeze({ ...fixture.result });
-      acceptedByKey.set(input.idempotencyKey, result);
-      return result;
-    },
-  });
+  return markSimulatorAdapter(
+    Object.freeze({
+      async send(input: SmsInput): Promise<SmsResult> {
+        const accepted = acceptedByKey.get(input.idempotencyKey);
+        if (accepted !== undefined) {
+          return accepted;
+        }
+        const fixture = options.fixtures.find((candidate) =>
+          smsInputMatches(candidate.input, input),
+        );
+        if (fixture === undefined) {
+          throw new Error("SIMULATOR_FIXTURE_NOT_FOUND");
+        }
+        const result = Object.freeze({ ...fixture.result });
+        acceptedByKey.set(input.idempotencyKey, result);
+        return result;
+      },
+    }),
+  );
 }
 
 function smsInputMatches(expected: SmsInput, actual: SmsInput): boolean {

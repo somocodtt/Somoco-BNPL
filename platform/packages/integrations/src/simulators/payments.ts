@@ -3,6 +3,7 @@ import type {
   PaymentWebhookVerifier,
 } from "../payments.js";
 import { assertSimulatorAllowed, type SimulatorEnvironment } from "./guard.js";
+import { markSimulatorAdapter } from "../provenance.js";
 
 export interface PaymentWebhookSimulatorFixture {
   readonly rawBody: Uint8Array;
@@ -16,24 +17,26 @@ export function createPaymentWebhookSimulator(options: {
   fixtures: readonly PaymentWebhookSimulatorFixture[];
 }): PaymentWebhookVerifier {
   assertSimulatorAllowed(options.environment);
-  return Object.freeze({
-    async verify(input: {
-      rawBody: Uint8Array;
-      signature: string;
-      requestTimestamp: string;
-    }): Promise<CanonicalPaymentEvent> {
-      const fixture = options.fixtures.find(
-        (candidate) =>
-          candidate.signature === input.signature &&
-          candidate.requestTimestamp === input.requestTimestamp &&
-          bytesMatch(candidate.rawBody, input.rawBody),
-      );
-      if (fixture === undefined) {
-        throw new Error("PAYMENT_SIGNATURE_INVALID");
-      }
-      return clonePaymentEvent(fixture.event);
-    },
-  });
+  return markSimulatorAdapter(
+    Object.freeze({
+      async verify(input: {
+        rawBody: Uint8Array;
+        signature: string;
+        requestTimestamp: string;
+      }): Promise<CanonicalPaymentEvent> {
+        const fixture = options.fixtures.find(
+          (candidate) =>
+            candidate.signature === input.signature &&
+            candidate.requestTimestamp === input.requestTimestamp &&
+            bytesMatch(candidate.rawBody, input.rawBody),
+        );
+        if (fixture === undefined) {
+          throw new Error("PAYMENT_SIGNATURE_INVALID");
+        }
+        return clonePaymentEvent(fixture.event);
+      },
+    }),
+  );
 }
 
 function bytesMatch(expected: Uint8Array, actual: Uint8Array): boolean {

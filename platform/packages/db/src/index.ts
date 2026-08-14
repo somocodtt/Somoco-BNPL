@@ -19,6 +19,7 @@ export {
   listOutboxAttempts,
   scheduleOutboxRetry,
   type ClaimOutboxBatchOptions,
+  type ClaimedOutboxMessage,
   type CompleteOutboxAttemptInput,
   type FailOutboxAttemptInput,
   type HeartbeatOutboxClaimInput,

@@ -54,6 +54,7 @@ export const outboxMessage = pgTable(
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     attempts: integer("attempts").notNull().default(0),
     claimedBy: text("claimed_by"),
+    claimToken: uuid("claim_token"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     availableAt: timestamp("available_at", { withTimezone: true })
       .defaultNow()
@@ -77,7 +78,10 @@ export const outboxMessage = pgTable(
     check("outbox_attempts_nonnegative", sql`${table.attempts} >= 0`),
     check(
       "outbox_claim_consistent",
-      sql`(${table.claimedBy} is null) = (${table.claimedAt} is null)`,
+      sql`(
+        (${table.claimedBy} is null and ${table.claimToken} is null and ${table.claimedAt} is null)
+        or (${table.claimedBy} is not null and ${table.claimToken} is not null and ${table.claimedAt} is not null)
+      )`,
     ),
     check(
       "outbox_terminal_state_exclusive",
@@ -95,7 +99,9 @@ export const outboxAttempt = pgTable(
       .references(() => outboxMessage.id, { onDelete: "restrict" }),
     attemptNumber: integer("attempt_number").notNull(),
     workerId: text("worker_id").notNull(),
+    leaseToken: uuid("lease_token").notNull(),
     attemptedAt: timestamp("attempted_at", { withTimezone: true }).notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
     outcome: text("outcome").notNull(),
     failureCode: text("failure_code"),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
@@ -108,7 +114,7 @@ export const outboxAttempt = pgTable(
     check("outbox_attempt_number_positive", sql`${table.attemptNumber} > 0`),
     check(
       "outbox_attempt_outcome_allowed",
-      sql`${table.outcome} in ('PUBLISHED', 'RETRY_SCHEDULED', 'EXCEPTION')`,
+      sql`${table.outcome} in ('STARTED', 'ABANDONED', 'PUBLISHED', 'RETRY_SCHEDULED', 'EXCEPTION')`,
     ),
     check(
       "outbox_attempt_failure_code_safe",
@@ -117,9 +123,11 @@ export const outboxAttempt = pgTable(
     check(
       "outbox_attempt_outcome_consistent",
       sql`(
-        (${table.outcome} = 'PUBLISHED' and ${table.failureCode} is null and ${table.nextAttemptAt} is null)
-        or (${table.outcome} = 'RETRY_SCHEDULED' and ${table.failureCode} is not null and ${table.nextAttemptAt} is not null)
-        or (${table.outcome} = 'EXCEPTION' and ${table.failureCode} is not null and ${table.nextAttemptAt} is null)
+        (${table.outcome} = 'STARTED' and ${table.finishedAt} is null and ${table.failureCode} is null and ${table.nextAttemptAt} is null)
+        or (${table.outcome} = 'ABANDONED' and ${table.finishedAt} is not null and ${table.failureCode} is not null and ${table.nextAttemptAt} is null)
+        or (${table.outcome} = 'PUBLISHED' and ${table.finishedAt} is not null and ${table.failureCode} is null and ${table.nextAttemptAt} is null)
+        or (${table.outcome} = 'RETRY_SCHEDULED' and ${table.finishedAt} is not null and ${table.failureCode} is not null and ${table.nextAttemptAt} is not null)
+        or (${table.outcome} = 'EXCEPTION' and ${table.finishedAt} is not null and ${table.failureCode} is not null and ${table.nextAttemptAt} is null)
       )`,
     ),
   ],

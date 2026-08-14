@@ -3,6 +3,7 @@ import { createDatabase, type Database } from "@somo/db";
 import { createDatabaseOutboxStore } from "./database-outbox-store.js";
 import {
   dispatchOutboxBatch,
+  inspectOutboxHandlerProvenance,
   validateDispatchOutboxOptions,
   type OutboxClaimStore,
   type OutboxHandler,
@@ -33,6 +34,7 @@ export interface WorkerProcessConfig {
   databaseUrl: string;
   workerId: string;
   handlersModule: string;
+  environment: "development" | "test" | "production";
 }
 
 export interface WorkerHandlerModuleContext {
@@ -140,7 +142,29 @@ export function readWorkerProcessConfig(
     environment.WORKER_HANDLERS_MODULE,
     "WORKER_HANDLERS_MODULE_REQUIRED",
   );
-  return Object.freeze({ databaseUrl, workerId, handlersModule });
+  const runtimeEnvironment = workerEnvironment(environment.NODE_ENV);
+  return Object.freeze({
+    databaseUrl,
+    workerId,
+    handlersModule,
+    environment: runtimeEnvironment,
+  });
+}
+
+export function validateWorkerHandlerRegistry(
+  environment: WorkerProcessConfig["environment"],
+  handlers: ReadonlyMap<string, OutboxHandler>,
+): void {
+  if (environment !== "production") return;
+  for (const handler of handlers.values()) {
+    const provenance = inspectOutboxHandlerProvenance(handler);
+    if (provenance === "SIMULATOR") {
+      throw new Error("WORKER_SIMULATOR_HANDLER_FORBIDDEN");
+    }
+    if (provenance === "UNDECLARED") {
+      throw new Error("WORKER_HANDLER_PROVENANCE_REQUIRED");
+    }
+  }
 }
 
 export async function runWorkerProcess(
@@ -156,6 +180,7 @@ export async function runWorkerProcess(
       config.handlersModule,
       connection.db,
     );
+    validateWorkerHandlerRegistry(config.environment, handlers);
     const worker = startWorker({
       store: createDatabaseOutboxStore(connection.db),
       workerId: config.workerId,
@@ -200,6 +225,16 @@ function requiredEnvironmentValue(
 ): string {
   if (value === undefined || value.trim().length === 0) throw new Error(code);
   return value;
+}
+
+function workerEnvironment(
+  value: string | undefined,
+): WorkerProcessConfig["environment"] {
+  const environment = value ?? "development";
+  if (!["development", "test", "production"].includes(environment)) {
+    throw new Error("WORKER_NODE_ENV_INVALID");
+  }
+  return environment as WorkerProcessConfig["environment"];
 }
 
 const processLoggerImplementation: WorkerLogger = {

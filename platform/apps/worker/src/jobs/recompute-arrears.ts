@@ -1,5 +1,8 @@
 import type { OutboxMessage } from "@somo/db";
-import { PermanentWorkerError } from "./dispatch-outbox.js";
+import {
+  createOutboxHandler,
+  PermanentWorkerError,
+} from "./dispatch-outbox.js";
 
 export interface ArrearsRecomputationPort {
   recompute(input: {
@@ -10,14 +13,14 @@ export interface ArrearsRecomputationPort {
 }
 
 export function createRecomputeArrearsHandler(port: ArrearsRecomputationPort) {
-  return async (message: OutboxMessage) => {
+  return createOutboxHandler([port], async (message: OutboxMessage) => {
     const asOfDate = arrearsDate(message.payload);
     return port.recompute({
       idempotencyKey: message.id,
       contractId: message.aggregateId,
       asOfDate,
     });
-  };
+  });
 }
 
 function arrearsDate(payload: unknown): string {

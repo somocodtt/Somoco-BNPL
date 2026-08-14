@@ -1,9 +1,12 @@
 import type { OutboxMessage } from "@somo/db";
 import type { SmsPort } from "@somo/integrations";
-import { PermanentWorkerError } from "./dispatch-outbox.js";
+import {
+  createOutboxHandler,
+  PermanentWorkerError,
+} from "./dispatch-outbox.js";
 
 export function createSendNotificationHandler(sms: SmsPort) {
-  return async (message: OutboxMessage) => {
+  return createOutboxHandler([sms], async (message: OutboxMessage) => {
     const payload = notificationPayload(message.payload);
     return sms.send({
       idempotencyKey: message.id,
@@ -11,7 +14,7 @@ export function createSendNotificationHandler(sms: SmsPort) {
       template: payload.template,
       variables: payload.variables,
     });
-  };
+  });
 }
 
 function notificationPayload(payload: unknown): {

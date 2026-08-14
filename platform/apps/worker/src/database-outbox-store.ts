@@ -14,8 +14,8 @@ export function createDatabaseOutboxStore(db: Database): OutboxClaimStore {
       claimOutboxBatch(db, {
         workerId: options.workerId,
         limit: options.limit,
-        claimedAt: options.claimedAt,
-        staleBefore: options.staleBefore,
+        claimLeaseMs: options.claimLeaseMs,
+        maxAttempts: options.maxAttempts,
       }),
     heartbeat: (input) => heartbeatOutboxClaim(db, input),
     complete: (input) => completeOutboxAttempt(db, input),

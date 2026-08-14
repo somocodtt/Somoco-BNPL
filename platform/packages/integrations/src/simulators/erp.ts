@@ -1,5 +1,6 @@
 import { IntegrationTemporaryError, type ErpPort } from "../erp.js";
 import { assertSimulatorAllowed, type SimulatorEnvironment } from "./guard.js";
+import { markSimulatorAdapter } from "../provenance.js";
 
 export type ErpSimulatorOutcome =
   | { readonly type: "SUCCESS"; readonly externalReference: string }
@@ -15,22 +16,24 @@ export function createErpSimulator(options: {
   fixtures: readonly ErpSimulatorFixture[];
 }): ErpPort {
   assertSimulatorAllowed(options.environment);
-  return Object.freeze({
-    async publish(
-      event: Parameters<ErpPort["publish"]>[0],
-    ): Promise<{ externalReference: string }> {
-      const fixture = options.fixtures.find(
-        (candidate) => candidate.eventId === event.eventId,
-      );
-      if (fixture === undefined) {
-        throw new Error("SIMULATOR_FIXTURE_NOT_FOUND");
-      }
-      if (fixture.outcome.type === "TEMPORARY_FAILURE") {
-        throw new IntegrationTemporaryError(fixture.outcome.code);
-      }
-      return Object.freeze({
-        externalReference: fixture.outcome.externalReference,
-      });
-    },
-  });
+  return markSimulatorAdapter(
+    Object.freeze({
+      async publish(
+        event: Parameters<ErpPort["publish"]>[0],
+      ): Promise<{ externalReference: string }> {
+        const fixture = options.fixtures.find(
+          (candidate) => candidate.eventId === event.eventId,
+        );
+        if (fixture === undefined) {
+          throw new Error("SIMULATOR_FIXTURE_NOT_FOUND");
+        }
+        if (fixture.outcome.type === "TEMPORARY_FAILURE") {
+          throw new IntegrationTemporaryError(fixture.outcome.code);
+        }
+        return Object.freeze({
+          externalReference: fixture.outcome.externalReference,
+        });
+      },
+    }),
+  );
 }
