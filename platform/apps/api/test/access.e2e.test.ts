@@ -25,6 +25,7 @@ import {
 import type { StaffAction } from "../src/modules/access/actions.js";
 import { createAccessService } from "../src/modules/access/service.js";
 import { resetTestDatabase } from "../../../packages/testkit/src/database.js";
+import { markProductionAdapter } from "../../../packages/integrations/src/provenance.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -60,57 +61,87 @@ const deterministicMfaVerifier = {
 };
 
 const productionIdentityTestDependencies = {
-  sms: {
-    async send() {
-      return {
-        providerReference: "production-safe-sms-test-reference",
-        acceptedAt: "2026-08-14T12:00:00.000Z",
-      };
+  sms: markProductionAdapter(
+    {
+      async send() {
+        return {
+          providerReference: "production-safe-sms-test-reference",
+          acceptedAt: "2026-08-14T12:00:00.000Z",
+        };
+      },
     },
-  },
+    "SMS",
+  ),
   otpPolicy: {
     ttlMs: 120_000,
     attemptLimit: 3,
     resendCooldownMs: 30_000,
     codeLength: 6,
     hashSecret: "production-safe-test-otp-secret-32-characters",
+    deliveryEncryptionSecret:
+      "production-safe-test-delivery-secret-32-characters",
     sessionTtlMs: 3_600_000,
   },
-  nia: {
-    async verify() {
-      return {
-        providerReference: "production-safe-nia-test-reference",
-        decision: "REVIEW" as const,
-        checkedAt: "2026-08-14T12:00:00.000Z",
-      };
-    },
+  consentCatalog: {
+    documents: [
+      {
+        purpose: "NIA_IDENTITY_VERIFICATION",
+        currentVersion: "nia-consent-v1",
+      },
+    ],
   },
+  nia: markProductionAdapter(
+    {
+      async verify() {
+        return {
+          providerReference: "production-safe-nia-test-reference",
+          decision: "REVIEW" as const,
+          checkedAt: "2026-08-14T12:00:00.000Z",
+        };
+      },
+    },
+    "NIA",
+  ),
   documents: {
-    storage: {
-      async createUploadTicket(input) {
-        return {
-          uploadUrl: "https://storage.test.invalid/upload",
-          requiredHeaders: input.requiredHeaders,
-        };
+    storage: markProductionAdapter(
+      {
+        async createUploadTicket(input) {
+          return {
+            uploadUrl: "https://storage.test.invalid/upload",
+            requiredHeaders: input.requiredHeaders,
+          };
+        },
+        async readObject() {
+          throw new Error("PRODUCTION_SAFE_TEST_OBJECT_UNAVAILABLE");
+        },
+        async promoteToImmutable() {
+          return {
+            objectKey: "identity-accepted/test/document/evidence",
+            versionId: "test-version-1",
+            etag: "0123456789abcdef0123456789abcdef",
+          };
+        },
+        async createDownloadTicket(input) {
+          return {
+            downloadUrl: "https://storage.test.invalid/download",
+            expiresAt: input.expiresAt.toISOString(),
+            requiredHeaders: { "if-match": input.etag },
+          };
+        },
       },
-      async readObject() {
-        throw new Error("PRODUCTION_SAFE_TEST_OBJECT_UNAVAILABLE");
+      "OBJECT_STORAGE",
+    ),
+    malwareScanner: markProductionAdapter(
+      {
+        async scan() {
+          return {
+            verdict: "CLEAN" as const,
+            scannerReference: "production-safe-scanner-test-reference",
+          };
+        },
       },
-      async createDownloadTicket(input) {
-        return {
-          downloadUrl: "https://storage.test.invalid/download",
-          expiresAt: input.expiresAt.toISOString(),
-        };
-      },
-    },
-    malwareScanner: {
-      async scan() {
-        return {
-          verdict: "CLEAN" as const,
-          scannerReference: "production-safe-scanner-test-reference",
-        };
-      },
-    },
+      "MALWARE_SCANNER",
+    ),
     policy: {
       allowedMimeTypes: ["application/pdf"],
       maxBytes: 1_024,

@@ -55,7 +55,11 @@ export interface DocumentService {
     sessionId?: string;
     documentId: string;
     requestId: string;
-  }): Promise<{ downloadUrl: string; expiresAt: string }>;
+  }): Promise<{
+    downloadUrl: string;
+    expiresAt: string;
+    requiredHeaders: Readonly<Record<string, string>>;
+  }>;
 }
 
 export interface DocumentClock {
@@ -331,6 +335,30 @@ export function createDocumentService(options: {
       }
 
       const digest = sha256(stored.bytes);
+      let immutableObject;
+      try {
+        immutableObject = await options.storage.promoteToImmutable({
+          stagingObjectKey: document.objectKey,
+          stagingVersionId: stored.versionId,
+          stagingEtag: stored.etag,
+          immutableObjectKey: `identity-accepted/${document.personId}/${document.id}/${digest}-${randomUUID()}`,
+        });
+      } catch {
+        await rejectDocument(
+          options.database,
+          input,
+          "SCANNING",
+          "QUARANTINED",
+          true,
+          "DOCUMENT_IMMUTABLE_PROMOTION_FAILED",
+          clock.now(),
+        );
+        throw new AppError(
+          503,
+          "DOCUMENT_STORAGE_UNAVAILABLE",
+          "Document storage is unavailable.",
+        );
+      }
       const acceptedAt = clock.now();
       const accepted = await transitionWithAudit({
         database: options.database,
@@ -340,6 +368,9 @@ export function createDocumentService(options: {
         status: "ACCEPTED",
         malwareScanned: true,
         sha256: digest,
+        acceptedObjectKey: immutableObject.objectKey,
+        acceptedObjectVersionId: immutableObject.versionId,
+        acceptedObjectEtag: immutableObject.etag,
         metadata: {
           detectedMimeType,
           scannerReference: scan.scannerReference,
@@ -377,7 +408,10 @@ export function createDocumentService(options: {
       if (
         document.status !== "ACCEPTED" ||
         !document.malwareScanned ||
-        document.sha256 === null
+        document.sha256 === null ||
+        document.acceptedObjectKey === null ||
+        document.acceptedObjectVersionId === null ||
+        document.acceptedObjectEtag === null
       ) {
         await appendAuditEvent(options.database, {
           aggregateType: "document",
@@ -403,7 +437,9 @@ export function createDocumentService(options: {
       });
       try {
         return await options.storage.createDownloadTicket({
-          objectKey: document.objectKey,
+          objectKey: document.acceptedObjectKey,
+          versionId: document.acceptedObjectVersionId,
+          etag: document.acceptedObjectEtag,
           expiresAt,
         });
       } catch {
@@ -462,6 +498,9 @@ async function transitionWithAudit(input: {
   status: DocumentStatus;
   malwareScanned: boolean;
   sha256?: string;
+  acceptedObjectKey?: string;
+  acceptedObjectVersionId?: string;
+  acceptedObjectEtag?: string;
   metadata?: Readonly<Record<string, unknown>>;
   requestId: string;
   action: string;
@@ -476,6 +515,15 @@ async function transitionWithAudit(input: {
       status: input.status,
       malwareScanned: input.malwareScanned,
       ...(input.sha256 === undefined ? {} : { sha256: input.sha256 }),
+      ...(input.acceptedObjectKey === undefined
+        ? {}
+        : { acceptedObjectKey: input.acceptedObjectKey }),
+      ...(input.acceptedObjectVersionId === undefined
+        ? {}
+        : { acceptedObjectVersionId: input.acceptedObjectVersionId }),
+      ...(input.acceptedObjectEtag === undefined
+        ? {}
+        : { acceptedObjectEtag: input.acceptedObjectEtag }),
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
       updatedAt: input.now,
     });

@@ -1,7 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import { createDatabase, migrateDatabase, type Database } from "@somo/db";
-import type { NiaPort, SmsPort } from "@somo/integrations";
+import {
+  openOtpDelivery,
+  type NiaPort,
+  type SmsPort,
+} from "@somo/integrations";
 import { createNiaSimulator } from "@somo/integrations/simulators";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
@@ -17,11 +21,14 @@ import {
 import { createConsentService } from "../src/modules/identity/consent-service.js";
 import { createNiaService } from "../src/modules/identity/nia-service.js";
 import {
+  attemptAcceptedDocumentMutation,
   attemptConsentEvidenceMutation,
   readAuditEventsForAggregate,
   readConsentEvidence,
   readIdentityChecks,
   readLatestOtpChallenge,
+  readOtpDeliveryPayloads,
+  readOtpRequestWorkEvidence,
   readSyntheticDraft,
   resetTestDatabase,
   seedSyntheticDraft,
@@ -60,8 +67,28 @@ const otpPolicy: OtpPolicy = {
   resendCooldownMs: 30_000,
   codeLength: 6,
   hashSecret: "test-otp-hash-secret-with-at-least-32-characters",
+  deliveryEncryptionSecret:
+    "test-otp-delivery-secret-with-at-least-32-characters",
   sessionTtlMs: 3_600_000,
 };
+
+const consentCatalogV1 = {
+  documents: [
+    {
+      purpose: "NIA_IDENTITY_VERIFICATION",
+      currentVersion: "nia-consent-v1",
+    },
+  ],
+} as const;
+
+const consentCatalogV2 = {
+  documents: [
+    {
+      purpose: "NIA_IDENTITY_VERIFICATION",
+      currentVersion: "nia-consent-v2",
+    },
+  ],
+} as const;
 
 let database: Database;
 let closeDatabase: () => Promise<void>;
@@ -106,7 +133,7 @@ describe("SMS OTP abuse controls", () => {
     await expect(
       service.verify({
         phoneE164: person.phoneE164,
-        code: sms.lastCode(),
+        code: await latestOtpCode(),
         requestId: randomUUID(),
       }),
     ).rejects.toMatchObject({ code: "OTP_VERIFICATION_FAILED" });
@@ -129,13 +156,13 @@ describe("SMS OTP abuse controls", () => {
       phoneE164: person.phoneE164,
       requestId: randomUUID(),
     });
-    const firstCode = sms.lastCode();
+    const firstCode = await latestOtpCode();
     clock.advance(otpPolicy.resendCooldownMs + 1);
     await service.request({
       phoneE164: person.phoneE164,
       requestId: randomUUID(),
     });
-    const secondCode = sms.lastCode();
+    const secondCode = await latestOtpCode();
 
     await expect(
       service.verify({
@@ -181,10 +208,134 @@ describe("SMS OTP abuse controls", () => {
     await expect(
       service.verify({
         phoneE164: person.phoneE164,
-        code: sms.lastCode(),
+        code: await latestOtpCode(),
         requestId: randomUUID(),
       }),
     ).rejects.toMatchObject({ code: "OTP_VERIFICATION_FAILED" });
+  });
+
+  it("keeps resend cooldown after attempt exhaustion", async () => {
+    const clock = mutableClock("2026-08-14T12:00:00.000Z");
+    const sms = recordingSms();
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000108",
+    });
+    const service = createOtpService({
+      database,
+      sms,
+      policy: otpPolicy,
+      clock,
+    });
+    await service.request({
+      phoneE164: person.phoneE164,
+      requestId: randomUUID(),
+    });
+    for (let attempt = 0; attempt < otpPolicy.attemptLimit; attempt += 1) {
+      await expect(
+        service.verify({
+          phoneE164: person.phoneE164,
+          code: "000000",
+          requestId: randomUUID(),
+        }),
+      ).rejects.toMatchObject({ code: "OTP_VERIFICATION_FAILED" });
+    }
+
+    await service.request({
+      phoneE164: person.phoneE164,
+      requestId: randomUUID(),
+    });
+
+    expect(await readOtpDeliveryPayloads(databaseUrl)).toHaveLength(1);
+  });
+
+  it("returns without awaiting SMS delivery and equalizes request persistence work", async () => {
+    const gate = deferredSms();
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000109",
+    });
+    const service = createOtpService({
+      database,
+      sms: gate.sms,
+      policy: otpPolicy,
+      clock: mutableClock("2026-08-14T12:00:00.000Z"),
+    });
+    const knownRequestId = randomUUID();
+    const unknownRequestId = randomUUID();
+    let knownSettled = false;
+    const knownRequest = service
+      .request({ phoneE164: person.phoneE164, requestId: knownRequestId })
+      .then(() => {
+        knownSettled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    const settledBeforeDelivery = knownSettled;
+    gate.release();
+    await knownRequest;
+    await service.request({
+      phoneE164: "+233200009998",
+      requestId: unknownRequestId,
+    });
+
+    expect(settledBeforeDelivery).toBe(true);
+    expect(gate.sendCount()).toBe(0);
+    expect(
+      await readOtpRequestWorkEvidence(databaseUrl, knownRequestId),
+    ).toEqual({
+      auditCount: 1,
+      outboxCount: 1,
+    });
+    expect(
+      await readOtpRequestWorkEvidence(databaseUrl, unknownRequestId),
+    ).toEqual({
+      auditCount: 1,
+      outboxCount: 1,
+    });
+  });
+
+  it("equalizes failed verification persistence for known and unknown targets", async () => {
+    const sms = recordingSms();
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000110",
+    });
+    const service = createOtpService({
+      database,
+      sms,
+      policy: otpPolicy,
+      clock: mutableClock("2026-08-14T12:00:00.000Z"),
+    });
+    await service.request({
+      phoneE164: person.phoneE164,
+      requestId: randomUUID(),
+    });
+    const knownRequestId = randomUUID();
+    const unknownRequestId = randomUUID();
+    await expect(
+      service.verify({
+        phoneE164: person.phoneE164,
+        code: "000000",
+        requestId: knownRequestId,
+      }),
+    ).rejects.toMatchObject({ code: "OTP_VERIFICATION_FAILED" });
+    await expect(
+      service.verify({
+        phoneE164: "+233200009997",
+        code: "000000",
+        requestId: unknownRequestId,
+      }),
+    ).rejects.toMatchObject({ code: "OTP_VERIFICATION_FAILED" });
+
+    expect(
+      await readOtpRequestWorkEvidence(databaseUrl, knownRequestId),
+    ).toEqual({
+      auditCount: 1,
+      outboxCount: 0,
+    });
+    expect(
+      await readOtpRequestWorkEvidence(databaseUrl, unknownRequestId),
+    ).toEqual({
+      auditCount: 1,
+      outboxCount: 0,
+    });
   });
 
   it("does not send another code inside the configured resend cooldown", async () => {
@@ -212,7 +363,7 @@ describe("SMS OTP abuse controls", () => {
 
     expect(first).toEqual({ accepted: true });
     expect(repeated).toEqual(first);
-    expect(sms.sendCount()).toBe(1);
+    expect(await readOtpDeliveryPayloads(databaseUrl)).toHaveLength(1);
   });
 
   it("persists only a keyed hash of the generated code", async () => {
@@ -232,10 +383,14 @@ describe("SMS OTP abuse controls", () => {
       requestId: randomUUID(),
     });
     const stored = await readLatestOtpChallenge(databaseUrl, person.id);
+    const code = await latestOtpCode();
+    const deliveryPayloads = await readOtpDeliveryPayloads(databaseUrl);
 
     expect(stored?.codeHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(stored?.codeHash).not.toBe(sms.lastCode());
-    expect(JSON.stringify(stored)).not.toContain(sms.lastCode());
+    expect(stored?.codeHash).not.toBe(code);
+    expect(JSON.stringify(stored)).not.toContain(code);
+    expect(JSON.stringify(deliveryPayloads)).not.toContain(code);
+    expect(JSON.stringify(deliveryPayloads)).not.toContain(person.phoneE164);
   });
 
   it("returns the same request response for an unknown and known phone", async () => {
@@ -277,6 +432,7 @@ describe("SMS OTP abuse controls", () => {
       identity: {
         sms: recordingSms(),
         otpPolicy,
+        consentCatalog: consentCatalogV1,
       },
     });
     app.log.info(
@@ -531,9 +687,281 @@ describe("document upload security", () => {
       clock.now().getTime() + documentPolicy.downloadTtlMs,
     );
   });
+
+  it("promotes clean bytes to immutable evidence and blocks accepted-row mutation", async () => {
+    const storage = memoryObjectStorage();
+    const service = createDocumentService({
+      database,
+      storage,
+      malwareScanner: recordingMalwareScanner("CLEAN"),
+      policy: documentPolicy,
+      clock: mutableClock("2026-08-14T12:00:00.000Z"),
+    });
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000208",
+    });
+    const original = pngBytes();
+    const ticket = await service.requestUpload({
+      personId: person.id,
+      documentType: "GHANA_CARD_FRONT",
+      mimeType: "image/png",
+      sizeBytes: original.byteLength,
+      requestId: randomUUID(),
+    });
+    storage.upload(ticket, original, "image/png");
+    await service.completeUpload({
+      personId: person.id,
+      documentId: ticket.documentId,
+      requestId: randomUUID(),
+    });
+
+    const replay = Uint8Array.from(original, (byte, index) =>
+      index < 8 ? byte : byte ^ 0xff,
+    );
+    storage.upload(ticket, replay, "image/png");
+    const download = await service.requestDownload({
+      personId: person.id,
+      documentId: ticket.documentId,
+      requestId: randomUUID(),
+    });
+
+    expect(storage.downloadBytes(download.downloadUrl)).toEqual(original);
+    await expect(
+      attemptAcceptedDocumentMutation(databaseUrl, ticket.documentId, "UPDATE"),
+    ).resolves.toBe("55000");
+    await expect(
+      attemptAcceptedDocumentMutation(databaseUrl, ticket.documentId, "DELETE"),
+    ).resolves.toBe("55000");
+  });
 });
 
 describe("NIA verification and consent evidence", () => {
+  it("rejects invented, stale, and wrong-purpose consent documents", async () => {
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000306",
+    });
+    const service = createConsentService({
+      database,
+      catalog: consentCatalogV2,
+      clock: mutableClock("2026-08-14T12:00:00.000Z"),
+    });
+    const common = {
+      subjectPersonId: person.id,
+      phoneE164: person.phoneE164,
+      sessionId: randomUUID(),
+      ipAddress: "192.0.2.36",
+      userAgent: "Synthetic Customer Test/1.0",
+      requestId: randomUUID(),
+    };
+
+    for (const document of [
+      { purpose: "NIA_IDENTITY_VERIFICATION", documentVersion: "invented-v99" },
+      {
+        purpose: "NIA_IDENTITY_VERIFICATION",
+        documentVersion: "nia-consent-v1",
+      },
+      { purpose: "CREDIT_BUREAU_CHECK", documentVersion: "nia-consent-v2" },
+    ]) {
+      await expect(
+        service.record({ ...common, ...document }),
+      ).rejects.toMatchObject({
+        code: "CONSENT_DOCUMENT_NOT_APPROVED",
+      });
+    }
+    expect(await readConsentEvidence(databaseUrl, person.id)).toEqual([]);
+  });
+
+  it("reserves one stable NIA correlation before outage and reuses it on retry", async () => {
+    const clock = mutableClock("2026-08-14T12:00:00.000Z");
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000307",
+    });
+    const consent = await recordNiaConsent(person, clock);
+    const correlations: string[] = [];
+    let unavailable = true;
+    const service = createNiaService({
+      database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
+      nia: {
+        async verify(input) {
+          correlations.push(input.correlationId);
+          if (unavailable) {
+            unavailable = false;
+            throw new Error("synthetic outage");
+          }
+          return {
+            providerReference: "nia-recovered-1",
+            decision: "MATCH",
+            checkedAt: "2026-08-14T12:00:01.000Z",
+          };
+        },
+      },
+      clock,
+    });
+    const request = {
+      subjectPersonId: person.id,
+      consentId: consent.consentId,
+      ghanaCardNumber: "GHA-000000007-7",
+      idempotencyKey: randomUUID(),
+      sessionId: consent.sessionId,
+      requestId: randomUUID(),
+    };
+
+    await expect(service.verifyGhanaCard(request)).rejects.toMatchObject({
+      code: "NIA_UNAVAILABLE",
+    });
+    expect(await readIdentityChecks(databaseUrl, person.id)).toMatchObject([
+      {
+        status: "PENDING",
+        providerReference: null,
+        consentEvidenceId: consent.consentId,
+      },
+    ]);
+    const recovered = await service.verifyGhanaCard({
+      ...request,
+      requestId: randomUUID(),
+    });
+    expect(correlations).toEqual([correlations[0], correlations[0]]);
+    expect(recovered.identityCheckId).toBe(correlations[0]);
+  });
+
+  it("coalesces concurrent duplicate NIA requests into one provider call", async () => {
+    const clock = mutableClock("2026-08-14T12:00:00.000Z");
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000308",
+    });
+    const consent = await recordNiaConsent(person, clock);
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const service = createNiaService({
+      database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
+      nia: {
+        async verify() {
+          calls += 1;
+          await gate;
+          return {
+            providerReference: "nia-concurrent-1",
+            decision: "MATCH",
+            checkedAt: "2026-08-14T12:00:01.000Z",
+          };
+        },
+      },
+      clock,
+    });
+    const request = {
+      subjectPersonId: person.id,
+      consentId: consent.consentId,
+      ghanaCardNumber: "GHA-000000008-8",
+      idempotencyKey: randomUUID(),
+      sessionId: consent.sessionId,
+      requestId: randomUUID(),
+    };
+    const first = service.verifyGhanaCard(request);
+    const duplicate = service.verifyGhanaCard({
+      ...request,
+      requestId: randomUUID(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    release();
+    const results = await Promise.allSettled([first, duplicate]);
+
+    expect(calls).toBe(1);
+    expect(results[0]).toMatchObject({ status: "fulfilled" });
+    expect(results[1]).toMatchObject({ status: "fulfilled" });
+    if (
+      results[0]?.status === "fulfilled" &&
+      results[1]?.status === "fulfilled"
+    ) {
+      expect(results[0].value.identityCheckId).toBe(
+        results[1].value.identityCheckId,
+      );
+    }
+  });
+
+  it("returns the recorded result when the provider repeats a reference", async () => {
+    const clock = mutableClock("2026-08-14T12:00:00.000Z");
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000309",
+    });
+    const consent = await recordNiaConsent(person, clock);
+    const service = createNiaService({
+      database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
+      nia: deterministicNia("MATCH", "nia-provider-duplicate-1"),
+      clock,
+    });
+    const common = {
+      subjectPersonId: person.id,
+      consentId: consent.consentId,
+      ghanaCardNumber: "GHA-000000009-9",
+      sessionId: consent.sessionId,
+    };
+    const first = await service.verifyGhanaCard({
+      ...common,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    const duplicate = await service.verifyGhanaCard({
+      ...common,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+
+    expect(duplicate.identityCheckId).toBe(first.identityCheckId);
+  });
+
+  it("binds a NIA idempotency key to the original minimized request", async () => {
+    const clock = mutableClock("2026-08-14T12:00:00.000Z");
+    const person = await seedSyntheticPerson(databaseUrl, {
+      phoneE164: "+233200000310",
+    });
+    const consent = await recordNiaConsent(person, clock);
+    let calls = 0;
+    const service = createNiaService({
+      database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
+      nia: {
+        async verify() {
+          calls += 1;
+          return {
+            providerReference: "nia-idempotency-bound-1",
+            decision: "MATCH",
+            checkedAt: "2026-08-14T12:00:01.000Z",
+          };
+        },
+      },
+      clock,
+    });
+    const idempotencyKey = randomUUID();
+    await service.verifyGhanaCard({
+      subjectPersonId: person.id,
+      consentId: consent.consentId,
+      ghanaCardNumber: "GHA-000000010-0",
+      idempotencyKey,
+      sessionId: consent.sessionId,
+      requestId: randomUUID(),
+    });
+
+    await expect(
+      service.verifyGhanaCard({
+        subjectPersonId: person.id,
+        consentId: consent.consentId,
+        ghanaCardNumber: "GHA-000000011-1",
+        idempotencyKey,
+        sessionId: consent.sessionId,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "NIA_IDEMPOTENCY_CONFLICT" });
+    expect(calls).toBe(1);
+  });
   it("preserves a saved application draft when NIA is unavailable", async () => {
     const clock = mutableClock("2026-08-14T12:00:00.000Z");
     const person = await seedSyntheticPerson(databaseUrl, {
@@ -545,6 +973,8 @@ describe("NIA verification and consent evidence", () => {
     const consent = await recordNiaConsent(person, clock);
     const service = createNiaService({
       database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
       nia: {
         async verify() {
           throw new Error("provider payload with sensitive diagnostics");
@@ -558,6 +988,7 @@ describe("NIA verification and consent evidence", () => {
         subjectPersonId: person.id,
         consentId: consent.consentId,
         ghanaCardNumber: "GHA-000000001-1",
+        idempotencyKey: randomUUID(),
         sessionId: consent.sessionId,
         requestId: randomUUID(),
       }),
@@ -568,7 +999,13 @@ describe("NIA verification and consent evidence", () => {
       status: "DRAFT",
       version: 1,
     });
-    expect(await readIdentityChecks(databaseUrl, person.id)).toEqual([]);
+    expect(await readIdentityChecks(databaseUrl, person.id)).toMatchObject([
+      {
+        status: "PENDING",
+        providerReference: null,
+        consentEvidenceId: consent.consentId,
+      },
+    ]);
   });
 
   it("maps NO_MATCH to failed and cannot produce verified state", async () => {
@@ -579,6 +1016,8 @@ describe("NIA verification and consent evidence", () => {
     const consent = await recordNiaConsent(person, clock);
     const service = createNiaService({
       database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
       nia: deterministicNia("NO_MATCH", "nia-no-match-1"),
       clock,
     });
@@ -587,6 +1026,7 @@ describe("NIA verification and consent evidence", () => {
       subjectPersonId: person.id,
       consentId: consent.consentId,
       ghanaCardNumber: "GHA-000000002-2",
+      idempotencyKey: randomUUID(),
       sessionId: consent.sessionId,
       requestId: randomUUID(),
     });
@@ -614,6 +1054,8 @@ describe("NIA verification and consent evidence", () => {
     const consent = await recordNiaConsent(person, clock);
     const service = createNiaService({
       database,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
       nia: deterministicNia("REVIEW", "nia-review-1"),
       clock,
     });
@@ -622,6 +1064,7 @@ describe("NIA verification and consent evidence", () => {
       subjectPersonId: person.id,
       consentId: consent.consentId,
       ghanaCardNumber: "GHA-000000003-3",
+      idempotencyKey: randomUUID(),
       sessionId: consent.sessionId,
       requestId: randomUUID(),
     });
@@ -651,12 +1094,19 @@ describe("NIA verification and consent evidence", () => {
         };
       },
     } satisfies NiaPort;
-    const service = createNiaService({ database, nia: provider, clock });
+    const service = createNiaService({
+      database,
+      nia: provider,
+      catalog: consentCatalogV1,
+      idempotencyHashSecret: otpPolicy.hashSecret,
+      clock,
+    });
 
     const result = await service.verifyGhanaCard({
       subjectPersonId: person.id,
       consentId: consent.consentId,
       ghanaCardNumber,
+      idempotencyKey: randomUUID(),
       sessionId: consent.sessionId,
       requestId: randomUUID(),
     });
@@ -680,19 +1130,31 @@ describe("NIA verification and consent evidence", () => {
         personId: person.id,
         provider: "NIA",
         providerReference: "nia-match-1",
+        consentEvidenceId: consent.consentId,
         status: "VERIFIED",
         evidence: {
           decision: "MATCH",
           purpose: "NIA_IDENTITY_VERIFICATION",
+          consentEvidenceId: consent.consentId,
         },
       },
     ]);
     expect(audits).toEqual([
       {
+        action: "NIA_IDENTITY_CHECK_RESERVED",
+        data: {
+          subjectPersonId: person.id,
+          purpose: "NIA_IDENTITY_VERIFICATION",
+          consentEvidenceId: consent.consentId,
+          customerSessionId: consent.sessionId,
+        },
+      },
+      {
         action: "NIA_IDENTITY_CHECK_RECORDED",
         data: {
           subjectPersonId: person.id,
           purpose: "NIA_IDENTITY_VERIFICATION",
+          consentEvidenceId: consent.consentId,
           providerReference: "nia-match-1",
           decision: "MATCH",
           checkedAt: "2026-08-14T12:00:01.000Z",
@@ -710,7 +1172,11 @@ describe("NIA verification and consent evidence", () => {
     const person = await seedSyntheticPerson(databaseUrl, {
       phoneE164: "+233200000305",
     });
-    const service = createConsentService({ database, clock });
+    const service = createConsentService({
+      database,
+      catalog: consentCatalogV1,
+      clock,
+    });
     const common = {
       subjectPersonId: person.id,
       purpose: "NIA_IDENTITY_VERIFICATION",
@@ -725,7 +1191,11 @@ describe("NIA verification and consent evidence", () => {
       requestId: randomUUID(),
     });
     clock.advance(1_000);
-    const second = await service.record({
+    const second = await createConsentService({
+      database,
+      catalog: consentCatalogV2,
+      clock,
+    }).record({
       ...common,
       documentVersion: "nia-consent-v2",
       requestId: randomUUID(),
@@ -769,6 +1239,7 @@ describe("customer identity and document routes", () => {
       identity: {
         sms,
         otpPolicy,
+        consentCatalog: consentCatalogV1,
         nia: deterministicNia("MATCH", "nia-route-match-1"),
         documents: {
           storage,
@@ -789,7 +1260,10 @@ describe("customer identity and document routes", () => {
       const verified = await app.inject({
         method: "POST",
         url: "/v1/customer/otp/verifications",
-        payload: { phoneE164: person.phoneE164, code: sms.lastCode() },
+        payload: {
+          phoneE164: person.phoneE164,
+          code: await latestOtpCode(),
+        },
       });
       expect(verified.statusCode).toBe(201);
       const session = verified.json<{
@@ -822,6 +1296,7 @@ describe("customer identity and document routes", () => {
         payload: {
           consentId: consent.consentId,
           ghanaCardNumber: "GHA-000000401-1",
+          idempotencyKey: randomUUID(),
         },
       });
       expect(niaResponse.statusCode).toBe(201);
@@ -886,6 +1361,19 @@ describe("customer identity and document routes", () => {
     ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
   });
 
+  it("uses actual runtime NODE_ENV for production startup validation", async () => {
+    const priorNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      await expect(
+        buildApp({ config: testConfig, database, logger: false }),
+      ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    }
+  });
+
   it("rejects partially configured production identity dependencies", async () => {
     await expect(
       buildApp({
@@ -897,7 +1385,11 @@ describe("customer identity and document routes", () => {
         },
         database,
         logger: false,
-        identity: { sms: recordingSms(), otpPolicy },
+        identity: {
+          sms: recordingSms(),
+          otpPolicy,
+          consentCatalog: consentCatalogV1,
+        },
       }),
     ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
   });
@@ -916,6 +1408,7 @@ describe("customer identity and document routes", () => {
         identity: {
           sms: recordingSms(),
           otpPolicy,
+          consentCatalog: consentCatalogV1,
           nia: createNiaSimulator({ environment: "test", fixtures: [] }),
           documents: {
             storage: memoryObjectStorage(),
@@ -932,7 +1425,11 @@ async function recordNiaConsent(
   person: { id: string; phoneE164: string },
   clock: ReturnType<typeof mutableClock>,
 ) {
-  return createConsentService({ database, clock }).record({
+  return createConsentService({
+    database,
+    catalog: consentCatalogV1,
+    clock,
+  }).record({
     subjectPersonId: person.id,
     purpose: "NIA_IDENTITY_VERIFICATION",
     documentVersion: "nia-consent-v1",
@@ -969,30 +1466,50 @@ function mutableClock(initial: string) {
   };
 }
 
-function recordingSms(): SmsPort & {
-  lastCode(): string;
-  sendCount(): number;
-} {
-  const codes: string[] = [];
+function recordingSms(): SmsPort {
   return {
-    async send(input) {
-      const code = input.variables.code;
-      if (code === undefined) throw new Error("OTP_CODE_MISSING");
-      codes.push(code);
-      return {
-        providerReference: `sms-${codes.length}`,
-        acceptedAt: "2026-08-14T12:00:00.000Z",
-      };
-    },
-    lastCode() {
-      const code = codes.at(-1);
-      if (code === undefined) throw new Error("OTP_NOT_SENT");
-      return code;
-    },
-    sendCount() {
-      return codes.length;
+    async send() {
+      throw new Error("OTP_DELIVERY_MUST_USE_OUTBOX");
     },
   };
+}
+
+function deferredSms() {
+  let release!: () => void;
+  let sends = 0;
+  const delivery = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    sms: {
+      async send() {
+        sends += 1;
+        await delivery;
+        return {
+          providerReference: "sms-deferred-1",
+          acceptedAt: "2026-08-14T12:00:00.000Z",
+        };
+      },
+    } satisfies SmsPort,
+    release,
+    sendCount: () => sends,
+  };
+}
+
+async function latestOtpCode(): Promise<string> {
+  const payloads = await readOtpDeliveryPayloads(testConfig.databaseUrl);
+  const latest = payloads.at(-1);
+  if (
+    typeof latest !== "object" ||
+    latest === null ||
+    !("delivery" in latest)
+  ) {
+    throw new Error("OTP_DELIVERY_NOT_QUEUED");
+  }
+  return openOtpDelivery(
+    otpPolicy.deliveryEncryptionSecret,
+    (latest as { delivery: unknown }).delivery,
+  ).variables.code;
 }
 
 function pngBytes(): Uint8Array {
@@ -1009,6 +1526,8 @@ function memoryObjectStorage() {
     bytes: Uint8Array;
     contentType: string;
     metadata: Readonly<Record<string, string>>;
+    versionId: string;
+    etag: string;
   };
   const objects = new Map<string, StoredObject>();
   const ticketInputs: Array<{
@@ -1042,14 +1561,62 @@ function memoryObjectStorage() {
         contentLength: object.bytes.byteLength,
         contentType: object.contentType,
         metadata: object.metadata,
+        versionId: object.versionId,
+        etag: object.etag,
       };
     },
-    async createDownloadTicket(input: { objectKey: string; expiresAt: Date }) {
+    async promoteToImmutable(input: {
+      stagingObjectKey: string;
+      stagingVersionId: string;
+      stagingEtag: string;
+      immutableObjectKey: string;
+    }) {
+      const staging = objects.get(input.stagingObjectKey);
+      if (
+        staging === undefined ||
+        staging.versionId !== input.stagingVersionId ||
+        staging.etag !== input.stagingEtag
+      ) {
+        throw new Error("STAGING_IDENTITY_MISMATCH");
+      }
+      const immutable = {
+        ...staging,
+        bytes: Uint8Array.from(staging.bytes),
+        versionId: randomUUID(),
+      };
+      objects.set(input.immutableObjectKey, immutable);
+      return {
+        objectKey: input.immutableObjectKey,
+        versionId: immutable.versionId,
+        etag: immutable.etag,
+      };
+    },
+    async createDownloadTicket(input: {
+      objectKey: string;
+      versionId: string;
+      etag: string;
+      expiresAt: Date;
+    }) {
+      const object = objects.get(input.objectKey);
+      if (
+        object === undefined ||
+        object.versionId !== input.versionId ||
+        object.etag !== input.etag
+      ) {
+        throw new Error("IMMUTABLE_IDENTITY_MISMATCH");
+      }
       downloads += 1;
       return {
         downloadUrl: `fake://download/${input.objectKey}`,
         expiresAt: input.expiresAt.toISOString(),
+        requiredHeaders: { "if-match": input.etag },
       };
+    },
+    downloadBytes(downloadUrl: string) {
+      const objectKey = downloadUrl.replace("fake://download/", "");
+      const object = objects.get(objectKey);
+      if (object === undefined) throw new Error("OBJECT_NOT_FOUND");
+      return object.bytes;
     },
     upload(
       ticket: {
@@ -1065,7 +1632,13 @@ function memoryObjectStorage() {
           .filter(([name]) => name.startsWith("x-amz-meta-"))
           .map(([name, value]) => [name.slice("x-amz-meta-".length), value]),
       );
-      objects.set(objectKey, { bytes, contentType, metadata });
+      objects.set(objectKey, {
+        bytes,
+        contentType,
+        metadata,
+        versionId: randomUUID(),
+        etag: createHash("sha256").update(bytes).digest("hex"),
+      });
     },
     uploadTicketCount() {
       return ticketInputs.length;

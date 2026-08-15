@@ -68,6 +68,7 @@ export const otpChallenge = privacySchema.table(
     attempts: integer("attempts").notNull().default(0),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
+    deliveryFailedAt: timestamp("delivery_failed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -97,10 +98,20 @@ export const identityCheck = privacySchema.table(
       .notNull()
       .references(() => person.id, { onDelete: "restrict" }),
     provider: text("provider").notNull(),
-    providerReference: text("provider_reference").notNull(),
+    idempotencyKey: text("idempotency_key"),
+    providerCorrelationId: uuid("provider_correlation_id").notNull(),
+    providerReference: text("provider_reference"),
+    consentEvidenceId: uuid("consent_evidence_id").references(
+      () => consentEvidence.id,
+      { onDelete: "restrict" },
+    ),
     status: identityCheckStatus("status").notNull(),
     evidence: jsonb("evidence").$type<Record<string, unknown>>().notNull(),
-    checkedAt: timestamp("checked_at", { withTimezone: true }).notNull(),
+    checkedAt: timestamp("checked_at", { withTimezone: true }),
+    processingToken: uuid("processing_token"),
+    processingStartedAt: timestamp("processing_started_at", {
+      withTimezone: true,
+    }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -110,7 +121,19 @@ export const identityCheck = privacySchema.table(
       table.provider,
       table.providerReference,
     ),
+    uniqueIndex("identity_check_provider_idempotency_unique").on(
+      table.provider,
+      table.idempotencyKey,
+    ),
     index("identity_check_person_idx").on(table.personId),
+    check(
+      "identity_check_processing_lease_consistent",
+      sql`(${table.processingToken} is null) = (${table.processingStartedAt} is null)`,
+    ),
+    check(
+      "identity_check_final_result_complete",
+      sql`${table.status} = 'PENDING' or (${table.providerReference} is not null and ${table.checkedAt} is not null) or (${table.status} = 'FAILED' and ${table.checkedAt} is not null)`,
+    ),
   ],
 );
 
@@ -129,6 +152,9 @@ export const document = privacySchema.table(
     uploadExpiresAt: timestamp("upload_expires_at", {
       withTimezone: true,
     }).notNull(),
+    acceptedObjectKey: text("accepted_object_key"),
+    acceptedObjectVersionId: text("accepted_object_version_id"),
+    acceptedObjectEtag: text("accepted_object_etag"),
     sha256: text("sha256"),
     status: documentStatus("status").notNull().default("UPLOADED"),
     malwareScanned: boolean("malware_scanned").notNull().default(false),
@@ -146,6 +172,10 @@ export const document = privacySchema.table(
   },
   (table) => [
     uniqueIndex("document_object_key_unique").on(table.objectKey),
+    uniqueIndex("document_accepted_object_identity_unique").on(
+      table.acceptedObjectKey,
+      table.acceptedObjectVersionId,
+    ),
     index("document_person_idx").on(table.personId),
     check(
       "document_declared_size_positive",
@@ -161,7 +191,7 @@ export const document = privacySchema.table(
     ),
     check(
       "document_accepted_has_clean_evidence",
-      sql`${table.status} <> 'ACCEPTED' or (${table.malwareScanned} and ${table.sha256} is not null)`,
+      sql`${table.status} <> 'ACCEPTED' or (${table.malwareScanned} and ${table.sha256} is not null and ${table.acceptedObjectKey} is not null and ${table.acceptedObjectVersionId} is not null and ${table.acceptedObjectEtag} is not null)`,
     ),
     check("document_version_positive", sql`${table.version} > 0`),
   ],

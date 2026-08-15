@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(7);
+    expect(before.rows[0]?.count).toBe(8);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -724,6 +724,89 @@ describe("populated legacy schema migration", () => {
         legacyUploadEvidence: true,
         migrationReason: "UPLOAD_BINDING_UNAVAILABLE",
       },
+    });
+  });
+
+  it("safely upgrades populated accepted documents and legacy identity checks in 0007", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const personId = randomUUID();
+    const documentId = randomUUID();
+    const identityCheckId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164) values ($1, $2)`,
+      [personId, "+233200009902"],
+    );
+    await pool.query(
+      `insert into privacy.document
+         (id, person_id, document_type, object_key, declared_mime_type,
+          declared_size_bytes, upload_ticket_hash, upload_expires_at, sha256,
+          status, malware_scanned, metadata, created_at, updated_at)
+       values ($1, $2, 'GHANA_CARD_FRONT', $3, 'image/png', 68, $4,
+               '2026-08-14T12:01:00.000Z', $5, 'ACCEPTED', true,
+               '{"source":"pre-immutable"}'::jsonb,
+               '2026-08-14T12:00:00.000Z', '2026-08-14T12:00:00.000Z')`,
+      [
+        documentId,
+        personId,
+        `legacy/${documentId}`,
+        "0".repeat(64),
+        "1".repeat(64),
+      ],
+    );
+    await pool.query(
+      `insert into privacy.identity_check
+         (id, person_id, provider, provider_reference, status, evidence,
+          checked_at, created_at)
+       values ($1, $2, 'NIA', 'legacy-provider-reference', 'VERIFIED',
+               '{"decision":"MATCH"}'::jsonb,
+               '2026-08-14T12:00:00.000Z', '2026-08-14T12:00:00.000Z')`,
+      [identityCheckId, personId],
+    );
+
+    await applyMigrationFile(pool, "0007_concerned_siren.sql");
+
+    const documentResult = await pool.query<{
+      status: string;
+      malware_scanned: boolean;
+      accepted_object_key: string | null;
+      metadata: Record<string, unknown>;
+    }>(
+      `select status, malware_scanned, accepted_object_key, metadata
+         from privacy.document where id = $1`,
+      [documentId],
+    );
+    expect(documentResult.rows[0]).toEqual({
+      status: "QUARANTINED",
+      malware_scanned: false,
+      accepted_object_key: null,
+      metadata: {
+        source: "pre-immutable",
+        legacyAcceptedEvidence: true,
+        migrationReason: "IMMUTABLE_OBJECT_IDENTITY_UNAVAILABLE",
+      },
+    });
+    const identityResult = await pool.query<{
+      provider_correlation_id: string;
+      idempotency_key: string | null;
+      consent_evidence_id: string | null;
+    }>(
+      `select provider_correlation_id, idempotency_key, consent_evidence_id
+         from privacy.identity_check where id = $1`,
+      [identityCheckId],
+    );
+    expect(identityResult.rows[0]).toEqual({
+      provider_correlation_id: identityCheckId,
+      idempotency_key: null,
+      consent_evidence_id: null,
     });
   });
 });

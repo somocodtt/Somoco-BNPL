@@ -10,18 +10,19 @@ import {
   appendAuditEvent,
   createCustomerSession,
   createOtpChallenge,
+  enqueueOutbox,
   findActiveCustomerSessionByTokenHash,
   findLatestUsableOtpChallenge,
+  findLatestOtpChallengeForCooldown,
   findOrCreateCustomerAccount,
   findPersonByPhone,
-  invalidateOtpChallenge,
   invalidateOutstandingOtpChallenges,
   lockPersonByPhone,
   recordFailedOtpAttempt,
   withTransaction,
   type Database,
 } from "@somo/db";
-import type { SmsPort } from "@somo/integrations";
+import { sealOtpDelivery, type SmsPort } from "@somo/integrations";
 import type { CustomerPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 
@@ -31,6 +32,7 @@ export interface OtpPolicy {
   resendCooldownMs: number;
   codeLength: number;
   hashSecret: string;
+  deliveryEncryptionSecret: string;
   sessionTtlMs: number;
 }
 
@@ -74,17 +76,40 @@ export function createOtpService(options: {
       const phoneE164 = normalizePhone(input.phoneE164);
       const now = clock.now();
       const person = await findPersonByPhone(options.database, phoneE164);
-      if (person === null) return acceptedResponse;
-
       const code = generateCode(policy.codeLength);
       const challengeId = randomUUID();
+      if (person === null) {
+        dummyHash(policy.hashSecret, code);
+        await withTransaction(options.database, async (tx) => {
+          await appendAuditEvent(tx, {
+            aggregateType: "otp_challenge",
+            aggregateId: challengeId,
+            action: "OTP_REQUESTED",
+            requestId: input.requestId,
+            data: { purpose: "CUSTOMER_AUTHENTICATION" },
+            occurredAt: now,
+          });
+          await enqueueOutbox(tx, {
+            id: challengeId,
+            topic: "identity.otp_delivery_suppressed",
+            aggregateType: "otp_challenge",
+            aggregateId: challengeId,
+            payload: {
+              requestId: input.requestId,
+              purpose: "CUSTOMER_AUTHENTICATION",
+            },
+            occurredAt: now,
+          });
+        });
+        return acceptedResponse;
+      }
       const created = await withTransaction(options.database, async (tx) => {
         const lockedPerson = await lockPersonByPhone(tx, phoneE164);
         if (lockedPerson === null) return false;
-        const latest = await findLatestUsableOtpChallenge(tx, {
-          personId: lockedPerson.id,
-          now,
-        });
+        const latest = await findLatestOtpChallengeForCooldown(
+          tx,
+          lockedPerson.id,
+        );
         if (
           latest !== null &&
           now.getTime() - latest.createdAt.getTime() < policy.resendCooldownMs
@@ -111,30 +136,25 @@ export function createOtpService(options: {
           data: { purpose: "CUSTOMER_AUTHENTICATION" },
           occurredAt: now,
         });
+        await enqueueOutbox(tx, {
+          id: challengeId,
+          topic: "identity.otp_sms_requested",
+          aggregateType: "otp_challenge",
+          aggregateId: challengeId,
+          payload: {
+            requestId: input.requestId,
+            delivery: sealOtpDelivery(policy.deliveryEncryptionSecret, {
+              phoneE164,
+              template: "CUSTOMER_AUTHENTICATION_OTP",
+              variables: { code },
+            }),
+          },
+          occurredAt: now,
+        });
         return true;
       });
       if (!created) return acceptedResponse;
 
-      try {
-        await options.sms.send({
-          idempotencyKey: challengeId,
-          phoneE164,
-          template: "CUSTOMER_AUTHENTICATION_OTP",
-          variables: { code },
-        });
-      } catch {
-        await withTransaction(options.database, async (tx) => {
-          await invalidateOtpChallenge(tx, challengeId, clock.now());
-          await appendAuditEvent(tx, {
-            aggregateType: "otp_challenge",
-            aggregateId: challengeId,
-            action: "OTP_DELIVERY_FAILED",
-            requestId: input.requestId,
-            data: { failureCode: "SMS_UNAVAILABLE" },
-            occurredAt: clock.now(),
-          });
-        });
-      }
       return acceptedResponse;
     },
 
@@ -146,6 +166,14 @@ export function createOtpService(options: {
         const person = await lockPersonByPhone(tx, phoneE164);
         if (person === null) {
           dummyHash(policy.hashSecret, input.code);
+          await appendAuditEvent(tx, {
+            aggregateType: "otp_challenge",
+            aggregateId: randomUUID(),
+            action: "OTP_VERIFICATION_REJECTED",
+            requestId: input.requestId,
+            data: { reason: "INVALID_OR_EXPIRED" },
+            occurredAt: now,
+          });
           return null;
         }
         const challenge = await findLatestUsableOtpChallenge(tx, {
@@ -244,6 +272,14 @@ export function validateOtpPolicy(policy: OtpPolicy): Readonly<OtpPolicy> {
   }
   if (policy.hashSecret.length < 32) {
     throw new Error("otp hashSecret must be at least 32 characters");
+  }
+  if (
+    policy.deliveryEncryptionSecret.length < 32 ||
+    policy.deliveryEncryptionSecret === policy.hashSecret
+  ) {
+    throw new Error(
+      "otp deliveryEncryptionSecret must be distinct and at least 32 characters",
+    );
   }
   return Object.freeze({ ...policy });
 }

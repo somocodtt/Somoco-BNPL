@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import { createClamAvMalwareScanner } from "./malware-scanner.js";
 import { createS3ObjectStorage } from "./object-storage.js";
+import { openOtpDelivery, sealOtpDelivery } from "./otp-delivery.js";
 import {
   IntegrationTemporaryError,
   createCreditBureauSimulator,
@@ -18,6 +19,22 @@ import {
 const checkedAt = "2026-08-14T12:00:00.000Z";
 
 describe("deterministic integration simulators", () => {
+  it("authenticates OTP outbox delivery without plaintext persistence", () => {
+    const secret = "synthetic-otp-delivery-secret-at-least-32-characters";
+    const delivery = {
+      phoneE164: "+233200000001",
+      template: "CUSTOMER_AUTHENTICATION_OTP" as const,
+      variables: { code: "123456" },
+    };
+    const envelope = sealOtpDelivery(secret, delivery);
+
+    expect(openOtpDelivery(secret, envelope)).toEqual(delivery);
+    expect(JSON.stringify(envelope)).not.toContain(delivery.phoneE164);
+    expect(JSON.stringify(envelope)).not.toContain(delivery.variables.code);
+    expect(() =>
+      openOtpDelivery(secret, { ...envelope, authenticationTag: "tampered" }),
+    ).toThrow("OTP_DELIVERY_ENVELOPE_INVALID");
+  });
   it("returns the configured NIA decision for an exact fixture", async () => {
     const nia = createNiaSimulator({
       environment: "test",
@@ -274,7 +291,11 @@ describe("production document adapters", () => {
 
   it("stops a chunked S3 object read as soon as the bound byte limit is exceeded", async () => {
     const server = createHttpServer((_request, response) => {
-      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-amz-version-id": "version-bounded-1",
+        etag: '"0123456789abcdef0123456789abcdef"',
+      });
       response.write(Buffer.alloc(4, 1));
       response.end(Buffer.alloc(4, 2));
     });
@@ -292,6 +313,23 @@ describe("production document adapters", () => {
       server.close();
       await once(server, "close");
     }
+  });
+
+  it("signs downloads for the exact immutable object version and ETag", async () => {
+    const storage = createS3ObjectStorage(s3Config("http://127.0.0.1:9000"));
+    const ticket = await storage.createDownloadTicket({
+      objectKey: "identity-accepted/person-1001/document-1001/evidence.png",
+      versionId: "opaque-version-1001",
+      etag: "0123456789abcdef0123456789abcdef",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const url = new URL(ticket.downloadUrl);
+
+    expect(url.searchParams.get("versionId")).toBe("opaque-version-1001");
+    expect(url.searchParams.get("X-Amz-SignedHeaders")).toContain("if-match");
+    expect(ticket.requiredHeaders).toEqual({
+      "if-match": "0123456789abcdef0123456789abcdef",
+    });
   });
 
   it("uses ClamAV INSTREAM framing and accepts only an explicit clean result", async () => {
@@ -312,6 +350,7 @@ describe("production document adapters", () => {
       port: address.port,
       timeoutMs: 2_000,
       maxBytes: 1_024,
+      maxResponseBytes: 256,
     });
     try {
       await expect(
@@ -326,6 +365,85 @@ describe("production document adapters", () => {
       expect(request.subarray(0, 10).toString()).toBe("zINSTREAM\0");
       expect(request.readUInt32BE(10)).toBe(4);
       expect(request.subarray(14, 18)).toEqual(Buffer.from([1, 2, 3, 4]));
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+
+  it.each([
+    ["missing terminator", "stream: OK"],
+    ["malformed prefix", "garbagestream: OK\0"],
+    ["trailing data", "stream: OK\0TRAIL"],
+    ["oversized response", `${"X".repeat(4_096)} OK\0`],
+  ])("fails closed on a %s ClamAV response", async (_label, responseFrame) => {
+    const server = createTcpServer((socket) => {
+      socket.on("data", (chunk: Buffer) => {
+        if (chunk.subarray(-4).equals(Buffer.alloc(4))) {
+          socket.end(responseFrame);
+        }
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const scanner = createClamAvMalwareScanner({
+      host: "127.0.0.1",
+      port: address.port,
+      timeoutMs: 1_000,
+      maxBytes: 1_024,
+      maxResponseBytes: 256,
+    });
+    try {
+      await expect(
+        scanner.scan({
+          objectKey: "identity/document-malformed",
+          bytes: Uint8Array.from([1]),
+        }),
+      ).resolves.toMatchObject({ verdict: "ERROR" });
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+
+  it("enforces an absolute ClamAV deadline despite response trickle", async () => {
+    const server = createTcpServer({ allowHalfOpen: true }, (socket) => {
+      let request = Buffer.alloc(0);
+      let responding = false;
+      socket.on("data", (chunk: Buffer) => {
+        request = Buffer.concat([request, chunk]);
+        if (responding || !request.subarray(-4).equals(Buffer.alloc(4))) return;
+        responding = true;
+        const interval = setInterval(() => socket.write("x"), 15);
+        const completion = setTimeout(() => {
+          clearInterval(interval);
+          if (!socket.destroyed) socket.end("stream: OK\0");
+        }, 150);
+        socket.on("close", () => {
+          clearInterval(interval);
+          clearTimeout(completion);
+        });
+        socket.on("error", () => undefined);
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const scanner = createClamAvMalwareScanner({
+      host: "127.0.0.1",
+      port: address.port,
+      timeoutMs: 50,
+      maxBytes: 1_024,
+      maxResponseBytes: 256,
+    });
+    try {
+      await expect(
+        scanner.scan({
+          objectKey: "identity/document-trickle",
+          bytes: Uint8Array.from([1]),
+        }),
+      ).rejects.toThrow("MALWARE_SCANNER_TIMEOUT");
     } finally {
       server.close();
       await once(server, "close");

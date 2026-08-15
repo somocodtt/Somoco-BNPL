@@ -1,5 +1,5 @@
 import type { OutboxMessage } from "@somo/db";
-import type { SmsPort } from "@somo/integrations";
+import { openOtpDelivery, type SmsPort } from "@somo/integrations";
 import {
   createOutboxHandler,
   PermanentWorkerError,
@@ -13,6 +13,29 @@ export function createSendNotificationHandler(sms: SmsPort) {
       phoneE164: payload.phoneE164,
       template: payload.template,
       variables: payload.variables,
+    });
+  });
+}
+
+export function createSendOtpHandler(sms: SmsPort, encryptionSecret: string) {
+  return createOutboxHandler([sms], async (message: OutboxMessage) => {
+    if (typeof message.payload !== "object" || message.payload === null) {
+      invalidOtpPayload();
+    }
+    let delivery;
+    try {
+      delivery = openOtpDelivery(
+        encryptionSecret,
+        (message.payload as Record<string, unknown>)["delivery"],
+      );
+    } catch {
+      invalidOtpPayload();
+    }
+    return sms.send({
+      idempotencyKey: message.id,
+      phoneE164: delivery.phoneE164,
+      template: delivery.template,
+      variables: delivery.variables,
     });
   });
 }
@@ -50,4 +73,8 @@ function notificationPayload(payload: unknown): {
 
 function invalidPayload(): never {
   throw new PermanentWorkerError("NOTIFICATION_PAYLOAD_INVALID");
+}
+
+function invalidOtpPayload(): never {
+  throw new PermanentWorkerError("OTP_DELIVERY_PAYLOAD_INVALID");
 }

@@ -4,7 +4,12 @@ export * from "./file-inspection.js";
 export * from "./nia.js";
 export * from "./malware-scanner.js";
 export * from "./object-storage.js";
+export * from "./otp-delivery.js";
 export * from "./payments.js";
 export * from "./sms.js";
 export * from "./tracker.js";
-export { isSimulatorAdapter } from "./provenance.js";
+export {
+  hasProductionAdapterCapability,
+  isSimulatorAdapter,
+  type ProductionAdapterCapability,
+} from "./provenance.js";

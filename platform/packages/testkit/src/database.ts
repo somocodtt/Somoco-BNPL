@@ -77,6 +77,50 @@ export async function readLatestOtpChallenge(
   }
 }
 
+export async function readOtpRequestWorkEvidence(
+  connectionString: string,
+  requestId: string,
+): Promise<{ auditCount: number; outboxCount: number }> {
+  assertExactTestDatabaseUrl(connectionString, "Read");
+  const pool = new Pool({ connectionString, max: 1 });
+  try {
+    const audit = await pool.query<{ count: string }>(
+      `select count(*)::text as count from audit_event where request_id = $1`,
+      [requestId],
+    );
+    const outbox = await pool.query<{ count: string }>(
+      `select count(*)::text as count
+         from outbox_message
+        where payload->>'requestId' = $1`,
+      [requestId],
+    );
+    return {
+      auditCount: Number(audit.rows[0]!.count),
+      outboxCount: Number(outbox.rows[0]!.count),
+    };
+  } finally {
+    await pool.end();
+  }
+}
+
+export async function readOtpDeliveryPayloads(
+  connectionString: string,
+): Promise<unknown[]> {
+  assertExactTestDatabaseUrl(connectionString, "Read");
+  const pool = new Pool({ connectionString, max: 1 });
+  try {
+    const result = await pool.query<{ payload: unknown }>(
+      `select payload
+         from outbox_message
+        where topic = 'identity.otp_sms_requested'
+        order by occurred_at, created_at, id`,
+    );
+    return result.rows.map((row) => row.payload);
+  } finally {
+    await pool.end();
+  }
+}
+
 export async function seedSyntheticDraft(
   connectionString: string,
   input: { personId: string },
@@ -128,7 +172,9 @@ export async function readIdentityChecks(
     id: string;
     personId: string;
     provider: string;
-    providerReference: string;
+    providerReference: string | null;
+    consentEvidenceId: string | null;
+    idempotencyKey: string | null;
     status: string;
     evidence: Record<string, unknown>;
     checkedAt: Date;
@@ -141,12 +187,15 @@ export async function readIdentityChecks(
       id: string;
       person_id: string;
       provider: string;
-      provider_reference: string;
+      provider_reference: string | null;
+      consent_evidence_id: string | null;
+      idempotency_key: string | null;
       status: string;
       evidence: Record<string, unknown>;
       checked_at: Date;
     }>(
-      `select id, person_id, provider, provider_reference, status, evidence,
+      `select id, person_id, provider, provider_reference, consent_evidence_id,
+              idempotency_key, status, evidence,
               checked_at
          from privacy.identity_check
         where person_id = $1
@@ -158,6 +207,8 @@ export async function readIdentityChecks(
       personId: row.person_id,
       provider: row.provider,
       providerReference: row.provider_reference,
+      consentEvidenceId: row.consent_evidence_id,
+      idempotencyKey: row.idempotency_key,
       status: row.status,
       evidence: row.evidence,
       checkedAt: row.checked_at,
@@ -229,6 +280,36 @@ export async function attemptConsentEvidenceMutation(
       } else {
         await pool.query(`delete from privacy.consent_evidence where id = $1`, [
           consentId,
+        ]);
+      }
+      return undefined;
+    } catch (error) {
+      return databaseErrorCode(error);
+    }
+  } finally {
+    await pool.end();
+  }
+}
+
+export async function attemptAcceptedDocumentMutation(
+  connectionString: string,
+  documentId: string,
+  operation: "UPDATE" | "DELETE",
+): Promise<string | undefined> {
+  assertExactTestDatabaseUrl(connectionString, "Mutation");
+  const pool = new Pool({ connectionString, max: 1 });
+  try {
+    try {
+      if (operation === "UPDATE") {
+        await pool.query(
+          `update privacy.document
+              set metadata = metadata || '{"tampered":true}'::jsonb
+            where id = $1`,
+          [documentId],
+        );
+      } else {
+        await pool.query(`delete from privacy.document where id = $1`, [
+          documentId,
         ]);
       }
       return undefined;

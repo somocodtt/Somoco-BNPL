@@ -8,6 +8,10 @@ import {
   type Database,
 } from "@somo/db";
 import { AppError } from "../../plugins/errors.js";
+import {
+  createConsentDocumentCatalog,
+  type ConsentDocumentCatalogConfig,
+} from "./consent-catalog.js";
 
 export interface ConsentEvidence {
   consentId: string;
@@ -39,12 +43,21 @@ export interface ConsentClock {
 
 export function createConsentService(options: {
   database: Database;
+  catalog: ConsentDocumentCatalogConfig;
   clock?: ConsentClock;
 }): ConsentService {
   const clock = options.clock ?? { now: () => new Date() };
+  const catalog = createConsentDocumentCatalog(options.catalog);
   return {
     async record(input) {
       const normalized = validateConsentInput(input);
+      if (!catalog.isCurrent(normalized.purpose, normalized.documentVersion)) {
+        throw new AppError(
+          400,
+          "CONSENT_DOCUMENT_NOT_APPROVED",
+          "The consent document is not approved.",
+        );
+      }
       const person = await findPersonById(
         options.database,
         normalized.subjectPersonId,

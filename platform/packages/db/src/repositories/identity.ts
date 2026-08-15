@@ -88,26 +88,191 @@ export async function findOwnedConsentEvidence(
   return record ?? null;
 }
 
-export async function createIdentityCheck(
+export async function reserveIdentityCheck(
   tx: DatabaseTransaction,
   input: {
     id: string;
     personId: string;
     provider: string;
-    providerReference: string;
-    status: "PENDING" | "VERIFIED" | "FAILED" | "MANUAL_REVIEW";
+    idempotencyKey: string;
+    providerCorrelationId: string;
+    consentEvidenceId: string;
     evidence: Readonly<Record<string, unknown>>;
-    checkedAt: Date;
     createdAt: Date;
   },
 ) {
   const [created] = await getInternalTransaction(tx)
     .insert(identityCheck)
-    .values(input)
-    .returning();
-  if (created === undefined) throw new Error("IDENTITY_CHECK_CREATE_FAILED");
-  return created;
+    .values({
+      ...input,
+      providerReference: null,
+      status: "PENDING",
+      checkedAt: null,
+    })
+    .onConflictDoNothing({
+      target: [identityCheck.provider, identityCheck.idempotencyKey],
+    })
+    .returning(identityCheckProjection);
+  if (created !== undefined)
+    return { record: created, reserved: true as const };
+  const existing = await findIdentityCheckByIdempotencyKey(tx, {
+    provider: input.provider,
+    idempotencyKey: input.idempotencyKey,
+  });
+  if (existing === null) throw new Error("IDENTITY_CHECK_RESERVE_FAILED");
+  return { record: existing, reserved: false as const };
 }
+
+export async function findIdentityCheckByIdempotencyKey(
+  db: Database | DatabaseTransaction,
+  input: { provider: string; idempotencyKey: string },
+) {
+  const [record] = await getInternalExecutor(db)
+    .select(identityCheckProjection)
+    .from(identityCheck)
+    .where(
+      and(
+        eq(identityCheck.provider, input.provider),
+        eq(identityCheck.idempotencyKey, input.idempotencyKey),
+      ),
+    )
+    .limit(1);
+  return record ?? null;
+}
+
+export async function findIdentityCheckByProviderReference(
+  db: Database | DatabaseTransaction,
+  input: { provider: string; providerReference: string },
+) {
+  const [record] = await getInternalExecutor(db)
+    .select(identityCheckProjection)
+    .from(identityCheck)
+    .where(
+      and(
+        eq(identityCheck.provider, input.provider),
+        eq(identityCheck.providerReference, input.providerReference),
+      ),
+    )
+    .limit(1);
+  return record ?? null;
+}
+
+export async function claimIdentityCheck(
+  db: Database | DatabaseTransaction,
+  input: { identityCheckId: string; processingToken: string; startedAt: Date },
+) {
+  const [record] = await getInternalExecutor(db)
+    .update(identityCheck)
+    .set({
+      processingToken: input.processingToken,
+      processingStartedAt: input.startedAt,
+    })
+    .where(
+      and(
+        eq(identityCheck.id, input.identityCheckId),
+        eq(identityCheck.status, "PENDING"),
+        isNull(identityCheck.processingToken),
+      ),
+    )
+    .returning(identityCheckProjection);
+  return record ?? null;
+}
+
+export async function releaseIdentityCheckClaim(
+  db: Database | DatabaseTransaction,
+  input: { identityCheckId: string; processingToken: string },
+): Promise<void> {
+  await getInternalExecutor(db)
+    .update(identityCheck)
+    .set({ processingToken: null, processingStartedAt: null })
+    .where(
+      and(
+        eq(identityCheck.id, input.identityCheckId),
+        eq(identityCheck.processingToken, input.processingToken),
+        eq(identityCheck.status, "PENDING"),
+      ),
+    );
+}
+
+export async function completeIdentityCheck(
+  tx: DatabaseTransaction,
+  input: {
+    identityCheckId: string;
+    processingToken: string;
+    providerReference: string;
+    status: "VERIFIED" | "FAILED" | "MANUAL_REVIEW";
+    evidence: Readonly<Record<string, unknown>>;
+    checkedAt: Date;
+  },
+) {
+  const [record] = await getInternalTransaction(tx)
+    .update(identityCheck)
+    .set({
+      providerReference: input.providerReference,
+      status: input.status,
+      evidence: input.evidence,
+      checkedAt: input.checkedAt,
+      processingToken: null,
+      processingStartedAt: null,
+    })
+    .where(
+      and(
+        eq(identityCheck.id, input.identityCheckId),
+        eq(identityCheck.processingToken, input.processingToken),
+        eq(identityCheck.status, "PENDING"),
+      ),
+    )
+    .returning(identityCheckProjection);
+  if (record === undefined) throw new Error("IDENTITY_CHECK_COMPLETE_FAILED");
+  return record;
+}
+
+export async function markDuplicateIdentityCheck(
+  tx: DatabaseTransaction,
+  input: {
+    identityCheckId: string;
+    processingToken: string;
+    duplicateOfIdentityCheckId: string;
+    consentEvidenceId: string;
+    checkedAt: Date;
+  },
+): Promise<void> {
+  await getInternalTransaction(tx)
+    .update(identityCheck)
+    .set({
+      status: "FAILED",
+      evidence: {
+        reason: "PROVIDER_REFERENCE_DUPLICATE",
+        duplicateOfIdentityCheckId: input.duplicateOfIdentityCheckId,
+        consentEvidenceId: input.consentEvidenceId,
+      },
+      checkedAt: input.checkedAt,
+      processingToken: null,
+      processingStartedAt: null,
+    })
+    .where(
+      and(
+        eq(identityCheck.id, input.identityCheckId),
+        eq(identityCheck.processingToken, input.processingToken),
+      ),
+    );
+}
+
+const identityCheckProjection = {
+  id: identityCheck.id,
+  personId: identityCheck.personId,
+  provider: identityCheck.provider,
+  idempotencyKey: identityCheck.idempotencyKey,
+  providerCorrelationId: identityCheck.providerCorrelationId,
+  providerReference: identityCheck.providerReference,
+  consentEvidenceId: identityCheck.consentEvidenceId,
+  status: identityCheck.status,
+  evidence: identityCheck.evidence,
+  checkedAt: identityCheck.checkedAt,
+  processingToken: identityCheck.processingToken,
+  processingStartedAt: identityCheck.processingStartedAt,
+  createdAt: identityCheck.createdAt,
+} as const;
 
 export async function lockPersonByPhone(
   tx: DatabaseTransaction,
@@ -134,6 +299,25 @@ export async function findLatestUsableOtpChallenge(
         eq(otpChallenge.personId, input.personId),
         isNull(otpChallenge.invalidatedAt),
         gt(otpChallenge.expiresAt, input.now),
+      ),
+    )
+    .orderBy(desc(otpChallenge.createdAt))
+    .limit(1)
+    .for("update");
+  return record ?? null;
+}
+
+export async function findLatestOtpChallengeForCooldown(
+  tx: DatabaseTransaction,
+  personId: string,
+) {
+  const [record] = await getInternalTransaction(tx)
+    .select()
+    .from(otpChallenge)
+    .where(
+      and(
+        eq(otpChallenge.personId, personId),
+        isNull(otpChallenge.deliveryFailedAt),
       ),
     )
     .orderBy(desc(otpChallenge.createdAt))
@@ -190,6 +374,17 @@ export async function invalidateOtpChallenge(
     .where(
       and(eq(otpChallenge.id, challengeId), isNull(otpChallenge.invalidatedAt)),
     );
+}
+
+export async function markOtpDeliveryFailed(
+  tx: DatabaseTransaction,
+  challengeId: string,
+  failedAt: Date,
+): Promise<void> {
+  await getInternalTransaction(tx)
+    .update(otpChallenge)
+    .set({ deliveryFailedAt: failedAt, invalidatedAt: failedAt })
+    .where(eq(otpChallenge.id, challengeId));
 }
 
 export async function invalidateOutstandingOtpChallenges(

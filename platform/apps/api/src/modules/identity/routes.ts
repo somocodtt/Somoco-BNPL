@@ -47,10 +47,11 @@ const consentSchema = {
 const niaSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["consentId", "ghanaCardNumber"],
+  required: ["consentId", "ghanaCardNumber", "idempotencyKey"],
   properties: {
     consentId: { type: "string", format: "uuid" },
     ghanaCardNumber: { type: "string", pattern: "^GHA-[0-9]{9}-[0-9]$" },
+    idempotencyKey: { type: "string", format: "uuid" },
   },
 } as const;
 
@@ -121,7 +122,13 @@ export async function registerIdentityRoutes(
 
   if (services.nia !== undefined) {
     const nia = services.nia;
-    app.post<{ Body: { consentId: string; ghanaCardNumber: string } }>(
+    app.post<{
+      Body: {
+        consentId: string;
+        ghanaCardNumber: string;
+        idempotencyKey: string;
+      };
+    }>(
       "/v1/customer/identity/ghana-card-verifications",
       { schema: { body: niaSchema }, preHandler: authenticateCustomer },
       async (request, reply) => {
@@ -130,6 +137,7 @@ export async function registerIdentityRoutes(
           subjectPersonId: principal.personId,
           consentId: request.body.consentId,
           ghanaCardNumber: request.body.ghanaCardNumber,
+          idempotencyKey: request.body.idempotencyKey,
           sessionId: principal.sessionId,
           requestId: request.id,
         });

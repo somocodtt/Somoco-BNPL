@@ -62,6 +62,9 @@ export async function transitionDocumentStatus(
     status: DocumentStatus;
     malwareScanned: boolean;
     sha256?: string;
+    acceptedObjectKey?: string;
+    acceptedObjectVersionId?: string;
+    acceptedObjectEtag?: string;
     metadata?: Readonly<Record<string, unknown>>;
     updatedAt: Date;
   },
@@ -72,6 +75,15 @@ export async function transitionDocumentStatus(
       status: input.status,
       malwareScanned: input.malwareScanned,
       ...(input.sha256 === undefined ? {} : { sha256: input.sha256 }),
+      ...(input.acceptedObjectKey === undefined
+        ? {}
+        : { acceptedObjectKey: input.acceptedObjectKey }),
+      ...(input.acceptedObjectVersionId === undefined
+        ? {}
+        : { acceptedObjectVersionId: input.acceptedObjectVersionId }),
+      ...(input.acceptedObjectEtag === undefined
+        ? {}
+        : { acceptedObjectEtag: input.acceptedObjectEtag }),
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
       version: sql`${document.version} + 1`,
       updatedAt: input.updatedAt,
@@ -97,6 +109,9 @@ const documentProjection = {
   declaredSizeBytes: document.declaredSizeBytes,
   uploadTicketHash: document.uploadTicketHash,
   uploadExpiresAt: document.uploadExpiresAt,
+  acceptedObjectKey: document.acceptedObjectKey,
+  acceptedObjectVersionId: document.acceptedObjectVersionId,
+  acceptedObjectEtag: document.acceptedObjectEtag,
   sha256: document.sha256,
   status: document.status,
   malwareScanned: document.malwareScanned,

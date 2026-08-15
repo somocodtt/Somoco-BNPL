@@ -14,18 +14,19 @@ import {
 } from "./plugins/request-context.js";
 import { redactedLogPaths, registerSecurity } from "./plugins/security.js";
 import {
-  isSimulatorAdapter,
   type MalwareScannerPort,
   type NiaPort,
   type ObjectStoragePort,
   type SmsPort,
 } from "@somo/integrations";
+import { validateProductionIdentityComposition } from "./production-composition.js";
 import { registerDocumentRoutes } from "./modules/documents/routes.js";
 import {
   createDocumentService,
   type DocumentPolicy,
 } from "./modules/documents/service.js";
 import { createConsentService } from "./modules/identity/consent-service.js";
+import type { ConsentDocumentCatalogConfig } from "./modules/identity/consent-catalog.js";
 import { createNiaService } from "./modules/identity/nia-service.js";
 import { registerIdentityRoutes } from "./modules/identity/routes.js";
 import {
@@ -53,6 +54,7 @@ export interface BuildAppOptions {
   identity?: {
     sms: SmsPort;
     otpPolicy: OtpPolicy;
+    consentCatalog: ConsentDocumentCatalogConfig;
     nia?: NiaPort;
     documents?: {
       storage: ObjectStoragePort;
@@ -127,11 +129,19 @@ export async function buildApp(
       sms: options.identity.sms,
       policy: options.identity.otpPolicy,
     });
-    const consent = createConsentService({ database });
+    const consent = createConsentService({
+      database,
+      catalog: options.identity.consentCatalog,
+    });
     const nia =
       options.identity.nia === undefined
         ? undefined
-        : createNiaService({ database, nia: options.identity.nia });
+        : createNiaService({
+            database,
+            nia: options.identity.nia,
+            catalog: options.identity.consentCatalog,
+            idempotencyHashSecret: options.identity.otpPolicy.hashSecret,
+          });
     await registerIdentityRoutes(app, config, {
       otp,
       consent,
@@ -154,22 +164,11 @@ function assertProductionIdentityDependencies(
   config: AppConfig,
   identity: BuildAppOptions["identity"],
 ): void {
-  if (config.environment !== "production") return;
   if (
-    identity === undefined ||
-    identity.nia === undefined ||
-    identity.documents === undefined
+    config.environment !== "production" &&
+    process.env.NODE_ENV !== "production"
   ) {
-    throw new Error("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
+    return;
   }
-  if (
-    [
-      identity.sms,
-      identity.nia,
-      identity.documents.storage,
-      identity.documents.malwareScanner,
-    ].some((adapter) => isSimulatorAdapter(adapter))
-  ) {
-    throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
-  }
+  validateProductionIdentityComposition(identity);
 }

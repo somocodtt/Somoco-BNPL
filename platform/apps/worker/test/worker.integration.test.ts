@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
+import { sealOtpDelivery } from "@somo/integrations";
 import {
   IntegrationTemporaryError,
   createPaymentWebhookSimulator,
@@ -21,7 +22,10 @@ import {
   type OutboxHandler,
 } from "../src/jobs/dispatch-outbox.js";
 import { createRecomputeArrearsHandler } from "../src/jobs/recompute-arrears.js";
-import { createSendNotificationHandler } from "../src/jobs/send-notification.js";
+import {
+  createSendNotificationHandler,
+  createSendOtpHandler,
+} from "../src/jobs/send-notification.js";
 
 type StoredState = "PENDING" | "CLAIMED" | "PUBLISHED" | "EXCEPTION";
 
@@ -699,6 +703,48 @@ describe("durable outbox worker", () => {
     expect(duplicate).toEqual(first);
     expect(first).toEqual({
       providerReference: "sms-sim-1001",
+      acceptedAt: "2026-08-14T12:00:00.000Z",
+    });
+  });
+
+  it("decrypts an OTP only at dispatch and uses the outbox idempotency key", async () => {
+    const encryptionSecret =
+      "test-otp-delivery-secret-with-at-least-32-characters";
+    const message = {
+      ...outboxMessage("otp-delivery-1001"),
+      topic: "identity.otp_sms_requested",
+      payload: {
+        requestId: "request-1001",
+        delivery: sealOtpDelivery(encryptionSecret, {
+          phoneE164: "+233201234567",
+          template: "CUSTOMER_AUTHENTICATION_OTP",
+          variables: { code: "123456" },
+        }),
+      },
+    };
+    const sms = createSmsSimulator({
+      environment: "test",
+      fixtures: [
+        {
+          input: {
+            idempotencyKey: "otp-delivery-1001",
+            phoneE164: "+233201234567",
+            template: "CUSTOMER_AUTHENTICATION_OTP",
+            variables: { code: "123456" },
+          },
+          result: {
+            providerReference: "sms-sim-otp-1001",
+            acceptedAt: "2026-08-14T12:00:00.000Z",
+          },
+        },
+      ],
+    });
+    const handler = createSendOtpHandler(sms, encryptionSecret);
+
+    const result = await handler(message);
+
+    expect(result).toEqual({
+      providerReference: "sms-sim-otp-1001",
       acceptedAt: "2026-08-14T12:00:00.000Z",
     });
   });

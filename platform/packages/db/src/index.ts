@@ -71,18 +71,26 @@ export type { WriteEffects } from "./repositories/effects.js";
 export {
   createCustomerSession,
   createConsentEvidence,
-  createIdentityCheck,
+  claimIdentityCheck,
+  completeIdentityCheck,
   createOtpChallenge,
   findActiveCustomerSessionByTokenHash,
   findOwnedConsentEvidence,
+  findIdentityCheckByIdempotencyKey,
+  findIdentityCheckByProviderReference,
   findLatestUsableOtpChallenge,
+  findLatestOtpChallengeForCooldown,
   findOrCreateCustomerAccount,
   findPersonById,
   findPersonByPhone,
   invalidateOtpChallenge,
+  markOtpDeliveryFailed,
   invalidateOutstandingOtpChallenges,
+  markDuplicateIdentityCheck,
   lockPersonByPhone,
   recordFailedOtpAttempt,
+  releaseIdentityCheckClaim,
+  reserveIdentityCheck,
 } from "./repositories/identity.js";
 export { ledgerRepo, type NewLedgerEntry } from "./repositories/ledger.js";
 export {
