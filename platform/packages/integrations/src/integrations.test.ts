@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import { createClamAvMalwareScanner } from "./malware-scanner.js";
 import { createS3ObjectStorage } from "./object-storage.js";
-import { openOtpDelivery, sealOtpDelivery } from "./otp-delivery.js";
+import { deriveOtpCode } from "./otp-delivery.js";
 import {
   IntegrationTemporaryError,
   createCreditBureauSimulator,
@@ -19,21 +19,17 @@ import {
 const checkedAt = "2026-08-14T12:00:00.000Z";
 
 describe("deterministic integration simulators", () => {
-  it("authenticates OTP outbox delivery without plaintext persistence", () => {
+  it("derives a stable OTP from a non-database secret and challenge id", () => {
     const secret = "synthetic-otp-delivery-secret-at-least-32-characters";
-    const delivery = {
-      phoneE164: "+233200000001",
-      template: "CUSTOMER_AUTHENTICATION_OTP" as const,
-      variables: { code: "123456" },
-    };
-    const envelope = sealOtpDelivery(secret, delivery);
+    const challengeId = "00000000-0000-4000-8000-000000000001";
 
-    expect(openOtpDelivery(secret, envelope)).toEqual(delivery);
-    expect(JSON.stringify(envelope)).not.toContain(delivery.phoneE164);
-    expect(JSON.stringify(envelope)).not.toContain(delivery.variables.code);
-    expect(() =>
-      openOtpDelivery(secret, { ...envelope, authenticationTag: "tampered" }),
-    ).toThrow("OTP_DELIVERY_ENVELOPE_INVALID");
+    expect(deriveOtpCode(secret, challengeId, 6)).toMatch(/^[0-9]{6}$/);
+    expect(deriveOtpCode(secret, challengeId, 6)).toBe(
+      deriveOtpCode(secret, challengeId, 6),
+    );
+    expect(deriveOtpCode(secret, challengeId, 6)).not.toBe(
+      deriveOtpCode(secret, "00000000-0000-4000-8000-000000000002", 6),
+    );
   });
   it("returns the configured NIA decision for an exact fixture", async () => {
     const nia = createNiaSimulator({
@@ -254,6 +250,27 @@ describe("deterministic integration simulators", () => {
 });
 
 describe("production document adapters", () => {
+  it("exposes a read-only production connector boundary without an attestation writer", async () => {
+    const api = (await import("./index.js")) as Record<string, unknown>;
+
+    expect(api["requireProductionConnector"]).toBeTypeOf("function");
+    expect(api["markProductionAdapter"]).toBeUndefined();
+    const requireConnector = api["requireProductionConnector"] as (
+      adapter: object,
+      capability: "OBJECT_STORAGE",
+    ) => object;
+    const storage = createS3ObjectStorage(s3Config("http://127.0.0.1:9000"));
+    expect(requireConnector(storage, "OBJECT_STORAGE")).toBe(storage);
+    const wrapper = {
+      createUploadTicket: storage.createUploadTicket.bind(storage),
+      readObject: storage.readObject.bind(storage),
+      promoteToImmutable: storage.promoteToImmutable.bind(storage),
+      createDownloadTicket: storage.createDownloadTicket.bind(storage),
+    };
+    expect(() => requireConnector(wrapper, "OBJECT_STORAGE")).toThrow(
+      "PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED",
+    );
+  });
   it("binds every required upload header into an expiring S3 signature", async () => {
     const storage = createS3ObjectStorage(s3Config("http://127.0.0.1:9000"));
     const requiredHeaders = {

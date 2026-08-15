@@ -145,7 +145,7 @@ function productionComposition() {
       resendCooldownMs: 30_000,
       codeLength: 6,
       hashSecret: "production-test-otp-secret-with-32-characters",
-      deliveryEncryptionSecret:
+      deliveryDerivationSecret:
         "production-test-delivery-secret-with-32-characters",
       sessionTtlMs: 3_600_000,
     },

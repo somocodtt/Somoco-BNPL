@@ -2,27 +2,25 @@ import {
   createHash,
   createHmac,
   randomBytes,
-  randomInt,
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
 import {
   appendAuditEvent,
   createCustomerSession,
-  createOtpChallenge,
+  createOtpChallengeIfPersonExists,
   enqueueOutbox,
   findActiveCustomerSessionByTokenHash,
   findLatestUsableOtpChallenge,
   findLatestOtpChallengeForCooldown,
   findOrCreateCustomerAccount,
-  findPersonByPhone,
   invalidateOutstandingOtpChallenges,
   lockPersonByPhone,
   recordFailedOtpAttempt,
   withTransaction,
   type Database,
 } from "@somo/db";
-import { sealOtpDelivery, type SmsPort } from "@somo/integrations";
+import { deriveOtpCode, type SmsPort } from "@somo/integrations";
 import type { CustomerPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 
@@ -32,13 +30,25 @@ export interface OtpPolicy {
   resendCooldownMs: number;
   codeLength: number;
   hashSecret: string;
-  deliveryEncryptionSecret: string;
+  deliveryDerivationSecret: string;
   sessionTtlMs: number;
 }
 
 export interface Clock {
   now(): Date;
 }
+
+export type OtpWorkStep =
+  | "person-lock"
+  | "cooldown-read"
+  | "otp-hash"
+  | "challenge-invalidate"
+  | "challenge-write"
+  | "audit-write"
+  | "outbox-write"
+  | "challenge-read"
+  | "otp-hash-compare"
+  | "attempt-write";
 
 export interface OtpService {
   request(input: {
@@ -67,6 +77,7 @@ export function createOtpService(options: {
   sms: SmsPort;
   policy: OtpPolicy;
   clock?: Clock;
+  workObserver?: (step: OtpWorkStep) => void;
 }): OtpService {
   const policy = validateOtpPolicy(options.policy);
   const clock = options.clock ?? { now: () => new Date() };
@@ -75,59 +86,41 @@ export function createOtpService(options: {
     async request(input) {
       const phoneE164 = normalizePhone(input.phoneE164);
       const now = clock.now();
-      const person = await findPersonByPhone(options.database, phoneE164);
-      const code = generateCode(policy.codeLength);
       const challengeId = randomUUID();
-      if (person === null) {
-        dummyHash(policy.hashSecret, code);
-        await withTransaction(options.database, async (tx) => {
-          await appendAuditEvent(tx, {
-            aggregateType: "otp_challenge",
-            aggregateId: challengeId,
-            action: "OTP_REQUESTED",
-            requestId: input.requestId,
-            data: { purpose: "CUSTOMER_AUTHENTICATION" },
-            occurredAt: now,
-          });
-          await enqueueOutbox(tx, {
-            id: challengeId,
-            topic: "identity.otp_delivery_suppressed",
-            aggregateType: "otp_challenge",
-            aggregateId: challengeId,
-            payload: {
-              requestId: input.requestId,
-              purpose: "CUSTOMER_AUTHENTICATION",
-            },
-            occurredAt: now,
-          });
-        });
-        return acceptedResponse;
-      }
-      const created = await withTransaction(options.database, async (tx) => {
-        const lockedPerson = await lockPersonByPhone(tx, phoneE164);
-        if (lockedPerson === null) return false;
-        const latest = await findLatestOtpChallengeForCooldown(
-          tx,
-          lockedPerson.id,
+      const code = deriveOtpCode(
+        policy.deliveryDerivationSecret,
+        challengeId,
+        policy.codeLength,
+      );
+      await withTransaction(options.database, async (tx) => {
+        const person = await lockPersonByPhone(tx, phoneE164);
+        observe(options, "person-lock");
+        const subjectId = person?.id ?? absentSubjectId;
+        const latest = await findLatestOtpChallengeForCooldown(tx, subjectId);
+        observe(options, "cooldown-read");
+        const mayIssue =
+          person !== null &&
+          (latest === null ||
+            now.getTime() - latest.createdAt.getTime() >=
+              policy.resendCooldownMs);
+        const persistedSubjectId = mayIssue ? subjectId : absentSubjectId;
+        const codeHash = hashOtp(
+          policy.hashSecret,
+          challengeId,
+          persistedSubjectId,
+          code,
         );
-        if (
-          latest !== null &&
-          now.getTime() - latest.createdAt.getTime() < policy.resendCooldownMs
-        ) {
-          return false;
-        }
-        await createOtpChallenge(tx, {
+        observe(options, "otp-hash");
+        await invalidateOutstandingOtpChallenges(tx, persistedSubjectId, now);
+        observe(options, "challenge-invalidate");
+        await createOtpChallengeIfPersonExists(tx, {
           id: challengeId,
-          personId: lockedPerson.id,
-          codeHash: hashOtp(
-            policy.hashSecret,
-            challengeId,
-            lockedPerson.id,
-            code,
-          ),
+          personId: persistedSubjectId,
+          codeHash,
           expiresAt: new Date(now.getTime() + policy.ttlMs),
           createdAt: now,
         });
+        observe(options, "challenge-write");
         await appendAuditEvent(tx, {
           aggregateType: "otp_challenge",
           aggregateId: challengeId,
@@ -136,6 +129,7 @@ export function createOtpService(options: {
           data: { purpose: "CUSTOMER_AUTHENTICATION" },
           occurredAt: now,
         });
+        observe(options, "audit-write");
         await enqueueOutbox(tx, {
           id: challengeId,
           topic: "identity.otp_sms_requested",
@@ -143,18 +137,12 @@ export function createOtpService(options: {
           aggregateId: challengeId,
           payload: {
             requestId: input.requestId,
-            delivery: sealOtpDelivery(policy.deliveryEncryptionSecret, {
-              phoneE164,
-              template: "CUSTOMER_AUTHENTICATION_OTP",
-              variables: { code },
-            }),
+            challengeId,
           },
           occurredAt: now,
         });
-        return true;
+        observe(options, "outbox-write");
       });
-      if (!created) return acceptedResponse;
-
       return acceptedResponse;
     },
 
@@ -164,47 +152,55 @@ export function createOtpService(options: {
       const sessionToken = randomBytes(32).toString("base64url");
       const outcome = await withTransaction(options.database, async (tx) => {
         const person = await lockPersonByPhone(tx, phoneE164);
-        if (person === null) {
-          dummyHash(policy.hashSecret, input.code);
-          await appendAuditEvent(tx, {
-            aggregateType: "otp_challenge",
-            aggregateId: randomUUID(),
-            action: "OTP_VERIFICATION_REJECTED",
-            requestId: input.requestId,
-            data: { reason: "INVALID_OR_EXPIRED" },
-            occurredAt: now,
-          });
-          return null;
-        }
+        observe(options, "person-lock");
+        const subjectId = person?.id ?? absentSubjectId;
         const challenge = await findLatestUsableOtpChallenge(tx, {
-          personId: person.id,
+          personId: subjectId,
           now,
         });
-        if (challenge === null || challenge.attempts >= policy.attemptLimit) {
-          dummyHash(policy.hashSecret, input.code);
-          return null;
-        }
+        observe(options, "challenge-read");
+        const challengeId = challenge?.id ?? absentChallengeId;
+        const dummyExpected = hashOtp(
+          policy.hashSecret,
+          absentChallengeId,
+          subjectId,
+          "0".repeat(policy.codeLength),
+        );
         const suppliedHash = hashOtp(
           policy.hashSecret,
-          challenge.id,
-          person.id,
+          challengeId,
+          subjectId,
           input.code,
         );
-        if (!equalHashes(challenge.codeHash, suppliedHash)) {
-          const attempts = challenge.attempts + 1;
+        const matches = equalHashes(
+          challenge?.codeHash ?? dummyExpected,
+          suppliedHash,
+        );
+        observe(options, "otp-hash-compare");
+        if (
+          person === null ||
+          challenge === null ||
+          challenge.attempts >= policy.attemptLimit ||
+          !matches
+        ) {
+          const attempts = challenge === null ? 0 : challenge.attempts + 1;
           await recordFailedOtpAttempt(tx, {
-            challengeId: challenge.id,
+            challengeId,
             attempts,
-            ...(attempts >= policy.attemptLimit ? { invalidatedAt: now } : {}),
+            ...(challenge !== null && attempts >= policy.attemptLimit
+              ? { invalidatedAt: now }
+              : {}),
           });
+          observe(options, "attempt-write");
           await appendAuditEvent(tx, {
             aggregateType: "otp_challenge",
-            aggregateId: challenge.id,
+            aggregateId: challengeId,
             action: "OTP_VERIFICATION_REJECTED",
             requestId: input.requestId,
             data: { reason: "INVALID_OR_EXPIRED" },
             occurredAt: now,
           });
+          observe(options, "audit-write");
           return null;
         }
 
@@ -274,20 +270,14 @@ export function validateOtpPolicy(policy: OtpPolicy): Readonly<OtpPolicy> {
     throw new Error("otp hashSecret must be at least 32 characters");
   }
   if (
-    policy.deliveryEncryptionSecret.length < 32 ||
-    policy.deliveryEncryptionSecret === policy.hashSecret
+    policy.deliveryDerivationSecret.length < 32 ||
+    policy.deliveryDerivationSecret === policy.hashSecret
   ) {
     throw new Error(
-      "otp deliveryEncryptionSecret must be distinct and at least 32 characters",
+      "otp deliveryDerivationSecret must be distinct and at least 32 characters",
     );
   }
   return Object.freeze({ ...policy });
-}
-
-function generateCode(length: number): string {
-  return randomInt(0, 10 ** length)
-    .toString()
-    .padStart(length, "0");
 }
 
 function hashOtp(
@@ -303,13 +293,6 @@ function hashOtp(
     .update("\0")
     .update(code)
     .digest("hex");
-}
-
-function dummyHash(secret: string, code: string): void {
-  createHmac("sha256", secret)
-    .update("unknown\0unknown\0")
-    .update(code)
-    .digest();
 }
 
 function equalHashes(expected: string, actual: string): boolean {
@@ -351,4 +334,14 @@ function authenticationError(): AppError {
     "AUTHENTICATION_FAILED",
     "Credentials could not be verified.",
   );
+}
+
+const absentSubjectId = "00000000-0000-4000-8000-000000000000";
+const absentChallengeId = "00000000-0000-4000-8000-000000000001";
+
+function observe(
+  options: { workObserver?: (step: OtpWorkStep) => void },
+  step: OtpWorkStep,
+): void {
+  options.workObserver?.(step);
 }

@@ -1,5 +1,9 @@
 import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
-import { isSimulatorAdapter } from "@somo/integrations";
+import {
+  hasProductionAdapterCapability,
+  isSimulatorAdapter,
+  type ProductionAdapterCapability,
+} from "@somo/integrations";
 
 const failureCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -46,26 +50,35 @@ export interface OutboxClaimStore {
 
 export type OutboxHandler = (message: OutboxMessage) => Promise<unknown>;
 
-const handlerProvenance = new WeakMap<OutboxHandler, boolean>();
+type HandlerProvenance = "UNDECLARED" | "PRODUCTION" | "SIMULATOR";
+const handlerProvenance = new WeakMap<OutboxHandler, HandlerProvenance>();
 
 export function createOutboxHandler(
   adapters: readonly object[],
   handler: OutboxHandler,
+  requiredCapabilities: readonly (readonly [
+    object,
+    ProductionAdapterCapability,
+  ])[] = [],
 ): OutboxHandler {
   const registered: OutboxHandler = (message) => handler(message);
-  handlerProvenance.set(
-    registered,
-    adapters.some((adapter) => isSimulatorAdapter(adapter)),
-  );
+  const provenance: HandlerProvenance = adapters.some((adapter) =>
+    isSimulatorAdapter(adapter),
+  )
+    ? "SIMULATOR"
+    : requiredCapabilities.every(([adapter, capability]) =>
+          hasProductionAdapterCapability(adapter, capability),
+        )
+      ? "PRODUCTION"
+      : "UNDECLARED";
+  handlerProvenance.set(registered, provenance);
   return registered;
 }
 
 export function inspectOutboxHandlerProvenance(
   handler: OutboxHandler,
 ): "UNDECLARED" | "PRODUCTION" | "SIMULATOR" {
-  const simulator = handlerProvenance.get(handler);
-  if (simulator === undefined) return "UNDECLARED";
-  return simulator ? "SIMULATOR" : "PRODUCTION";
+  return handlerProvenance.get(handler) ?? "UNDECLARED";
 }
 
 export interface DispatchOutboxOptions {

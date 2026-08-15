@@ -55,15 +55,15 @@ export async function seedSyntheticPerson(
 export async function readLatestOtpChallenge(
   connectionString: string,
   personId: string,
-): Promise<{ codeHash: string } | null> {
+): Promise<{ id: string; codeHash: string } | null> {
   const configuredUrl = requireTestDatabaseUrl();
   if (connectionString !== configuredUrl) {
     throw new Error("Read target must exactly match TEST_DATABASE_URL");
   }
   const pool = new Pool({ connectionString, max: 1 });
   try {
-    const result = await pool.query<{ code_hash: string }>(
-      `select code_hash
+    const result = await pool.query<{ id: string; code_hash: string }>(
+      `select id, code_hash
          from privacy.otp_challenge
         where person_id = $1
         order by created_at desc
@@ -71,7 +71,7 @@ export async function readLatestOtpChallenge(
       [personId],
     );
     const row = result.rows[0];
-    return row === undefined ? null : { codeHash: row.code_hash };
+    return row === undefined ? null : { id: row.id, codeHash: row.code_hash };
   } finally {
     await pool.end();
   }
@@ -110,12 +110,33 @@ export async function readOtpDeliveryPayloads(
   const pool = new Pool({ connectionString, max: 1 });
   try {
     const result = await pool.query<{ payload: unknown }>(
-      `select payload
-         from outbox_message
-        where topic = 'identity.otp_sms_requested'
-        order by occurred_at, created_at, id`,
+      `select o.payload
+         from outbox_message o
+         join privacy.otp_challenge c
+           on c.id = (o.payload->>'challengeId')::uuid
+        where o.topic = 'identity.otp_sms_requested'
+        order by o.occurred_at, o.created_at, o.id`,
     );
     return result.rows.map((row) => row.payload);
+  } finally {
+    await pool.end();
+  }
+}
+
+export async function expireIdentityCheckProcessingLease(
+  connectionString: string,
+  identityCheckId: string,
+): Promise<void> {
+  assertExactTestDatabaseUrl(connectionString, "Mutate");
+  const pool = new Pool({ connectionString, max: 1 });
+  try {
+    await pool.query(
+      `update privacy.identity_check
+          set processing_token = $2,
+              processing_started_at = now() - interval '5 minutes'
+        where id = $1`,
+      [identityCheckId, randomUUID()],
+    );
   } finally {
     await pool.end();
   }

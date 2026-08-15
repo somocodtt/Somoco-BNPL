@@ -3,10 +3,13 @@ import {
   appendAuditEvent,
   claimIdentityCheck,
   completeIdentityCheck,
+  findIdentityCheckById,
   findIdentityCheckByIdempotencyKey,
   findIdentityCheckByProviderReference,
   findOwnedConsentEvidence,
   markDuplicateIdentityCheck,
+  markIdentityCheckProviderReferenceConflict,
+  lockIdentityProviderReference,
   releaseIdentityCheckClaim,
   reserveIdentityCheck,
   withTransaction,
@@ -53,12 +56,21 @@ export function createNiaService(options: {
   nia: NiaPort;
   catalog: ConsentDocumentCatalogConfig;
   idempotencyHashSecret: string;
+  processingLeaseMs?: number;
   clock?: NiaClock;
 }): IdentityService {
   const clock = options.clock ?? { now: () => new Date() };
   const catalog = createConsentDocumentCatalog(options.catalog);
   if (options.idempotencyHashSecret.length < 32) {
     throw new Error("NIA_IDEMPOTENCY_HASH_SECRET_INVALID");
+  }
+  const processingLeaseMs = options.processingLeaseMs ?? 30_000;
+  if (
+    !Number.isSafeInteger(processingLeaseMs) ||
+    processingLeaseMs < 100 ||
+    processingLeaseMs > 300_000
+  ) {
+    throw new Error("NIA_PROCESSING_LEASE_INVALID");
   }
   return {
     async verifyGhanaCard(input) {
@@ -130,26 +142,34 @@ export function createNiaService(options: {
           "The idempotency key is already in use.",
         );
       }
-      const existingResult = resultFromRecord(reservation.record);
+      throwIfProviderReferenceConflict(reservation.record);
+      const existingResult = await resultForRecord(
+        options.database,
+        reservation.record,
+      );
       if (existingResult !== null) return existingResult;
 
       const processingToken = randomUUID();
       let claimed = await claimIdentityCheck(options.database, {
         identityCheckId: reservation.record.id,
         processingToken,
-        startedAt: clock.now(),
+        leaseMs: processingLeaseMs,
       });
       if (claimed === null) {
         const completed = await waitForIdentityResult(
           options.database,
           input.idempotencyKey,
         );
-        const completedResult = resultFromRecord(completed);
+        throwIfProviderReferenceConflict(completed);
+        const completedResult = await resultForRecord(
+          options.database,
+          completed,
+        );
         if (completedResult !== null) return completedResult;
         claimed = await claimIdentityCheck(options.database, {
           identityCheckId: completed.id,
           processingToken,
-          startedAt: clock.now(),
+          leaseMs: processingLeaseMs,
         });
         if (claimed === null) {
           throw new AppError(
@@ -195,35 +215,54 @@ export function createNiaService(options: {
         );
       }
 
-      const duplicate = await findIdentityCheckByProviderReference(
-        options.database,
-        {
+      const status = statusForDecision(providerResult.decision);
+      const checkedAt = new Date(providerResult.checkedAt);
+      const resolution = await withTransaction(options.database, async (tx) => {
+        await lockIdentityProviderReference(tx, {
           provider: NIA_PROVIDER,
           providerReference: providerResult.providerReference,
-        },
-      );
-      if (duplicate !== null && duplicate.id !== claimed.id) {
-        if (duplicate.personId !== input.subjectPersonId) {
-          await releaseIdentityCheckClaim(options.database, {
-            identityCheckId: claimed.id,
-            processingToken,
-          });
-          throw new AppError(
-            503,
-            "NIA_UNAVAILABLE",
-            "Identity verification is temporarily unavailable.",
-          );
-        }
-        const duplicateResult = resultFromRecord(duplicate);
-        if (duplicateResult === null)
-          throw new Error("NIA_DUPLICATE_INCOMPLETE");
-        await withTransaction(options.database, async (tx) => {
+        });
+        const duplicate = await findIdentityCheckByProviderReference(tx, {
+          provider: NIA_PROVIDER,
+          providerReference: providerResult.providerReference,
+        });
+        if (duplicate !== null && duplicate.id !== claimed.id) {
           const occurredAt = clock.now();
+          const sameRequest =
+            duplicate.personId === input.subjectPersonId &&
+            duplicate.consentEvidenceId === consent.id &&
+            duplicate.evidence["requestFingerprint"] === requestFingerprint;
+          if (!sameRequest) {
+            await markIdentityCheckProviderReferenceConflict(tx, {
+              identityCheckId: claimed.id,
+              processingToken,
+              consentEvidenceId: consent.id,
+              requestFingerprint,
+              checkedAt: occurredAt,
+            });
+            await appendAuditEvent(tx, {
+              aggregateType: "identity_check",
+              aggregateId: claimed.id,
+              action: "NIA_PROVIDER_REFERENCE_CONFLICT",
+              requestId: input.requestId,
+              data: auditData(input, {
+                purpose: NIA_PURPOSE,
+                consentEvidenceId: consent.id,
+              }),
+              occurredAt,
+            });
+            return { kind: "CONFLICT" as const };
+          }
+          const duplicateResult = resultFromRecord(duplicate);
+          if (duplicateResult === null) {
+            throw new Error("NIA_DUPLICATE_INCOMPLETE");
+          }
           await markDuplicateIdentityCheck(tx, {
             identityCheckId: claimed.id,
             processingToken,
             duplicateOfIdentityCheckId: duplicate.id,
             consentEvidenceId: consent.id,
+            requestFingerprint,
             checkedAt: occurredAt,
           });
           await appendAuditEvent(tx, {
@@ -238,13 +277,8 @@ export function createNiaService(options: {
             }),
             occurredAt,
           });
-        });
-        return duplicateResult;
-      }
-
-      const status = statusForDecision(providerResult.decision);
-      const checkedAt = new Date(providerResult.checkedAt);
-      const completed = await withTransaction(options.database, async (tx) => {
+          return { kind: "RESULT" as const, result: duplicateResult };
+        }
         const record = await completeIdentityCheck(tx, {
           identityCheckId: claimed.id,
           processingToken,
@@ -272,11 +306,12 @@ export function createNiaService(options: {
           }),
           occurredAt: clock.now(),
         });
-        return record;
+        const result = resultFromRecord(record);
+        if (result === null) throw new Error("NIA_RESULT_INCOMPLETE");
+        return { kind: "RESULT" as const, result };
       });
-      const result = resultFromRecord(completed);
-      if (result === null) throw new Error("NIA_RESULT_INCOMPLETE");
-      return result;
+      if (resolution.kind === "CONFLICT") throw providerReferenceConflict();
+      return resolution.result;
     },
   };
 }
@@ -301,6 +336,33 @@ async function waitForIdentityResult(
     "NIA_VERIFICATION_IN_PROGRESS",
     "Identity verification is already in progress.",
   );
+}
+
+async function resultForRecord(
+  database: Database,
+  record: {
+    id: string;
+    providerReference: string | null;
+    status: "PENDING" | "VERIFIED" | "FAILED" | "MANUAL_REVIEW";
+    evidence: Record<string, unknown>;
+    checkedAt: Date | null;
+  },
+): Promise<IdentityResult | null> {
+  const direct = resultFromRecord(record);
+  if (direct !== null) return direct;
+  const duplicateOf = record.evidence["duplicateOfIdentityCheckId"];
+  if (typeof duplicateOf !== "string" || !uuid(duplicateOf)) return null;
+  const original = await findIdentityCheckById(database, duplicateOf);
+  if (original === null) throw new Error("NIA_DUPLICATE_RESULT_MISSING");
+  return resultFromRecord(original);
+}
+
+function throwIfProviderReferenceConflict(record: {
+  evidence: Record<string, unknown>;
+}): void {
+  if (record.evidence["reason"] === "PROVIDER_REFERENCE_CONFLICT") {
+    throw providerReferenceConflict();
+  }
 }
 
 function resultFromRecord(record: {
@@ -378,6 +440,14 @@ function statusForDecision(decision: NiaDecision): IdentityCheckStatus {
   if (decision === "MATCH") return "VERIFIED";
   if (decision === "NO_MATCH") return "FAILED";
   return "MANUAL_REVIEW";
+}
+
+function providerReferenceConflict(): AppError {
+  return new AppError(
+    503,
+    "NIA_PROVIDER_REFERENCE_CONFLICT",
+    "Identity verification is temporarily unavailable.",
+  );
 }
 
 function auditData(

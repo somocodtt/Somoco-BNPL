@@ -78,7 +78,7 @@ const productionIdentityTestDependencies = {
     resendCooldownMs: 30_000,
     codeLength: 6,
     hashSecret: "production-safe-test-otp-secret-32-characters",
-    deliveryEncryptionSecret:
+    deliveryDerivationSecret:
       "production-safe-test-delivery-secret-32-characters",
     sessionTtlMs: 3_600_000,
   },

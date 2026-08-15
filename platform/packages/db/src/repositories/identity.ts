@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Database } from "../client.js";
 import { customerAccount, customerSession } from "../schema/access.js";
 import {
@@ -157,25 +157,59 @@ export async function findIdentityCheckByProviderReference(
   return record ?? null;
 }
 
+export async function findIdentityCheckById(
+  db: Database | DatabaseTransaction,
+  identityCheckId: string,
+) {
+  const [record] = await getInternalExecutor(db)
+    .select(identityCheckProjection)
+    .from(identityCheck)
+    .where(eq(identityCheck.id, identityCheckId))
+    .limit(1);
+  return record ?? null;
+}
+
 export async function claimIdentityCheck(
   db: Database | DatabaseTransaction,
-  input: { identityCheckId: string; processingToken: string; startedAt: Date },
+  input: {
+    identityCheckId: string;
+    processingToken: string;
+    leaseMs: number;
+  },
 ) {
   const [record] = await getInternalExecutor(db)
     .update(identityCheck)
     .set({
       processingToken: input.processingToken,
-      processingStartedAt: input.startedAt,
+      processingStartedAt: sql`clock_timestamp()`,
     })
     .where(
       and(
         eq(identityCheck.id, input.identityCheckId),
         eq(identityCheck.status, "PENDING"),
-        isNull(identityCheck.processingToken),
+        sql`(
+          ${identityCheck.processingToken} is null
+          or ${identityCheck.processingStartedAt} <
+            clock_timestamp() - (${input.leaseMs} * interval '1 millisecond')
+        )`,
       ),
     )
     .returning(identityCheckProjection);
   return record ?? null;
+}
+
+export async function lockIdentityProviderReference(
+  tx: DatabaseTransaction,
+  input: { provider: string; providerReference: string },
+): Promise<void> {
+  await getInternalTransaction(tx).execute(sql`
+    select pg_advisory_xact_lock(
+      hashtextextended(
+        concat(${input.provider}::text, ':', ${input.providerReference}::text),
+        0
+      )
+    )
+  `);
 }
 
 export async function releaseIdentityCheckClaim(
@@ -234,6 +268,7 @@ export async function markDuplicateIdentityCheck(
     processingToken: string;
     duplicateOfIdentityCheckId: string;
     consentEvidenceId: string;
+    requestFingerprint: string;
     checkedAt: Date;
   },
 ): Promise<void> {
@@ -245,6 +280,38 @@ export async function markDuplicateIdentityCheck(
         reason: "PROVIDER_REFERENCE_DUPLICATE",
         duplicateOfIdentityCheckId: input.duplicateOfIdentityCheckId,
         consentEvidenceId: input.consentEvidenceId,
+        requestFingerprint: input.requestFingerprint,
+      },
+      checkedAt: input.checkedAt,
+      processingToken: null,
+      processingStartedAt: null,
+    })
+    .where(
+      and(
+        eq(identityCheck.id, input.identityCheckId),
+        eq(identityCheck.processingToken, input.processingToken),
+      ),
+    );
+}
+
+export async function markIdentityCheckProviderReferenceConflict(
+  tx: DatabaseTransaction,
+  input: {
+    identityCheckId: string;
+    processingToken: string;
+    consentEvidenceId: string;
+    requestFingerprint: string;
+    checkedAt: Date;
+  },
+): Promise<void> {
+  await getInternalTransaction(tx)
+    .update(identityCheck)
+    .set({
+      status: "FAILED",
+      evidence: {
+        reason: "PROVIDER_REFERENCE_CONFLICT",
+        consentEvidenceId: input.consentEvidenceId,
+        requestFingerprint: input.requestFingerprint,
       },
       checkedAt: input.checkedAt,
       processingToken: null,
@@ -342,6 +409,46 @@ export async function createOtpChallenge(
     .returning();
   if (created === undefined) throw new Error("OTP_CHALLENGE_CREATE_FAILED");
   return created;
+}
+
+export async function createOtpChallengeIfPersonExists(
+  tx: DatabaseTransaction,
+  input: {
+    id: string;
+    personId: string;
+    codeHash: string;
+    expiresAt: Date;
+    createdAt: Date;
+  },
+): Promise<boolean> {
+  const result = await getInternalTransaction(tx).execute(sql`
+    insert into privacy.otp_challenge
+      (id, person_id, code_hash, expires_at, created_at)
+    select ${input.id}::uuid, p.id, ${input.codeHash}, ${input.expiresAt}, ${input.createdAt}
+      from privacy.person p
+     where p.id = ${input.personId}::uuid
+    returning id
+  `);
+  return result.rowCount === 1;
+}
+
+export async function findOtpDeliveryContext(
+  db: Database | DatabaseTransaction,
+  challengeId: string,
+) {
+  const [record] = await getInternalExecutor(db)
+    .select({
+      challengeId: otpChallenge.id,
+      phoneE164: person.phoneE164,
+      expiresAt: otpChallenge.expiresAt,
+      invalidatedAt: otpChallenge.invalidatedAt,
+      deliveryFailedAt: otpChallenge.deliveryFailedAt,
+    })
+    .from(otpChallenge)
+    .innerJoin(person, eq(person.id, otpChallenge.personId))
+    .where(eq(otpChallenge.id, challengeId))
+    .limit(1);
+  return record ?? null;
 }
 
 export async function recordFailedOtpAttempt(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
-import { sealOtpDelivery } from "@somo/integrations";
+import { deriveOtpCode } from "@somo/integrations";
 import {
   IntegrationTemporaryError,
   createPaymentWebhookSimulator,
@@ -229,6 +229,31 @@ describe("durable outbox worker", () => {
     expect(() => validateWorkerHandlerRegistry("production", handlers)).toThrow(
       "WORKER_SIMULATOR_HANDLER_FORBIDDEN",
     );
+  });
+
+  it("rejects a wrapped simulator SMS handler in production", () => {
+    const simulator = createSmsSimulator({ environment: "test", fixtures: [] });
+    const wrapped = {
+      send: (input: Parameters<typeof simulator.send>[0]) =>
+        simulator.send(input),
+    };
+    const handler = createSendOtpHandler({
+      sms: wrapped,
+      lookup: {
+        async find() {
+          return null;
+        },
+      },
+      derivationSecret: "test-otp-delivery-secret-with-at-least-32-characters",
+      codeLength: 6,
+    });
+
+    expect(() =>
+      validateWorkerHandlerRegistry(
+        "production",
+        new Map([["identity.otp_sms_requested", handler]]),
+      ),
+    ).toThrow("WORKER_HANDLER_PROVENANCE_REQUIRED");
   });
 
   it("accepts provenance-declared production adapters in production", () => {
@@ -707,19 +732,17 @@ describe("durable outbox worker", () => {
     });
   });
 
-  it("decrypts an OTP only at dispatch and uses the outbox idempotency key", async () => {
-    const encryptionSecret =
+  it("derives a stable OTP only at dispatch and uses the outbox idempotency key", async () => {
+    const derivationSecret =
       "test-otp-delivery-secret-with-at-least-32-characters";
+    const challengeId = "00000000-0000-4000-8000-000000001001";
+    const code = deriveOtpCode(derivationSecret, challengeId, 6);
     const message = {
-      ...outboxMessage("otp-delivery-1001"),
+      ...outboxMessage(challengeId),
       topic: "identity.otp_sms_requested",
       payload: {
         requestId: "request-1001",
-        delivery: sealOtpDelivery(encryptionSecret, {
-          phoneE164: "+233201234567",
-          template: "CUSTOMER_AUTHENTICATION_OTP",
-          variables: { code: "123456" },
-        }),
+        challengeId,
       },
     };
     const sms = createSmsSimulator({
@@ -727,10 +750,10 @@ describe("durable outbox worker", () => {
       fixtures: [
         {
           input: {
-            idempotencyKey: "otp-delivery-1001",
+            idempotencyKey: challengeId,
             phoneE164: "+233201234567",
             template: "CUSTOMER_AUTHENTICATION_OTP",
-            variables: { code: "123456" },
+            variables: { code },
           },
           result: {
             providerReference: "sms-sim-otp-1001",
@@ -739,10 +762,29 @@ describe("durable outbox worker", () => {
         },
       ],
     });
-    const handler = createSendOtpHandler(sms, encryptionSecret);
+    const handler = createSendOtpHandler({
+      sms,
+      lookup: {
+        async find() {
+          return {
+            phoneE164: "+233201234567",
+            expiresAt: new Date("2026-08-14T12:02:00.000Z"),
+            invalidatedAt: null,
+            deliveryFailedAt: null,
+          };
+        },
+      },
+      derivationSecret,
+      codeLength: 6,
+      now: () => new Date("2026-08-14T12:00:00.000Z"),
+    });
 
     const result = await handler(message);
+    const retry = await handler(message);
 
+    expect(retry).toEqual(result);
+    expect(JSON.stringify(message.payload)).not.toContain(code);
+    expect(JSON.stringify(message.payload)).not.toContain("+233201234567");
     expect(result).toEqual({
       providerReference: "sms-sim-otp-1001",
       acceptedAt: "2026-08-14T12:00:00.000Z",

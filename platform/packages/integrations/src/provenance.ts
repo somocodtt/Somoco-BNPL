@@ -44,3 +44,16 @@ export function hasProductionAdapterCapability(
     (productionCapabilities.get(value as object)?.has(capability) ?? false)
   );
 }
+
+export function requireProductionConnector<T extends object>(
+  adapter: T,
+  capability: ProductionAdapterCapability,
+): T {
+  if (isSimulatorAdapter(adapter)) {
+    throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+  }
+  if (!hasProductionAdapterCapability(adapter, capability)) {
+    throw new Error("PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED");
+  }
+  return adapter;
+}

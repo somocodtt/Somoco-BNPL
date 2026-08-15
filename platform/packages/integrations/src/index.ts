@@ -11,5 +11,6 @@ export * from "./tracker.js";
 export {
   hasProductionAdapterCapability,
   isSimulatorAdapter,
+  requireProductionConnector,
   type ProductionAdapterCapability,
 } from "./provenance.js";

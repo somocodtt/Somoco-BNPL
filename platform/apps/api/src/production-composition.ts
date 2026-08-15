@@ -1,6 +1,6 @@
 import {
-  hasProductionAdapterCapability,
   isSimulatorAdapter,
+  requireProductionConnector,
   type MalwareScannerPort,
   type NiaPort,
   type ObjectStoragePort,
@@ -74,7 +74,9 @@ export function validateProductionIdentityComposition(
     [storage, "OBJECT_STORAGE"],
     [malwareScanner, "MALWARE_SCANNER"],
   ] as const) {
-    if (!hasProductionAdapterCapability(adapter, capability)) {
+    try {
+      requireProductionConnector(adapter as object, capability);
+    } catch {
       throw new Error("PRODUCTION_IDENTITY_PROVENANCE_REQUIRED");
     }
   }
