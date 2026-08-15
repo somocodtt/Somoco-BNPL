@@ -1,13 +1,32 @@
 import type { FastifyRequest, preHandlerHookHandler } from "fastify";
 import type { AppConfig } from "../config.js";
-import type { StaffPrincipal } from "../modules/access/policy.js";
+import type {
+  CustomerPrincipal,
+  StaffPrincipal,
+} from "../modules/access/policy.js";
 import type { AccessService } from "../modules/access/service.js";
+import type { OtpService } from "../modules/identity/otp-service.js";
 import { AppError } from "./errors.js";
 
 declare module "fastify" {
   interface FastifyRequest {
     staffPrincipal?: StaffPrincipal;
+    customerPrincipal?: CustomerPrincipal;
   }
+}
+
+export function createCustomerAuthenticationHook(
+  service: Pick<OtpService, "authenticateSessionToken">,
+): preHandlerHookHandler {
+  return async function authenticateCustomer(request: FastifyRequest) {
+    const authorization = request.headers.authorization;
+    if (authorization === undefined) throw authenticationError();
+    const match = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(authorization);
+    if (match === null) throw authenticationError();
+    request.customerPrincipal = await service.authenticateSessionToken(
+      match[1]!,
+    );
+  };
 }
 
 export function createStaffAuthenticationHook(
@@ -34,6 +53,15 @@ export function requireStaffPrincipal(request: FastifyRequest): StaffPrincipal {
     throw authenticationError();
   }
   return request.staffPrincipal;
+}
+
+export function requireCustomerPrincipal(
+  request: FastifyRequest,
+): CustomerPrincipal {
+  if (request.customerPrincipal === undefined) {
+    throw authenticationError();
+  }
+  return request.customerPrincipal;
 }
 
 function authenticationError(): AppError {

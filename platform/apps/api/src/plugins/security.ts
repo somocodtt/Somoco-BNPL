@@ -12,6 +12,9 @@ export const redactedLogPaths = Object.freeze([
   "res.headers.set-cookie",
   "body.password",
   "body.mfaAssertion",
+  "body.phoneE164",
+  "body.code",
+  "body.ghanaCardNumber",
 ]);
 
 export async function registerSecurity(

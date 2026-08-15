@@ -77,6 +77,21 @@ describe("PostgreSQL persistence", () => {
     await close();
   });
 
+  it("applies the complete migration journal once and is repeat-safe", async () => {
+    const before = await db.execute<{ count: number }>(sql`
+      select count(*)::int as count from drizzle.__drizzle_migrations
+    `);
+
+    await migrateDatabase(database);
+    await migrateDatabase(database);
+
+    const after = await db.execute<{ count: number }>(sql`
+      select count(*)::int as count from drizzle.__drizzle_migrations
+    `);
+    expect(before.rows[0]?.count).toBe(7);
+    expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
+  });
+
   it("rejects an application whose person does not exist", async () => {
     await expect(
       withTransaction(database, async (tx) =>
@@ -649,6 +664,67 @@ describe("populated legacy schema migration", () => {
     } finally {
       await connection.close();
     }
+  });
+
+  it("quarantines populated legacy documents while adding bound upload evidence", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const personId = randomUUID();
+    const documentId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164) values ($1, $2)`,
+      [personId, "+233200009901"],
+    );
+    await pool.query(
+      `insert into privacy.document
+         (id, person_id, document_type, object_key, sha256, status,
+          malware_scanned, metadata, created_at, updated_at)
+       values
+         ($1, $2, 'GHANA_CARD_FRONT', $3, 'legacy-unverified-digest',
+          'ACCEPTED', false, '{"source":"legacy"}'::jsonb,
+          '2026-08-14T12:00:00.000Z', '2026-08-14T12:00:00.000Z')`,
+      [documentId, personId, `legacy/${documentId}`],
+    );
+
+    await applyMigrationFile(pool, "0006_worthless_marrow.sql");
+
+    const migrated = await pool.query<{
+      declared_mime_type: string;
+      declared_size_bytes: number;
+      upload_ticket_hash: string;
+      upload_expires_at: Date;
+      sha256: string | null;
+      status: string;
+      malware_scanned: boolean;
+      metadata: Record<string, unknown>;
+    }>(
+      `select declared_mime_type, declared_size_bytes, upload_ticket_hash,
+              upload_expires_at, sha256, status, malware_scanned, metadata
+         from privacy.document
+        where id = $1`,
+      [documentId],
+    );
+    expect(migrated.rows[0]).toEqual({
+      declared_mime_type: "application/octet-stream",
+      declared_size_bytes: 1,
+      upload_ticket_hash: "0".repeat(64),
+      upload_expires_at: new Date("2026-08-14T12:00:00.000Z"),
+      sha256: null,
+      status: "QUARANTINED",
+      malware_scanned: false,
+      metadata: {
+        source: "legacy",
+        legacyUploadEvidence: true,
+        migrationReason: "UPLOAD_BINDING_UNAVAILABLE",
+      },
+    });
   });
 });
 

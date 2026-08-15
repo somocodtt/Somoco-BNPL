@@ -101,6 +101,34 @@ export const customerAccount = pgTable(
   ],
 );
 
+export const customerSession = pgTable(
+  "customer_session",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    customerAccountId: uuid("customer_account_id")
+      .notNull()
+      .references(() => customerAccount.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("customer_session_token_hash_unique").on(table.tokenHash),
+    index("customer_session_account_idx").on(table.customerAccountId),
+    check(
+      "customer_session_token_hash_sha256",
+      sql`${table.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "customer_session_expiry_after_creation",
+      sql`${table.expiresAt} > ${table.createdAt}`,
+    ),
+  ],
+);
+
 export const staffSession = pgTable(
   "staff_session",
   {

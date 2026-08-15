@@ -24,6 +24,7 @@ export interface StaffPrincipal {
 export interface CustomerPrincipal {
   kind: "customer";
   customerAccountId: string;
+  personId: string;
   sessionId: string;
 }
 

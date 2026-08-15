@@ -61,7 +61,29 @@ export {
   completeOwnershipTransfer,
   type CompleteOwnershipTransferCommand,
 } from "./repositories/contracts.js";
+export {
+  createPendingDocument,
+  findOwnedDocument,
+  transitionDocumentStatus,
+  type DocumentStatus,
+} from "./repositories/documents.js";
 export type { WriteEffects } from "./repositories/effects.js";
+export {
+  createCustomerSession,
+  createConsentEvidence,
+  createIdentityCheck,
+  createOtpChallenge,
+  findActiveCustomerSessionByTokenHash,
+  findOwnedConsentEvidence,
+  findLatestUsableOtpChallenge,
+  findOrCreateCustomerAccount,
+  findPersonById,
+  findPersonByPhone,
+  invalidateOtpChallenge,
+  invalidateOutstandingOtpChallenges,
+  lockPersonByPhone,
+  recordFailedOtpAttempt,
+} from "./repositories/identity.js";
 export { ledgerRepo, type NewLedgerEntry } from "./repositories/ledger.js";
 export {
   paymentRepo,

@@ -1,4 +1,10 @@
+import { once } from "node:events";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
+import { createClamAvMalwareScanner } from "./malware-scanner.js";
+import { createS3ObjectStorage } from "./object-storage.js";
 import {
   IntegrationTemporaryError,
   createCreditBureauSimulator,
@@ -229,3 +235,110 @@ describe("deterministic integration simulators", () => {
     }
   });
 });
+
+describe("production document adapters", () => {
+  it("binds every required upload header into an expiring S3 signature", async () => {
+    const storage = createS3ObjectStorage(s3Config("http://127.0.0.1:9000"));
+    const requiredHeaders = {
+      "content-length": "68",
+      "content-type": "image/png",
+      "x-amz-meta-somo-document-id": "document-1001",
+      "x-amz-meta-somo-person-id": "person-1001",
+      "x-amz-meta-somo-upload-ticket": "opaque-ticket-1001",
+    } as const;
+
+    const ticket = await storage.createUploadTicket({
+      objectKey: "identity/person-1001/document-1001/evidence.png",
+      expiresAt: new Date(Date.now() + 60_000),
+      requiredHeaders,
+    });
+    const url = new URL(ticket.uploadUrl);
+
+    expect(ticket.requiredHeaders).toEqual(requiredHeaders);
+    expect(url.pathname).toBe(
+      "/somo-test/identity/person-1001/document-1001/evidence.png",
+    );
+    expect(url.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+    expect(url.searchParams.get("X-Amz-SignedHeaders")).toBe(
+      [
+        "content-length",
+        "content-type",
+        "host",
+        ...Object.keys(requiredHeaders).slice(2),
+      ]
+        .sort()
+        .join(";"),
+    );
+    expect(url.searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("stops a chunked S3 object read as soon as the bound byte limit is exceeded", async () => {
+    const server = createHttpServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.write(Buffer.alloc(4, 1));
+      response.end(Buffer.alloc(4, 2));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const storage = createS3ObjectStorage(
+      s3Config(`http://127.0.0.1:${address.port}`),
+    );
+    try {
+      await expect(
+        storage.readObject({ objectKey: "bounded/object.bin", maxBytes: 5 }),
+      ).rejects.toThrow("OBJECT_TOO_LARGE");
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+
+  it("uses ClamAV INSTREAM framing and accepts only an explicit clean result", async () => {
+    let request = Buffer.alloc(0);
+    const server = createTcpServer((socket) => {
+      socket.on("data", (chunk: Buffer) => {
+        request = Buffer.concat([request, chunk]);
+        if (request.subarray(-4).equals(Buffer.alloc(4))) {
+          socket.end("stream: OK\0");
+        }
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const scanner = createClamAvMalwareScanner({
+      host: "127.0.0.1",
+      port: address.port,
+      timeoutMs: 2_000,
+      maxBytes: 1_024,
+    });
+    try {
+      await expect(
+        scanner.scan({
+          objectKey: "identity/document-1001",
+          bytes: Uint8Array.from([1, 2, 3, 4]),
+        }),
+      ).resolves.toEqual({
+        verdict: "CLEAN",
+        scannerReference: "CLAMAV_OK",
+      });
+      expect(request.subarray(0, 10).toString()).toBe("zINSTREAM\0");
+      expect(request.readUInt32BE(10)).toBe(4);
+      expect(request.subarray(14, 18)).toEqual(Buffer.from([1, 2, 3, 4]));
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+});
+
+function s3Config(endpoint: string) {
+  return {
+    endpoint,
+    region: "test-region-1",
+    bucket: "somo-test",
+    accessKeyId: "test-access-key",
+    secretAccessKey: "test-secret-key",
+  };
+}

@@ -13,6 +13,25 @@ import {
   requestIdFromHeader,
 } from "./plugins/request-context.js";
 import { redactedLogPaths, registerSecurity } from "./plugins/security.js";
+import {
+  isSimulatorAdapter,
+  type MalwareScannerPort,
+  type NiaPort,
+  type ObjectStoragePort,
+  type SmsPort,
+} from "@somo/integrations";
+import { registerDocumentRoutes } from "./modules/documents/routes.js";
+import {
+  createDocumentService,
+  type DocumentPolicy,
+} from "./modules/documents/service.js";
+import { createConsentService } from "./modules/identity/consent-service.js";
+import { createNiaService } from "./modules/identity/nia-service.js";
+import { registerIdentityRoutes } from "./modules/identity/routes.js";
+import {
+  createOtpService,
+  type OtpPolicy,
+} from "./modules/identity/otp-service.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -31,6 +50,16 @@ export interface BuildAppOptions {
   logger?: boolean;
   loggerStream?: Writable;
   mfaVerifier?: MfaVerifier;
+  identity?: {
+    sms: SmsPort;
+    otpPolicy: OtpPolicy;
+    nia?: NiaPort;
+    documents?: {
+      storage: ObjectStoragePort;
+      malwareScanner: MalwareScannerPort;
+      policy: DocumentPolicy;
+    };
+  };
 }
 
 export async function buildApp(
@@ -40,6 +69,7 @@ export async function buildApp(
     options.config === undefined
       ? loadConfig()
       : validateConfig(options.config);
+  assertProductionIdentityDependencies(config, options.identity);
   const connection =
     options.database === undefined
       ? createDatabase(config.databaseUrl)
@@ -91,5 +121,55 @@ export async function buildApp(
       : { mfaVerifier: options.mfaVerifier }),
   });
   await registerAccessRoutes(app, config, accessService);
+  if (options.identity !== undefined) {
+    const otp = createOtpService({
+      database,
+      sms: options.identity.sms,
+      policy: options.identity.otpPolicy,
+    });
+    const consent = createConsentService({ database });
+    const nia =
+      options.identity.nia === undefined
+        ? undefined
+        : createNiaService({ database, nia: options.identity.nia });
+    await registerIdentityRoutes(app, config, {
+      otp,
+      consent,
+      ...(nia === undefined ? {} : { nia }),
+    });
+    if (options.identity.documents !== undefined) {
+      const documents = createDocumentService({
+        database,
+        storage: options.identity.documents.storage,
+        malwareScanner: options.identity.documents.malwareScanner,
+        policy: options.identity.documents.policy,
+      });
+      await registerDocumentRoutes(app, otp, documents);
+    }
+  }
   return app;
+}
+
+function assertProductionIdentityDependencies(
+  config: AppConfig,
+  identity: BuildAppOptions["identity"],
+): void {
+  if (config.environment !== "production") return;
+  if (
+    identity === undefined ||
+    identity.nia === undefined ||
+    identity.documents === undefined
+  ) {
+    throw new Error("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
+  }
+  if (
+    [
+      identity.sms,
+      identity.nia,
+      identity.documents.storage,
+      identity.documents.malwareScanner,
+    ].some((adapter) => isSimulatorAdapter(adapter))
+  ) {
+    throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+  }
 }

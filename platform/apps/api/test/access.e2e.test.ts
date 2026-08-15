@@ -15,7 +15,7 @@ import {
 } from "@somo/db";
 import argon2 from "argon2";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildApp } from "../src/app.js";
+import { buildApp, type BuildAppOptions } from "../src/app.js";
 import type { FastifyInstance } from "fastify";
 import { loadConfig, validateConfig, type AppConfig } from "../src/config.js";
 import {
@@ -58,6 +58,67 @@ const deterministicMfaVerifier = {
     return input.assertion === "valid-test-assertion";
   },
 };
+
+const productionIdentityTestDependencies = {
+  sms: {
+    async send() {
+      return {
+        providerReference: "production-safe-sms-test-reference",
+        acceptedAt: "2026-08-14T12:00:00.000Z",
+      };
+    },
+  },
+  otpPolicy: {
+    ttlMs: 120_000,
+    attemptLimit: 3,
+    resendCooldownMs: 30_000,
+    codeLength: 6,
+    hashSecret: "production-safe-test-otp-secret-32-characters",
+    sessionTtlMs: 3_600_000,
+  },
+  nia: {
+    async verify() {
+      return {
+        providerReference: "production-safe-nia-test-reference",
+        decision: "REVIEW" as const,
+        checkedAt: "2026-08-14T12:00:00.000Z",
+      };
+    },
+  },
+  documents: {
+    storage: {
+      async createUploadTicket(input) {
+        return {
+          uploadUrl: "https://storage.test.invalid/upload",
+          requiredHeaders: input.requiredHeaders,
+        };
+      },
+      async readObject() {
+        throw new Error("PRODUCTION_SAFE_TEST_OBJECT_UNAVAILABLE");
+      },
+      async createDownloadTicket(input) {
+        return {
+          downloadUrl: "https://storage.test.invalid/download",
+          expiresAt: input.expiresAt.toISOString(),
+        };
+      },
+    },
+    malwareScanner: {
+      async scan() {
+        return {
+          verdict: "CLEAN" as const,
+          scannerReference: "production-safe-scanner-test-reference",
+        };
+      },
+    },
+    policy: {
+      allowedMimeTypes: ["application/pdf"],
+      maxBytes: 1_024,
+      uploadTtlMs: 60_000,
+      downloadTtlMs: 30_000,
+    },
+  },
+} satisfies NonNullable<BuildAppOptions["identity"]>;
 
 let database: Database;
 let closeDatabase: () => Promise<void>;
@@ -401,6 +462,7 @@ describe("staff credentials and sessions", () => {
       },
       database,
       logger: false,
+      identity: productionIdentityTestDependencies,
     });
     try {
       const response = await login(
