@@ -1,6 +1,9 @@
 import type { SmsPort } from "../sms.js";
 import { assertSimulatorAllowed, type SimulatorEnvironment } from "./guard.js";
-import { markSimulatorAdapter } from "../provenance.js";
+import {
+  markSimulatorAdapter,
+  recordSimulatorAdapterUse,
+} from "../provenance.js";
 
 type SmsInput = Parameters<SmsPort["send"]>[0];
 type SmsResult = Awaited<ReturnType<SmsPort["send"]>>;
@@ -20,6 +23,7 @@ export function createSmsSimulator(options: {
   return markSimulatorAdapter(
     Object.freeze({
       async send(input: SmsInput): Promise<SmsResult> {
+        recordSimulatorAdapterUse();
         const accepted = acceptedByKey.get(input.idempotencyKey);
         if (accepted !== undefined) {
           return accepted;

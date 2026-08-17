@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { createNiaSimulator } from "@somo/integrations/simulators";
-import type { NiaPort } from "@somo/integrations";
-import { markProductionAdapter } from "../../../packages/integrations/src/provenance.js";
+import {
+  createClamAvMalwareScanner,
+  createProductionConnectorBoundary,
+  createS3ObjectStorage,
+  otpDerivationKeyId,
+  type NiaPort,
+} from "@somo/integrations";
 import {
   bootstrapApi,
   validateProductionIdentityComposition,
@@ -83,8 +88,15 @@ describe("production API bootstrap", () => {
 });
 
 function productionComposition() {
-  const sms = markProductionAdapter(
-    {
+  const boundary = createProductionConnectorBoundary();
+  const sms = boundary.register({
+    kind: "SMS",
+    provenance: {
+      packageName: "@somo-external/synthetic-sms",
+      packageVersion: "1.0.0",
+      connectorId: "synthetic-sms",
+    },
+    adapter: {
       async send() {
         return {
           providerReference: "sms-production-test-1",
@@ -92,10 +104,15 @@ function productionComposition() {
         };
       },
     },
-    "SMS",
-  );
-  const nia = markProductionAdapter(
-    {
+  });
+  const nia = boundary.register({
+    kind: "NIA",
+    provenance: {
+      packageName: "@somo-external/synthetic-nia",
+      packageVersion: "1.0.0",
+      connectorId: "synthetic-nia",
+    },
+    adapter: {
       async verify() {
         return {
           providerReference: "nia-production-test-1",
@@ -104,38 +121,22 @@ function productionComposition() {
         };
       },
     },
-    "NIA",
-  );
-  const storage = markProductionAdapter(
-    {
-      async createUploadTicket(input: {
-        requiredHeaders: Readonly<Record<string, string>>;
-      }) {
-        return {
-          uploadUrl: "https://storage.test.invalid/upload",
-          requiredHeaders: input.requiredHeaders,
-        };
-      },
-      async readObject() {
-        throw new Error("not used");
-      },
-      async promoteToImmutable() {
-        throw new Error("not used");
-      },
-      async createDownloadTicket() {
-        throw new Error("not used");
-      },
-    },
-    "OBJECT_STORAGE",
-  );
-  const malwareScanner = markProductionAdapter(
-    {
-      async scan() {
-        return { verdict: "ERROR" as const, scannerReference: "not-used" };
-      },
-    },
-    "MALWARE_SCANNER",
-  );
+  });
+  const storage = createS3ObjectStorage({
+    endpoint: "https://storage.test.invalid",
+    region: "test-1",
+    bucket: "synthetic-production-test",
+    accessKeyId: "synthetic-access-key",
+    secretAccessKey: "synthetic-secret-key-at-least-32-characters",
+  });
+  const malwareScanner = createClamAvMalwareScanner({
+    host: "127.0.0.1",
+    port: 3310,
+    timeoutMs: 1_000,
+    maxBytes: 1_024,
+    maxResponseBytes: 1_024,
+  });
+  const deliverySecret = "production-test-delivery-secret-with-32-characters";
   return {
     sms,
     nia,
@@ -145,8 +146,8 @@ function productionComposition() {
       resendCooldownMs: 30_000,
       codeLength: 6,
       hashSecret: "production-test-otp-secret-with-32-characters",
-      deliveryDerivationSecret:
-        "production-test-delivery-secret-with-32-characters",
+      deliveryDerivationSecret: deliverySecret,
+      deliveryDerivationKeyId: otpDerivationKeyId(deliverySecret),
       sessionTtlMs: 3_600_000,
     },
     consentCatalog: {

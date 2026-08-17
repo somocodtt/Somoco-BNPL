@@ -3,9 +3,14 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
+import type { ProductionConnectorBoundary, SmsPort } from "@somo/integrations";
 import { createClamAvMalwareScanner } from "./malware-scanner.js";
 import { createS3ObjectStorage } from "./object-storage.js";
-import { deriveOtpCode } from "./otp-delivery.js";
+import {
+  deriveOtpCode,
+  otpDerivationKeyId,
+  validateOtpDeliveryPolicy,
+} from "./otp-delivery.js";
 import {
   IntegrationTemporaryError,
   createCreditBureauSimulator,
@@ -30,6 +35,22 @@ describe("deterministic integration simulators", () => {
     expect(deriveOtpCode(secret, challengeId, 6)).not.toBe(
       deriveOtpCode(secret, "00000000-0000-4000-8000-000000000002", 6),
     );
+    const derivationKeyId = otpDerivationKeyId(secret);
+    expect(derivationKeyId).toMatch(/^otp-delivery-v1:[0-9a-f]{32}$/);
+    expect(
+      validateOtpDeliveryPolicy({
+        derivationSecret: secret,
+        derivationKeyId,
+        codeLength: 6,
+      }),
+    ).toEqual({ derivationKeyId, codeLength: 6 });
+    expect(() =>
+      validateOtpDeliveryPolicy({
+        derivationSecret: secret,
+        derivationKeyId: "otp-delivery-v2:mismatch",
+        codeLength: 6,
+      }),
+    ).toThrow("OTP_DERIVATION_KEY_ID_INVALID");
   });
   it("returns the configured NIA decision for an exact fixture", async () => {
     const nia = createNiaSimulator({
@@ -250,6 +271,103 @@ describe("deterministic integration simulators", () => {
 });
 
 describe("production document adapters", () => {
+  it("constructs legitimate external SMS and NIA connectors through a constrained package-root boundary", async () => {
+    const api = (await import("@somo/integrations")) as Record<string, unknown>;
+    expect(api["createProductionConnectorBoundary"]).toBeTypeOf("function");
+    const createBoundary = api[
+      "createProductionConnectorBoundary"
+    ] as () => ProductionConnectorBoundary;
+    const boundary = createBoundary();
+    const sms = boundary.register({
+      kind: "SMS",
+      provenance: externalProvenance("ghana-sms"),
+      adapter: {
+        async send() {
+          return {
+            providerReference: "external-sms-1",
+            acceptedAt: checkedAt,
+          };
+        },
+      },
+    });
+    const nia = boundary.register({
+      kind: "NIA",
+      provenance: externalProvenance("ghana-nia"),
+      adapter: {
+        async verify() {
+          return {
+            providerReference: "external-nia-1",
+            decision: "REVIEW" as const,
+            checkedAt,
+          };
+        },
+      },
+    });
+
+    expect(boundary.require(sms, "SMS")).toBe(sms);
+    expect(boundary.require(nia, "NIA")).toBe(nia);
+    expect(Object.isFrozen(sms)).toBe(true);
+    expect(Object.isFrozen(nia)).toBe(true);
+    expect(() =>
+      boundary.register({
+        kind: "SMS",
+        provenance: externalProvenance("wrong-method"),
+        adapter: {
+          verify: async () => undefined,
+        } as unknown as SmsPort,
+      }),
+    ).toThrow("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  });
+
+  it("does not let direct or wrapped simulators cross the external connector boundary", async () => {
+    const api = (await import("@somo/integrations")) as Record<string, unknown>;
+    const createBoundary = api[
+      "createProductionConnectorBoundary"
+    ] as () => ProductionConnectorBoundary;
+    const boundary = createBoundary();
+    const simulator = createSmsSimulator({
+      environment: "test",
+      fixtures: [
+        {
+          input: {
+            idempotencyKey: "wrapped-simulator",
+            phoneE164: "+233201234567",
+            template: "TEST",
+            variables: {},
+          },
+          result: {
+            providerReference: "simulator-result",
+            acceptedAt: checkedAt,
+          },
+        },
+      ],
+    });
+    expect(() =>
+      boundary.register({
+        kind: "SMS",
+        provenance: externalProvenance("direct-simulator"),
+        adapter: simulator,
+      }),
+    ).toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+
+    const wrapped = boundary.register({
+      kind: "SMS",
+      provenance: externalProvenance("wrapped-simulator"),
+      adapter: {
+        send: (input: Parameters<typeof simulator.send>[0]) =>
+          simulator.send(input),
+      },
+    });
+    await expect(
+      wrapped.send({
+        idempotencyKey: "wrapped-simulator",
+        phoneE164: "+233201234567",
+        template: "TEST",
+        variables: {},
+      }),
+    ).rejects.toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+  });
+
   it("exposes a read-only production connector boundary without an attestation writer", async () => {
     const api = (await import("./index.js")) as Record<string, unknown>;
 
@@ -467,6 +585,14 @@ describe("production document adapters", () => {
     }
   });
 });
+
+function externalProvenance(connectorId: string) {
+  return {
+    packageName: "@somo-external/synthetic-provider",
+    packageVersion: "1.2.3",
+    connectorId,
+  };
+}
 
 function s3Config(endpoint: string) {
   return {

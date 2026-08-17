@@ -1,3 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { NiaPort } from "./nia.js";
+import type { SmsPort } from "./sms.js";
+
 const simulatorAdapters = new WeakSet<object>();
 const productionCapabilities = new WeakMap<
   object,
@@ -7,9 +11,36 @@ const productionCapabilities = new WeakMap<
 export type ProductionAdapterCapability =
   "SMS" | "NIA" | "OBJECT_STORAGE" | "MALWARE_SCANNER";
 
+export interface ExternalConnectorProvenance {
+  packageName: string;
+  packageVersion: string;
+  connectorId: string;
+}
+
+export interface ProductionConnectorBoundary {
+  register(input: {
+    kind: "SMS";
+    provenance: ExternalConnectorProvenance;
+    adapter: SmsPort;
+  }): SmsPort;
+  register(input: {
+    kind: "NIA";
+    provenance: ExternalConnectorProvenance;
+    adapter: NiaPort;
+  }): NiaPort;
+  require<T extends object>(adapter: T, kind: "SMS" | "NIA"): T;
+}
+
+const simulatorUse = new AsyncLocalStorage<{ used: boolean }>();
+
 export function markSimulatorAdapter<T extends object>(adapter: T): T {
   simulatorAdapters.add(adapter);
   return adapter;
+}
+
+export function recordSimulatorAdapterUse(): void {
+  const context = simulatorUse.getStore();
+  if (context !== undefined) context.used = true;
 }
 
 export function isSimulatorAdapter(value: unknown): boolean {
@@ -56,4 +87,88 @@ export function requireProductionConnector<T extends object>(
     throw new Error("PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED");
   }
   return adapter;
+}
+
+export function createProductionConnectorBoundary(): ProductionConnectorBoundary {
+  const registered = new WeakMap<object, "SMS" | "NIA">();
+  function register(input: {
+    kind: "SMS" | "NIA";
+    provenance: ExternalConnectorProvenance;
+    adapter: SmsPort | NiaPort;
+  }): SmsPort | NiaPort {
+    validateExternalConnectorProvenance(input.provenance);
+    if (isSimulatorAdapter(input.adapter)) {
+      throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+    }
+    const connector =
+      input.kind === "SMS"
+        ? createExternalSmsConnector(input.adapter)
+        : createExternalNiaConnector(input.adapter);
+    markProductionAdapter(connector, input.kind);
+    registered.set(connector, input.kind);
+    return connector;
+  }
+  return Object.freeze({
+    register: register as ProductionConnectorBoundary["register"],
+    require<T extends object>(adapter: T, kind: "SMS" | "NIA"): T {
+      if (registered.get(adapter) !== kind) {
+        throw new Error("PRODUCTION_CONNECTOR_REGISTRATION_REQUIRED");
+      }
+      return adapter;
+    },
+  });
+}
+
+function createExternalSmsConnector(adapter: SmsPort | NiaPort): SmsPort {
+  if (typeof (adapter as Partial<SmsPort>).send !== "function") {
+    throw new Error("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  }
+  const send = (adapter as SmsPort).send.bind(adapter);
+  return Object.freeze({
+    send: (input: Parameters<SmsPort["send"]>[0]) =>
+      runExternalConnectorOperation(() => send(input)),
+  });
+}
+
+function createExternalNiaConnector(adapter: SmsPort | NiaPort): NiaPort {
+  if (typeof (adapter as Partial<NiaPort>).verify !== "function") {
+    throw new Error("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  }
+  const verify = (adapter as NiaPort).verify.bind(adapter);
+  return Object.freeze({
+    verify: (input: Parameters<NiaPort["verify"]>[0]) =>
+      runExternalConnectorOperation(() => verify(input)),
+  });
+}
+
+async function runExternalConnectorOperation<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const context = { used: false };
+  try {
+    const result = await simulatorUse.run(context, operation);
+    if (context.used) throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+    return result;
+  } catch (cause) {
+    if (context.used) {
+      throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION", { cause });
+    }
+    throw cause;
+  }
+}
+
+function validateExternalConnectorProvenance(
+  provenance: ExternalConnectorProvenance,
+): void {
+  if (
+    !/^@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/.test(
+      provenance.packageName,
+    ) ||
+    !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(
+      provenance.packageVersion,
+    ) ||
+    !/^[a-z0-9][a-z0-9._-]{2,63}$/.test(provenance.connectorId)
+  ) {
+    throw new Error("PRODUCTION_CONNECTOR_PROVENANCE_INVALID");
+  }
 }

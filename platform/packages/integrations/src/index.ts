@@ -9,8 +9,11 @@ export * from "./payments.js";
 export * from "./sms.js";
 export * from "./tracker.js";
 export {
+  createProductionConnectorBoundary,
   hasProductionAdapterCapability,
   isSimulatorAdapter,
   requireProductionConnector,
   type ProductionAdapterCapability,
+  type ExternalConnectorProvenance,
+  type ProductionConnectorBoundary,
 } from "./provenance.js";

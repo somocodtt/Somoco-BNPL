@@ -354,6 +354,17 @@ export async function lockPersonByPhone(
   return record ?? null;
 }
 
+export async function lockOtpPhone(
+  tx: DatabaseTransaction,
+  keyedPhoneFingerprint: string,
+): Promise<void> {
+  await getInternalTransaction(tx).execute(sql`
+    select pg_advisory_xact_lock(
+      hashtextextended(${keyedPhoneFingerprint}::text, 0)
+    )
+  `);
+}
+
 export async function findLatestUsableOtpChallenge(
   tx: DatabaseTransaction,
   input: { personId: string; now: Date },

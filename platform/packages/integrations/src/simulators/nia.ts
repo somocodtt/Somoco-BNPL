@@ -1,6 +1,9 @@
 import type { NiaPort } from "../nia.js";
 import { assertSimulatorAllowed, type SimulatorEnvironment } from "./guard.js";
-import { markSimulatorAdapter } from "../provenance.js";
+import {
+  markSimulatorAdapter,
+  recordSimulatorAdapterUse,
+} from "../provenance.js";
 
 type NiaInput = Parameters<NiaPort["verify"]>[0];
 type NiaResult = Awaited<ReturnType<NiaPort["verify"]>>;
@@ -18,6 +21,7 @@ export function createNiaSimulator(options: {
   return markSimulatorAdapter(
     Object.freeze({
       async verify(input: NiaInput): Promise<NiaResult> {
+        recordSimulatorAdapterUse();
         const fixture = options.fixtures.find(
           (candidate) =>
             candidate.input.correlationId === input.correlationId &&

@@ -4,6 +4,7 @@ import { createDatabaseOutboxStore } from "./database-outbox-store.js";
 import {
   dispatchOutboxBatch,
   inspectOutboxHandlerProvenance,
+  inspectOutboxHandlerRegistration,
   validateDispatchOutboxOptions,
   type OutboxClaimStore,
   type OutboxHandler,
@@ -164,6 +165,15 @@ export function validateWorkerHandlerRegistry(
     if (provenance === "UNDECLARED") {
       throw new Error("WORKER_HANDLER_PROVENANCE_REQUIRED");
     }
+  }
+  const otpHandler = handlers.get("identity.otp_sms_requested");
+  if (otpHandler === undefined) throw new Error("WORKER_OTP_HANDLER_REQUIRED");
+  const registration = inspectOutboxHandlerRegistration(otpHandler);
+  if (!registration?.capabilities.has("SMS")) {
+    throw new Error("WORKER_OTP_SMS_CAPABILITY_REQUIRED");
+  }
+  if (registration.otpDeliveryPolicy === undefined) {
+    throw new Error("WORKER_OTP_POLICY_REQUIRED");
   }
 }
 

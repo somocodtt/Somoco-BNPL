@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
-import { deriveOtpCode } from "@somo/integrations";
+import {
+  createProductionConnectorBoundary,
+  deriveOtpCode,
+  otpDerivationKeyId,
+} from "@somo/integrations";
 import {
   IntegrationTemporaryError,
   createPaymentWebhookSimulator,
@@ -245,6 +249,9 @@ describe("durable outbox worker", () => {
         },
       },
       derivationSecret: "test-otp-delivery-secret-with-at-least-32-characters",
+      derivationKeyId: otpDerivationKeyId(
+        "test-otp-delivery-secret-with-at-least-32-characters",
+      ),
       codeLength: 6,
     });
 
@@ -256,16 +263,62 @@ describe("durable outbox worker", () => {
     ).toThrow("WORKER_HANDLER_PROVENANCE_REQUIRED");
   });
 
-  it("accepts provenance-declared production adapters in production", () => {
+  it("requires the OTP delivery topic and an SMS-capable handler before a production loop starts", () => {
+    expect(() =>
+      validateWorkerHandlerRegistry("production", new Map()),
+    ).toThrow("WORKER_OTP_HANDLER_REQUIRED");
+
+    const emptyRequirements = createOutboxHandler([], async () => undefined);
+    expect(() =>
+      validateWorkerHandlerRegistry(
+        "production",
+        new Map([["identity.otp_sms_requested", emptyRequirements]]),
+      ),
+    ).toThrow("WORKER_OTP_SMS_CAPABILITY_REQUIRED");
+  });
+
+  it("accepts a complete production registry with an externally constructed SMS connector", () => {
     const productionPaymentVerifier = {
       async verify() {
         throw new Error("PROVIDER_NOT_CONFIGURED");
       },
     };
+    const boundary = createProductionConnectorBoundary();
+    const sms = boundary.register({
+      kind: "SMS",
+      provenance: {
+        packageName: "@somo-external/synthetic-sms",
+        packageVersion: "1.0.0",
+        connectorId: "synthetic-sms",
+      },
+      adapter: {
+        async send() {
+          return {
+            providerReference: "external-sms-1",
+            acceptedAt: "2026-08-14T12:00:00.000Z",
+          };
+        },
+      },
+    });
+    const secret = "production-otp-delivery-secret-at-least-32-characters";
     const handlers = new Map<string, OutboxHandler>([
       [
         "payment.verify",
         createOutboxHandler([productionPaymentVerifier], async () => undefined),
+      ],
+      [
+        "identity.otp_sms_requested",
+        createSendOtpHandler({
+          sms,
+          lookup: {
+            async find() {
+              return null;
+            },
+          },
+          derivationSecret: secret,
+          derivationKeyId: otpDerivationKeyId(secret),
+          codeLength: 6,
+        }),
       ],
     ]);
 
@@ -349,6 +402,56 @@ describe("durable outbox worker", () => {
         WORKER_HANDLERS_MODULE: "file:///deployment/worker-handlers.js",
       }),
     ).toThrow("WORKER_NODE_ENV_REQUIRED");
+  });
+
+  it("rejects mismatched OTP key identity and code length before lookup or provider delivery", async () => {
+    const secret = "test-otp-delivery-secret-with-at-least-32-characters";
+    const configuredKeyId = otpDerivationKeyId(secret);
+    const calls = { lookup: 0, provider: 0 };
+    const handler = createSendOtpHandler({
+      sms: {
+        async send() {
+          calls.provider += 1;
+          return {
+            providerReference: "must-not-send",
+            acceptedAt: "2026-08-14T12:00:00.000Z",
+          };
+        },
+      },
+      lookup: {
+        async find() {
+          calls.lookup += 1;
+          return null;
+        },
+      },
+      derivationSecret: secret,
+      derivationKeyId: configuredKeyId,
+      codeLength: 6,
+    });
+    const message = {
+      ...outboxMessage("00000000-0000-4000-8000-000000000050"),
+      topic: "identity.otp_sms_requested",
+      payload: {
+        requestId: "request-policy-binding",
+        challengeId: "00000000-0000-4000-8000-000000000051",
+        derivationKeyId: configuredKeyId,
+        codeLength: 6,
+      },
+    };
+
+    await expect(
+      handler({
+        ...message,
+        payload: { ...message.payload, derivationKeyId: "otp-v2:mismatch" },
+      }),
+    ).rejects.toMatchObject({ code: "OTP_DELIVERY_POLICY_MISMATCH" });
+    await expect(
+      handler({
+        ...message,
+        payload: { ...message.payload, codeLength: 7 },
+      }),
+    ).rejects.toMatchObject({ code: "OTP_DELIVERY_POLICY_MISMATCH" });
+    expect(calls).toEqual({ lookup: 0, provider: 0 });
   });
 
   it("does not invoke a handler for a claim beyond max attempts", async () => {
@@ -743,6 +846,8 @@ describe("durable outbox worker", () => {
       payload: {
         requestId: "request-1001",
         challengeId,
+        derivationKeyId: otpDerivationKeyId(derivationSecret),
+        codeLength: 6,
       },
     };
     const sms = createSmsSimulator({
@@ -775,6 +880,7 @@ describe("durable outbox worker", () => {
         },
       },
       derivationSecret,
+      derivationKeyId: otpDerivationKeyId(derivationSecret),
       codeLength: 6,
       now: () => new Date("2026-08-14T12:00:00.000Z"),
     });

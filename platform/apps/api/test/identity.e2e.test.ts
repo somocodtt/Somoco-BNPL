@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import { createDatabase, migrateDatabase, type Database } from "@somo/db";
-import { deriveOtpCode, type NiaPort, type SmsPort } from "@somo/integrations";
+import {
+  deriveOtpCode,
+  otpDerivationKeyId,
+  type NiaPort,
+  type SmsPort,
+} from "@somo/integrations";
 import { createNiaSimulator } from "@somo/integrations/simulators";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
@@ -66,6 +71,9 @@ const otpPolicy: OtpPolicy = {
   hashSecret: "test-otp-hash-secret-with-at-least-32-characters",
   deliveryDerivationSecret:
     "test-otp-delivery-secret-with-at-least-32-characters",
+  deliveryDerivationKeyId: otpDerivationKeyId(
+    "test-otp-delivery-secret-with-at-least-32-characters",
+  ),
   sessionTtlMs: 3_600_000,
 };
 
@@ -303,11 +311,15 @@ describe("SMS OTP abuse controls", () => {
       sms: recordingSms(),
       policy: otpPolicy,
       clock,
-      workObserver: (step: string) => requestPaths.known.push(step),
+      workObserver: (step: string) => {
+        requestPaths.known.push(step);
+      },
     };
     const unknownOptions = {
       ...knownOptions,
-      workObserver: (step: string) => requestPaths.unknown.push(step),
+      workObserver: (step: string) => {
+        requestPaths.unknown.push(step);
+      },
     };
     const known = createOtpService(knownOptions);
     const unknown = createOtpService(unknownOptions);
@@ -327,6 +339,7 @@ describe("SMS OTP abuse controls", () => {
 
     expect(requestPaths.known).toEqual(requestPaths.unknown);
     expect(requestPaths.known).toEqual([
+      "phone-lock",
       "person-lock",
       "cooldown-read",
       "otp-hash",
@@ -348,7 +361,9 @@ describe("SMS OTP abuse controls", () => {
         sms: recordingSms(),
         policy: otpPolicy,
         clock,
-        workObserver: (step: string) => path.push(step),
+        workObserver: (step: string) => {
+          path.push(step);
+        },
       };
       return createOtpService(options);
     };
@@ -370,12 +385,77 @@ describe("SMS OTP abuse controls", () => {
     expect(verificationPaths.invalid).toEqual(verificationPaths.none);
     expect(verificationPaths.invalid).toEqual(verificationPaths.unknown);
     expect(verificationPaths.invalid).toEqual([
+      "phone-lock",
       "person-lock",
       "challenge-read",
       "otp-hash-compare",
       "attempt-write",
       "audit-write",
     ]);
+  });
+
+  it("serializes concurrent same-phone request and verify work for known and unknown subjects", async () => {
+    const cases = [
+      { operation: "request" as const, known: true, phone: "+233200000113" },
+      { operation: "request" as const, known: false, phone: "+233200009993" },
+      { operation: "verify" as const, known: true, phone: "+233200000114" },
+      { operation: "verify" as const, known: false, phone: "+233200009994" },
+    ];
+
+    for (const testCase of cases) {
+      if (testCase.known) {
+        await seedSyntheticPerson(databaseUrl, { phoneE164: testCase.phone });
+      }
+      const firstReachedPersonLookup = deferredSignal();
+      const releaseFirst = deferredSignal();
+      let holdFirst = true;
+      const first = createOtpService({
+        database,
+        sms: recordingSms(),
+        policy: otpPolicy,
+        clock: mutableClock("2026-08-14T12:00:00.000Z"),
+        workObserver: async (step) => {
+          if (step === "person-lock" && holdFirst) {
+            holdFirst = false;
+            firstReachedPersonLookup.resolve();
+            await releaseFirst.promise;
+          }
+        },
+      });
+      const second = createOtpService({
+        database,
+        sms: recordingSms(),
+        policy: otpPolicy,
+        clock: mutableClock("2026-08-14T12:00:00.000Z"),
+      });
+      const invoke = (service: ReturnType<typeof createOtpService>) =>
+        testCase.operation === "request"
+          ? service.request({
+              phoneE164: testCase.phone,
+              requestId: randomUUID(),
+            })
+          : service
+              .verify({
+                phoneE164: testCase.phone,
+                code: "000000",
+                requestId: randomUUID(),
+              })
+              .catch(() => undefined);
+
+      const firstCall = invoke(first);
+      await firstReachedPersonLookup.promise;
+      let secondSettled = false;
+      const secondCall = invoke(second).finally(() => {
+        secondSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      expect(
+        secondSettled,
+        `${testCase.operation}/${String(testCase.known)}`,
+      ).toBe(false);
+      releaseFirst.resolve();
+      await Promise.all([firstCall, secondCall]);
+    }
   });
 
   it("equalizes failed verification persistence for known and unknown targets", async () => {
@@ -478,7 +558,14 @@ describe("SMS OTP abuse controls", () => {
     expect(JSON.stringify(stored)).not.toContain(code);
     expect(JSON.stringify(deliveryPayloads)).not.toContain(code);
     expect(JSON.stringify(deliveryPayloads)).not.toContain(person.phoneE164);
-    expect(deliveryPayloads).toEqual([{ requestId, challengeId: stored?.id }]);
+    expect(deliveryPayloads).toEqual([
+      {
+        requestId,
+        challengeId: stored?.id,
+        derivationKeyId: otpPolicy.deliveryDerivationKeyId,
+        codeLength: otpPolicy.codeLength,
+      },
+    ]);
   });
 
   it("returns the same request response for an unknown and known phone", async () => {
@@ -1737,6 +1824,14 @@ function deferredSms() {
     release,
     sendCount: () => sends,
   };
+}
+
+function deferredSignal() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settled) => {
+    resolve = settled;
+  });
+  return { promise, resolve };
 }
 
 async function latestOtpCode(): Promise<string> {

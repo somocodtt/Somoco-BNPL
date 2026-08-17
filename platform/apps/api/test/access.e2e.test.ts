@@ -14,6 +14,12 @@ import {
   type Database,
 } from "@somo/db";
 import argon2 from "argon2";
+import {
+  createClamAvMalwareScanner,
+  createProductionConnectorBoundary,
+  createS3ObjectStorage,
+  otpDerivationKeyId,
+} from "@somo/integrations";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp, type BuildAppOptions } from "../src/app.js";
 import type { FastifyInstance } from "fastify";
@@ -25,7 +31,6 @@ import {
 import type { StaffAction } from "../src/modules/access/actions.js";
 import { createAccessService } from "../src/modules/access/service.js";
 import { resetTestDatabase } from "../../../packages/testkit/src/database.js";
-import { markProductionAdapter } from "../../../packages/integrations/src/provenance.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -60,9 +65,18 @@ const deterministicMfaVerifier = {
   },
 };
 
+const productionConnectorBoundary = createProductionConnectorBoundary();
+const productionDeliverySecret =
+  "production-safe-test-delivery-secret-32-characters";
 const productionIdentityTestDependencies = {
-  sms: markProductionAdapter(
-    {
+  sms: productionConnectorBoundary.register({
+    kind: "SMS",
+    provenance: {
+      packageName: "@somo-external/synthetic-sms",
+      packageVersion: "1.0.0",
+      connectorId: "synthetic-sms",
+    },
+    adapter: {
       async send() {
         return {
           providerReference: "production-safe-sms-test-reference",
@@ -70,16 +84,15 @@ const productionIdentityTestDependencies = {
         };
       },
     },
-    "SMS",
-  ),
+  }),
   otpPolicy: {
     ttlMs: 120_000,
     attemptLimit: 3,
     resendCooldownMs: 30_000,
     codeLength: 6,
     hashSecret: "production-safe-test-otp-secret-32-characters",
-    deliveryDerivationSecret:
-      "production-safe-test-delivery-secret-32-characters",
+    deliveryDerivationSecret: productionDeliverySecret,
+    deliveryDerivationKeyId: otpDerivationKeyId(productionDeliverySecret),
     sessionTtlMs: 3_600_000,
   },
   consentCatalog: {
@@ -90,8 +103,14 @@ const productionIdentityTestDependencies = {
       },
     ],
   },
-  nia: markProductionAdapter(
-    {
+  nia: productionConnectorBoundary.register({
+    kind: "NIA",
+    provenance: {
+      packageName: "@somo-external/synthetic-nia",
+      packageVersion: "1.0.0",
+      connectorId: "synthetic-nia",
+    },
+    adapter: {
       async verify() {
         return {
           providerReference: "production-safe-nia-test-reference",
@@ -100,48 +119,22 @@ const productionIdentityTestDependencies = {
         };
       },
     },
-    "NIA",
-  ),
+  }),
   documents: {
-    storage: markProductionAdapter(
-      {
-        async createUploadTicket(input) {
-          return {
-            uploadUrl: "https://storage.test.invalid/upload",
-            requiredHeaders: input.requiredHeaders,
-          };
-        },
-        async readObject() {
-          throw new Error("PRODUCTION_SAFE_TEST_OBJECT_UNAVAILABLE");
-        },
-        async promoteToImmutable() {
-          return {
-            objectKey: "identity-accepted/test/document/evidence",
-            versionId: "test-version-1",
-            etag: "0123456789abcdef0123456789abcdef",
-          };
-        },
-        async createDownloadTicket(input) {
-          return {
-            downloadUrl: "https://storage.test.invalid/download",
-            expiresAt: input.expiresAt.toISOString(),
-            requiredHeaders: { "if-match": input.etag },
-          };
-        },
-      },
-      "OBJECT_STORAGE",
-    ),
-    malwareScanner: markProductionAdapter(
-      {
-        async scan() {
-          return {
-            verdict: "CLEAN" as const,
-            scannerReference: "production-safe-scanner-test-reference",
-          };
-        },
-      },
-      "MALWARE_SCANNER",
-    ),
+    storage: createS3ObjectStorage({
+      endpoint: "https://storage.test.invalid",
+      region: "test-1",
+      bucket: "synthetic-production-test",
+      accessKeyId: "synthetic-access-key",
+      secretAccessKey: "synthetic-secret-key-at-least-32-characters",
+    }),
+    malwareScanner: createClamAvMalwareScanner({
+      host: "127.0.0.1",
+      port: 3310,
+      timeoutMs: 1_000,
+      maxBytes: 1_024,
+      maxResponseBytes: 1_024,
+    }),
     policy: {
       allowedMimeTypes: ["application/pdf"],
       maxBytes: 1_024,

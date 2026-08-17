@@ -2,6 +2,7 @@ import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
 import {
   hasProductionAdapterCapability,
   isSimulatorAdapter,
+  type OtpDeliveryPolicyBinding,
   type ProductionAdapterCapability,
 } from "@somo/integrations";
 
@@ -51,7 +52,12 @@ export interface OutboxClaimStore {
 export type OutboxHandler = (message: OutboxMessage) => Promise<unknown>;
 
 type HandlerProvenance = "UNDECLARED" | "PRODUCTION" | "SIMULATOR";
-const handlerProvenance = new WeakMap<OutboxHandler, HandlerProvenance>();
+interface HandlerRegistration {
+  provenance: HandlerProvenance;
+  capabilities: ReadonlySet<ProductionAdapterCapability>;
+  otpDeliveryPolicy?: Readonly<OtpDeliveryPolicyBinding>;
+}
+const handlerRegistrations = new WeakMap<OutboxHandler, HandlerRegistration>();
 
 export function createOutboxHandler(
   adapters: readonly object[],
@@ -60,6 +66,7 @@ export function createOutboxHandler(
     object,
     ProductionAdapterCapability,
   ])[] = [],
+  metadata?: { otpDeliveryPolicy?: Readonly<OtpDeliveryPolicyBinding> },
 ): OutboxHandler {
   const registered: OutboxHandler = (message) => handler(message);
   const provenance: HandlerProvenance = adapters.some((adapter) =>
@@ -71,14 +78,33 @@ export function createOutboxHandler(
         )
       ? "PRODUCTION"
       : "UNDECLARED";
-  handlerProvenance.set(registered, provenance);
+  const capabilities = new Set(
+    requiredCapabilities
+      .filter(([adapter, capability]) =>
+        hasProductionAdapterCapability(adapter, capability),
+      )
+      .map(([, capability]) => capability),
+  );
+  handlerRegistrations.set(registered, {
+    provenance,
+    capabilities,
+    ...(metadata?.otpDeliveryPolicy === undefined
+      ? {}
+      : { otpDeliveryPolicy: metadata.otpDeliveryPolicy }),
+  });
   return registered;
 }
 
 export function inspectOutboxHandlerProvenance(
   handler: OutboxHandler,
 ): "UNDECLARED" | "PRODUCTION" | "SIMULATOR" {
-  return handlerProvenance.get(handler) ?? "UNDECLARED";
+  return handlerRegistrations.get(handler)?.provenance ?? "UNDECLARED";
+}
+
+export function inspectOutboxHandlerRegistration(
+  handler: OutboxHandler,
+): Readonly<HandlerRegistration> | null {
+  return handlerRegistrations.get(handler) ?? null;
 }
 
 export interface DispatchOutboxOptions {

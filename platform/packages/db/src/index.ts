@@ -88,6 +88,7 @@ export {
   findPersonByPhone,
   invalidateOtpChallenge,
   lockIdentityProviderReference,
+  lockOtpPhone,
   markOtpDeliveryFailed,
   invalidateOutstandingOtpChallenges,
   markDuplicateIdentityCheck,

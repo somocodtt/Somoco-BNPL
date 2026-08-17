@@ -3,7 +3,11 @@ import {
   type Database,
   type OutboxMessage,
 } from "@somo/db";
-import { deriveOtpCode, type SmsPort } from "@somo/integrations";
+import {
+  deriveOtpCode,
+  validateOtpDeliveryPolicy,
+  type SmsPort,
+} from "@somo/integrations";
 import {
   createOutboxHandler,
   PermanentWorkerError,
@@ -47,15 +51,27 @@ export function createSendOtpHandler(options: {
   sms: SmsPort;
   lookup: OtpDeliveryLookup;
   derivationSecret: string;
+  derivationKeyId: string;
   codeLength: number;
   now?: () => Date;
 }) {
   const now = options.now ?? (() => new Date());
+  const policy = validateOtpDeliveryPolicy({
+    derivationSecret: options.derivationSecret,
+    derivationKeyId: options.derivationKeyId,
+    codeLength: options.codeLength,
+  });
   return createOutboxHandler(
     [options.sms],
     async (message: OutboxMessage) => {
-      const challengeId = otpChallengeId(message.payload);
-      const delivery = await options.lookup.find(challengeId);
+      const payload = otpPayload(message.payload);
+      if (
+        payload.derivationKeyId !== policy.derivationKeyId ||
+        payload.codeLength !== policy.codeLength
+      ) {
+        throw new PermanentWorkerError("OTP_DELIVERY_POLICY_MISMATCH");
+      }
+      const delivery = await options.lookup.find(payload.challengeId);
       if (
         delivery === null ||
         delivery.invalidatedAt !== null ||
@@ -66,8 +82,8 @@ export function createSendOtpHandler(options: {
       }
       const code = deriveOtpCode(
         options.derivationSecret,
-        challengeId,
-        options.codeLength,
+        payload.challengeId,
+        policy.codeLength,
       );
       return options.sms.send({
         idempotencyKey: message.id,
@@ -77,14 +93,28 @@ export function createSendOtpHandler(options: {
       });
     },
     [[options.sms, "SMS"]],
+    { otpDeliveryPolicy: policy },
   );
 }
 
-function otpChallengeId(payload: unknown): string {
+function otpPayload(payload: unknown): {
+  challengeId: string;
+  derivationKeyId: string;
+  codeLength: number;
+} {
   if (typeof payload !== "object" || payload === null) invalidOtpPayload();
-  const challengeId = (payload as Record<string, unknown>)["challengeId"];
-  if (typeof challengeId !== "string") invalidOtpPayload();
-  return challengeId;
+  const candidate = payload as Record<string, unknown>;
+  const challengeId = candidate["challengeId"];
+  const derivationKeyId = candidate["derivationKeyId"];
+  const codeLength = candidate["codeLength"];
+  if (
+    typeof challengeId !== "string" ||
+    typeof derivationKeyId !== "string" ||
+    typeof codeLength !== "number"
+  ) {
+    invalidOtpPayload();
+  }
+  return { challengeId, derivationKeyId, codeLength };
 }
 
 function notificationPayload(payload: unknown): {
