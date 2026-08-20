@@ -57,6 +57,13 @@
       "when": 1786788791842,
       "tag": "0007_concerned_siren",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786956093202,
+      "tag": "0008_regular_juggernaut",
+      "breakpoints": true
     }
   ]
 }

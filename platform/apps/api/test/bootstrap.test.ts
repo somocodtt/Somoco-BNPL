@@ -63,6 +63,20 @@ describe("production API bootstrap", () => {
     ).toThrow("PRODUCTION_IDENTITY_PROVENANCE_REQUIRED");
   });
 
+  it("fails closed before build when application invitation policy is absent", async () => {
+    const build = vi.fn();
+
+    await expect(
+      bootstrapApi({
+        config,
+        env: { NODE_ENV: "production" },
+        build,
+        loadComposition: async () => productionComposition(),
+      }),
+    ).rejects.toThrow("PRODUCTION_APPLICATION_POLICY_REQUIRED");
+    expect(build).not.toHaveBeenCalled();
+  });
+
   it("uses actual NODE_ENV, validates every leaf, and listens only afterward", async () => {
     const events: string[] = [];
     const build = vi.fn(async () => ({
@@ -77,13 +91,29 @@ describe("production API bootstrap", () => {
 
     await bootstrapApi({
       config: { ...config, environment: "test", port: 0 },
-      env: { NODE_ENV: "production" },
+      env: {
+        NODE_ENV: "production",
+        APPLICATION_INVITATION_HASH_SECRET:
+          "production-test-invitation-secret-at-least-32-chars",
+        APPLICATION_INVITATION_TTL_MS: "1800000",
+        APPLICATION_REQUIRED_DOCUMENT_TYPES: "GHANA_CARD_FRONT",
+      },
       build,
       loadComposition,
     });
 
     expect(events).toEqual(["composition", "listen"]);
     expect(build).toHaveBeenCalledOnce();
+    expect(build).toHaveBeenCalledWith(
+      expect.objectContaining({
+        applications: {
+          invitationHashSecret:
+            "production-test-invitation-secret-at-least-32-chars",
+          invitationTtlMs: 1_800_000,
+          requiredDocumentTypes: ["GHANA_CARD_FRONT"],
+        },
+      }),
+    );
   });
 });
 

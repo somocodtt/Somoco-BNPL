@@ -33,6 +33,8 @@ import {
   createOtpService,
   type OtpPolicy,
 } from "./modules/identity/otp-service.js";
+import { createApplicationService } from "./modules/applications/service.js";
+import { registerApplicationRoutes } from "./modules/applications/routes.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -61,6 +63,11 @@ export interface BuildAppOptions {
       malwareScanner: MalwareScannerPort;
       policy: DocumentPolicy;
     };
+  };
+  applications?: {
+    invitationHashSecret: string;
+    invitationTtlMs: number;
+    requiredDocumentTypes: readonly string[];
   };
 }
 
@@ -156,6 +163,15 @@ export async function buildApp(
       });
       await registerDocumentRoutes(app, otp, documents);
     }
+    if (options.applications !== undefined) {
+      const applications = createApplicationService({
+        database,
+        ...options.applications,
+      });
+      await registerApplicationRoutes(app, otp, applications);
+    }
+  } else if (options.applications !== undefined) {
+    throw new Error("APPLICATION_IDENTITY_COMPOSITION_REQUIRED");
   }
   return app;
 }

@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(8);
+    expect(before.rows[0]?.count).toBe(9);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -808,6 +808,67 @@ describe("populated legacy schema migration", () => {
       idempotency_key: null,
       consent_evidence_id: null,
     });
+  });
+
+  it("adds onboarding controls to a populated 0007 schema without changing existing rows", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const applicantId = randomUUID();
+    const guarantorId = randomUUID();
+    const applicationId = randomUUID();
+    const relationshipId = randomUUID();
+    const applicationVersionId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164) values ($1, '+233200009903'), ($2, '+233200009904')`,
+      [applicantId, guarantorId],
+    );
+    await pool.query(
+      `insert into application (id, applicant_person_id) values ($1, $2)`,
+      [applicationId, applicantId],
+    );
+    await pool.query(
+      `insert into guarantor_relationship (id, application_id, guarantor_person_id)
+       values ($1, $2, $3)`,
+      [relationshipId, applicationId, guarantorId],
+    );
+    await pool.query(
+      `insert into application_version
+         (id, application_id, version_number, snapshot, submitted_at)
+       values ($1, $2, 1, '{"legacy":true}'::jsonb, '2026-08-14T12:00:00.000Z')`,
+      [applicationVersionId, applicationId],
+    );
+
+    await applyMigrationFile(pool, "0008_regular_juggernaut.sql");
+
+    const preserved = await pool.query(
+      `select gr.id relationship_id, av.snapshot
+         from guarantor_relationship gr
+         join application_version av on av.application_id = gr.application_id
+        where gr.application_id = $1`,
+      [applicationId],
+    );
+    expect(preserved.rows[0]).toEqual({
+      relationship_id: relationshipId,
+      snapshot: { legacy: true },
+    });
+    await expect(
+      pool.query(
+        `update application_version set snapshot = '{}'::jsonb where id = $1`,
+        [applicationVersionId],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(`select count(*)::int from guarantor_invitation`),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
   });
 });
 

@@ -28,18 +28,47 @@ export async function bootstrapApi(
   const productionRuntime =
     config.environment === "production" || env.NODE_ENV === "production";
   let identity: ProductionIdentityComposition | undefined;
+  let applications: BuildAppOptions["applications"];
   if (productionRuntime) {
     const loaded =
       options.loadComposition === undefined
         ? await loadProductionIdentityComposition(env)
         : await options.loadComposition();
     identity = validateProductionIdentityComposition(loaded);
+    applications = loadProductionApplicationPolicy(env);
   }
   const build = options.build ?? buildApp;
   const app = await build({
     config,
     ...(identity === undefined ? {} : { identity }),
+    ...(applications === undefined ? {} : { applications }),
   });
   await app.listen({ host: config.host, port: config.port });
   return app;
+}
+
+function loadProductionApplicationPolicy(
+  env: Readonly<Record<string, string | undefined>>,
+): NonNullable<BuildAppOptions["applications"]> {
+  const invitationHashSecret = env.APPLICATION_INVITATION_HASH_SECRET;
+  const ttlValue = env.APPLICATION_INVITATION_TTL_MS;
+  const documentsValue = env.APPLICATION_REQUIRED_DOCUMENT_TYPES;
+  const invitationTtlMs =
+    ttlValue === undefined ? Number.NaN : Number(ttlValue);
+  const requiredDocumentTypes =
+    documentsValue
+      ?.split(",")
+      .map((value) => value.trim())
+      .filter(Boolean) ?? [];
+  if (
+    invitationHashSecret === undefined ||
+    invitationHashSecret.length < 32 ||
+    !Number.isSafeInteger(invitationTtlMs) ||
+    invitationTtlMs < 1 ||
+    requiredDocumentTypes.length === 0 ||
+    requiredDocumentTypes.some((value) => !/^[A-Z][A-Z0-9_]{1,63}$/.test(value))
+  ) {
+    throw new Error("PRODUCTION_APPLICATION_POLICY_REQUIRED");
+  }
+  return { invitationHashSecret, invitationTtlMs, requiredDocumentTypes };
 }

@@ -15,6 +15,7 @@ export const redactedLogPaths = Object.freeze([
   "body.phoneE164",
   "body.code",
   "body.ghanaCardNumber",
+  "body.invitationToken",
 ]);
 
 export async function registerSecurity(

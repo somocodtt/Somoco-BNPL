@@ -137,11 +137,100 @@ export const guarantorRelationship = pgTable(
     confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
   },
   (table) => [
+    uniqueIndex("guarantor_relationship_application_unique").on(
+      table.applicationId,
+    ),
     uniqueIndex("guarantor_application_person_unique").on(
       table.applicationId,
       table.guarantorPersonId,
     ),
     check("guarantor_relationship_version_positive", sql`${table.version} > 0`),
+  ],
+);
+
+export const guarantorInvitation = pgTable(
+  "guarantor_invitation",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    guarantorPersonId: uuid("guarantor_person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "restrict" }),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    claimedByPersonId: uuid("claimed_by_person_id").references(
+      () => person.id,
+      { onDelete: "restrict" },
+    ),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("guarantor_invitation_token_hash_unique").on(table.tokenHash),
+    uniqueIndex("guarantor_invitation_application_active_unique")
+      .on(table.applicationId)
+      .where(sql`${table.claimedAt} is null and ${table.revokedAt} is null`),
+    index("guarantor_invitation_guarantor_idx").on(table.guarantorPersonId),
+    check(
+      "guarantor_invitation_token_hash_sha256",
+      sql`${table.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "guarantor_invitation_expiry_after_creation",
+      sql`${table.expiresAt} > ${table.createdAt}`,
+    ),
+    check(
+      "guarantor_invitation_claim_consistent",
+      sql`(${table.claimedAt} is null) = (${table.claimedByPersonId} is null)`,
+    ),
+    check(
+      "guarantor_invitation_claim_target_matches",
+      sql`${table.claimedByPersonId} is null or ${table.claimedByPersonId} = ${table.guarantorPersonId}`,
+    ),
+    check(
+      "guarantor_invitation_terminal_state_exclusive",
+      sql`not (${table.claimedAt} is not null and ${table.revokedAt} is not null)`,
+    ),
+  ],
+);
+
+export const applicationMutation = pgTable(
+  "application_mutation",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    actorPersonId: uuid("actor_person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "restrict" }),
+    mutationId: uuid("mutation_id").notNull(),
+    operation: text("operation").notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    result: jsonb("result").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("application_mutation_actor_idempotency_unique").on(
+      table.actorPersonId,
+      table.mutationId,
+    ),
+    index("application_mutation_application_idx").on(table.applicationId),
+    check(
+      "application_mutation_operation_safe",
+      sql`${table.operation} ~ '^[A-Z][A-Z0-9_]{1,63}$'`,
+    ),
+    check(
+      "application_mutation_payload_hash_sha256",
+      sql`${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
+    ),
   ],
 );
 

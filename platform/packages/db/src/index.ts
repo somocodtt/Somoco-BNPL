@@ -52,6 +52,18 @@ export {
   type NewApplication,
 } from "./repositories/applications.js";
 export {
+  createApplicationDraft,
+  createGuarantorInvitation,
+  listActiveVehicleModels,
+  readOwnedApplicationState,
+  readResumableApplication,
+  saveApplicantSection,
+  saveGuarantorSection,
+  submitApplication,
+  type ApplicationActor,
+  type ApplicationState,
+} from "./repositories/application-onboarding.js";
+export {
   appendAuditEvent,
   listAuditEventsByActor,
   listAuditEventsByRequestId,
