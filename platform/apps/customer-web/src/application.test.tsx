@@ -320,12 +320,28 @@ describe("customer onboarding PWA", () => {
   it("refreshes and reconciles a version conflict without treating it as offline", async () => {
     const user = userEvent.setup();
     const api = fakeApi();
+    const refreshed = onboardingState();
+    refreshed.models = [
+      ...refreshed.models,
+      {
+        id: "20000000-0000-4000-8000-000000000002",
+        manufacturer: "Remote Motors",
+        modelName: "Reconciled Car",
+        modelYear: 2027,
+      },
+    ];
+    refreshed.draft = {
+      ...refreshed.draft!,
+      version: 6,
+      vehicleModelId: "20000000-0000-4000-8000-000000000002",
+      applicantProfile: {
+        occupation: "Remote occupation",
+        residentialArea: "Remote area",
+      },
+    };
     api.loadOnboarding
       .mockResolvedValueOnce(onboardingState())
-      .mockResolvedValueOnce({
-        ...onboardingState(),
-        draft: { ...onboardingState().draft!, version: 6 },
-      });
+      .mockResolvedValueOnce(refreshed);
     api.saveApplicant
       .mockRejectedValueOnce({
         code: "VERSION_CONFLICT",
@@ -357,10 +373,69 @@ describe("customer onboarding PWA", () => {
       ),
     ).toBeVisible();
     expect(localStorage.getItem("somo-safe-mutations-v1")).toBeNull();
+    expect(screen.getByLabelText("Vehicle model")).toHaveValue(
+      "20000000-0000-4000-8000-000000000002",
+    );
+    expect(screen.getByLabelText("Occupation")).toHaveValue(
+      "Remote occupation",
+    );
+    expect(screen.getByLabelText("Residential area")).toHaveValue(
+      "Remote area",
+    );
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(api.saveApplicant.mock.calls[1]?.[1]).toEqual(
-      expect.objectContaining({ expectedVersion: 6 }),
+      expect.objectContaining({
+        expectedVersion: 6,
+        vehicleModelId: "20000000-0000-4000-8000-000000000002",
+        profile: {
+          occupation: "Remote occupation",
+          residentialArea: "Remote area",
+        },
+      }),
     );
+  });
+
+  it("refreshes and explains an invitation version conflict", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const refreshed = onboardingState();
+    refreshed.guarantorStatus = "EXPIRED";
+    refreshed.guarantorInvitation = {
+      status: "EXPIRED",
+      relationshipVersion: 1,
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    };
+    api.loadOnboarding
+      .mockResolvedValueOnce(onboardingState())
+      .mockResolvedValueOnce(refreshed);
+    api.inviteGuarantor.mockRejectedValueOnce({
+      code: "VERSION_CONFLICT",
+      detail: "This draft changed on another device.",
+    });
+    render(
+      <CustomerRouter
+        api={api}
+        initialSession={session()}
+        initialPhoneE164="+233241000001"
+      />,
+    );
+    await screen.findByRole("heading", { name: "Continue your application" });
+    await user.type(
+      screen.getByLabelText("Guarantor mobile number"),
+      "+233241000002",
+    );
+    await user.click(screen.getByRole("button", { name: "Send invitation" }));
+
+    expect(api.loadOnboarding).toHaveBeenCalledTimes(2);
+    expect(
+      await screen.findByText(
+        "Draft changed elsewhere. We refreshed it; review and save again.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByText("Invitation expired")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Send new invitation" }),
+    ).toBeVisible();
   });
 
   it("reports a server save failure without placing it in the offline queue", async () => {

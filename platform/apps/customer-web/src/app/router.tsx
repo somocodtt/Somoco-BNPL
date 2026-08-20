@@ -188,30 +188,37 @@ export function CustomerRouter({
   }
 
   async function inviteGuarantor(guarantorPhoneE164: string) {
-    const invitation = await api.inviteGuarantor(loadedState.draft!.id, {
-      expectedVersion: loadedState.draft!.version,
-      mutationId: crypto.randomUUID(),
-      guarantorPhoneE164,
-    });
-    setState((current) =>
-      current === null || current.draft === null
-        ? current
-        : {
-            ...current,
-            draft: {
-              ...current.draft,
-              status: "AWAITING_GUARANTOR",
-              version: invitation.applicationVersion,
+    try {
+      const invitation = await api.inviteGuarantor(loadedState.draft!.id, {
+        expectedVersion: loadedState.draft!.version,
+        mutationId: crypto.randomUUID(),
+        guarantorPhoneE164,
+      });
+      setState((current) =>
+        current === null || current.draft === null
+          ? current
+          : {
+              ...current,
+              draft: {
+                ...current.draft,
+                status: "AWAITING_GUARANTOR",
+                version: invitation.applicationVersion,
+              },
+              guarantorStatus: "INVITED",
+              guarantorInvitation: {
+                status: "INVITED",
+                relationshipVersion: invitation.relationshipVersion,
+                expiresAt: invitation.expiresAt,
+              },
             },
-            guarantorStatus: "INVITED",
-            guarantorInvitation: {
-              status: "INVITED",
-              relationshipVersion: invitation.relationshipVersion,
-              expiresAt: invitation.expiresAt,
-            },
-          },
-    );
-    return invitation;
+      );
+      return invitation;
+    } catch (error) {
+      if (problemCode(error) === "VERSION_CONFLICT") {
+        setState(await api.loadOnboarding());
+      }
+      throw error;
+    }
   }
 
   async function refreshEvidence() {

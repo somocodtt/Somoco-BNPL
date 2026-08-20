@@ -53,6 +53,17 @@ export function ApplicationForm({
   const errorSummary = useRef<HTMLElement>(null);
 
   useEffect(() => {
+    setVehicleModelId(draft.vehicleModelId ?? "");
+    setOccupation(String(draft.applicantProfile.occupation ?? ""));
+    setResidentialArea(String(draft.applicantProfile.residentialArea ?? ""));
+  }, [
+    draft.applicantProfile.occupation,
+    draft.applicantProfile.residentialArea,
+    draft.vehicleModelId,
+    draft.version,
+  ]);
+
+  useEffect(() => {
     if (Object.keys(errors).length > 0) errorSummary.current?.focus();
   }, [errors]);
 
@@ -83,8 +94,12 @@ export function ApplicationForm({
       setNotice(
         `Invitation sent. It expires ${new Date(result.expiresAt).toLocaleString()}.`,
       );
-    } catch {
-      setNotice("Invitation could not be sent. Try again.");
+    } catch (error) {
+      setNotice(
+        problemCode(error) === "VERSION_CONFLICT"
+          ? "Draft changed elsewhere. We refreshed it; review and save again."
+          : "Invitation could not be sent. Try again.",
+      );
     }
   }
 
@@ -271,4 +286,10 @@ function isFieldProblem(
   error: unknown,
 ): error is { fieldErrors: Record<string, string> } {
   return typeof error === "object" && error !== null && "fieldErrors" in error;
+}
+
+function problemCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const code = (error as Record<string, unknown>)["code"];
+  return typeof code === "string" ? code : null;
 }
