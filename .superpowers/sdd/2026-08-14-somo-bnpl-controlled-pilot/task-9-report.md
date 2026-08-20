@@ -31,3 +31,7 @@ The populated-through-0009 integration fixture now covers preservation of legacy
 No dependency was added. Financing arithmetic uses bounded bigint rational math, so no Temporal or decimal.js package action was needed. The API workspace link to `@somo/domain` was recorded in the manifest/lock; an offline pnpm linking attempt encountered registry `EACCES` retries and was stopped rather than silently installing or relinking packages.
 
 Self-review found no approved production fixture to transcribe, so production publishing and offer creation remain blocked until signed examples and licence approval are supplied. The API e2e seed now sends one SQL statement per `executeTestSql` call, avoiding pg prepared-statement multi-command failures without weakening production code.
+
+## PostgreSQL verification follow-up
+
+The first controller run after the seed fix reached assertions and reported 5/5 failures at `financing.ts:194`: PostgreSQL `42P18` could not infer the type of the optional `effectiveUntil` parameter. The publish overlap predicate now casts that parameter to `timestamptz` and uses a bounded/open-ended interval expression. The controller must rerun the focused API suite and the populated-0009 migration test with its configured disposable URL to append the assertion-level GREEN counts.

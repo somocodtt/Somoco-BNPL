@@ -209,9 +209,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
               where prior.product_id = rule.product_id
                 and prior.approved = true
                 and prior.effective_from is not null
-                and coalesce(prior.effective_until, 'infinity'::timestamptz) > ${input.effectiveFrom}
-                and ${input.effectiveUntil ?? null} is not null
-                and prior.effective_from < ${input.effectiveUntil ?? null}
+                and coalesce(prior.effective_until, 'infinity'::timestamptz) > ${input.effectiveFrom}::timestamptz
+                and prior.effective_from < coalesce(${input.effectiveUntil ?? null}::timestamptz, 'infinity'::timestamptz)
            )
          returning rule.id, rule.product_id, rule.version_number,
                    rule.selling_price_minor_units, rule.minimum_deposit_minor_units,
