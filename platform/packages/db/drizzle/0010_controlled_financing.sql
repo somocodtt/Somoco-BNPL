@@ -146,13 +146,18 @@ CREATE TRIGGER financing_rule_published_immutable
 CREATE OR REPLACE FUNCTION reject_accepted_offer_mutation()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF TG_TABLE_NAME = 'offer' AND (OLD.status = 'ACCEPTED' OR OLD.accepted_at IS NOT NULL) THEN
-    RAISE EXCEPTION 'ACCEPTED_OFFER_IMMUTABLE' USING ERRCODE = '55000';
-  END IF;
-  IF TG_TABLE_NAME = 'offer_version' AND EXISTS (
-    SELECT 1 FROM offer WHERE id = OLD.offer_id AND (status = 'ACCEPTED' OR accepted_at IS NOT NULL)
-  ) THEN
-    RAISE EXCEPTION 'ACCEPTED_OFFER_IMMUTABLE' USING ERRCODE = '55000';
+  IF TG_TABLE_NAME = 'offer' THEN
+    IF OLD.status = 'ACCEPTED' OR OLD.accepted_at IS NOT NULL THEN
+      RAISE EXCEPTION 'ACCEPTED_OFFER_IMMUTABLE' USING ERRCODE = '55000';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'offer_version' THEN
+    IF EXISTS (
+      SELECT 1 FROM offer
+       WHERE id = OLD.offer_id
+         AND (status = 'ACCEPTED' OR accepted_at IS NOT NULL)
+    ) THEN
+      RAISE EXCEPTION 'ACCEPTED_OFFER_IMMUTABLE' USING ERRCODE = '55000';
+    END IF;
   END IF;
   RETURN NEW;
 END;

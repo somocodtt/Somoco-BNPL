@@ -73,10 +73,10 @@ describe("controlled financing API against PostgreSQL", () => {
         "update financing_rule_version set permitted_fees = '{\"tampered\":true}'::jsonb where id = $1",
         [rule.id],
       ),
-    ).rejects.toMatchObject({ code: "P0001" });
+    ).rejects.toMatchObject({ code: "55000" });
     await expect(
       executeTestSql(databaseUrl!, "delete from financing_rule_version where id = $1", [rule.id]),
-    ).rejects.toMatchObject({ code: "P0001" });
+    ).rejects.toMatchObject({ code: "55000" });
   });
 
   it("enforces maker-checker separation and remains fail-closed without a fixture", async () => {
@@ -243,7 +243,7 @@ describe("controlled financing API against PostgreSQL", () => {
     expect(accepted.status).toBe("ACCEPTED");
     await expect(
       executeTestSql(databaseUrl!, "update offer set expires_at = expires_at where id = $1", [first.id]),
-    ).rejects.toMatchObject({ code: "P0001" });
+    ).rejects.toMatchObject({ code: "55000" });
 
     const counts = await queryTestSql<{ audit: string; outbox: string }>(
       databaseUrl!,
