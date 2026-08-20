@@ -120,8 +120,11 @@ export interface CustomerApi {
   ): Promise<DraftSummary>;
 }
 
-export class FetchCustomerApi implements CustomerApi {
+import type { CustomerOffer, OfferApi } from "../features/offer/offer-panel.js";
+
+export class FetchCustomerApi implements CustomerApi, OfferApi {
   #sessionToken: string | null = null;
+  #offerVersions = new Map<string, number>();
 
   constructor(
     private readonly baseUrl = "",
@@ -316,6 +319,56 @@ export class FetchCustomerApi implements CustomerApi {
     );
   }
 
+  async get(applicationId: string): Promise<CustomerOffer | null> {
+    const result = await this.request<Record<string, unknown> | null>(
+      `/v1/customer/applications/${encodeURIComponent(applicationId)}/offer`,
+    );
+    return result === null ? null : this.mapOffer(result);
+  }
+
+  async accept(
+    offerId: string,
+    input: { consent: boolean; consentAt: string; expectedVersion?: number },
+  ): Promise<CustomerOffer> {
+    if (!input.consent) throw new Error("CONSENT_REQUIRED");
+    const expectedVersion = input.expectedVersion ?? this.#offerVersions.get(offerId);
+    if (expectedVersion === undefined) throw new Error("OFFER_VERSION_REQUIRED");
+    const result = await this.request<Record<string, unknown>>(
+      `/v1/customer/offers/${encodeURIComponent(offerId)}/accept`,
+      { method: "POST", body: JSON.stringify({ expectedVersion, consentAt: input.consentAt, idempotencyKey: crypto.randomUUID() }) },
+    );
+    return this.mapOffer(result);
+  }
+
+  private mapOffer(value: Record<string, unknown>): CustomerOffer {
+    const installments = Array.isArray(value.installments) ? value.installments : [];
+    const offer: CustomerOffer = {
+      id: stringValue(value.id) ?? stringValue(value.offerId) ?? "",
+      version: numberValue(value.version) ?? 1,
+      status: statusValue(value.status),
+      expiresAt: stringValue(value.expiresAt) ?? "",
+      priceMinor: moneyValue(value.priceMinor),
+      depositMinor: moneyValue(value.depositMinor),
+      frequency: value.frequency === "WEEKLY" ? "WEEKLY" : "MONTHLY",
+      tenureMonths: tenureValue(value.tenureMonths),
+      totalPayableMinor: moneyValue(value.totalPayableMinor),
+      financeChargeMinor: moneyValue(value.financeChargeMinor),
+      installments: installments.map((item) => {
+        const row = (item ?? {}) as Record<string, unknown>;
+        return {
+          sequence: numberValue(row.sequence) ?? 0,
+          dueDate: stringValue(row.dueDate) ?? "",
+          totalMinor: moneyValue(row.totalMinor),
+        };
+      }),
+      disclosureVersion: stringValue(value.disclosureVersion),
+      fees: isRecord(value.fees) ? value.fees : {},
+      disclosedHash: stringValue(value.disclosedHash),
+    };
+    this.#offerVersions.set(offer.id, offer.version);
+    return offer;
+  }
+
   async request<T>(
     path: string,
     init: RequestInit = {},
@@ -337,4 +390,28 @@ export class FetchCustomerApi implements CustomerApi {
     if (!response.ok) throw body;
     return body as T;
   }
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function moneyValue(value: unknown): string {
+  return typeof value === "string" && /^\d+$/.test(value) ? value : "0";
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+function tenureValue(value: unknown): CustomerOffer["tenureMonths"] {
+  return value === 8 || value === 12 || value === 24 || value === 36 || value === 48 ? value : 6;
+}
+
+function statusValue(value: unknown): CustomerOffer["status"] {
+  return value === "EXPIRED" || value === "ACCEPTED" || value === "CANCELLED" ? value : "PENDING";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

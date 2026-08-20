@@ -32,6 +32,8 @@ export const offer = pgTable(
     acceptedAt: timestamp("accepted_at", { withTimezone: true }),
     acceptedHash: text("accepted_hash"),
     consentAt: timestamp("consent_at", { withTimezone: true }),
+    disclosedVersion: text("disclosed_version"),
+    disclosedHash: text("disclosed_hash"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),

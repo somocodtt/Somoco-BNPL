@@ -14,7 +14,8 @@
     "canonicalHash",
     "financeApproved",
     "complianceApproved",
-    "licencePermitted"
+    "licencePermitted",
+    "synthetic"
   ],
   "properties": {
     "schemaVersion": { "const": 1 },

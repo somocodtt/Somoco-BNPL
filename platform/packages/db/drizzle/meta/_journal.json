@@ -78,6 +78,13 @@
       "when": 1787230830905,
       "tag": "0010_controlled_financing",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1787230830906,
+      "tag": "0011_financing_binding",
+      "breakpoints": true
     }
   ]
 }

@@ -47,8 +47,11 @@ export function StaffRouter({
   if (session === null) {
     return <StaffLogin api={api} onAuthenticated={setSession} />;
   }
-  if (productsApi !== undefined && session.roles.includes("PRODUCT_ADMIN")) {
-    return <ProductWorkspace api={productsApi} actorId={session.staffUserId} />;
+  const canOperateFinancing = session.roles.some((role) =>
+    ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"].includes(role),
+  );
+  if (productsApi !== undefined && canOperateFinancing) {
+    return <ProductWorkspace api={productsApi} actorId={session.staffUserId} roles={session.roles} />;
   }
   if (!canReview(session.roles)) {
     return (

@@ -4,9 +4,10 @@ import { CustomerRouter } from "./app/router.js";
 import { FetchCustomerApi } from "./lib/api.js";
 import "./styles.css";
 
+const api = new FetchCustomerApi();
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <CustomerRouter api={new FetchCustomerApi()} />
+    <CustomerRouter api={api} offerApi={api} />
   </StrictMode>,
 );
 

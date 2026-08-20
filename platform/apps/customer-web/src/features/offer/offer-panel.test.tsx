@@ -40,11 +40,39 @@ describe("customer financing offer", () => {
     render(<OfferPanel api={api} applicationId="application-1" />);
     expect(await screen.findByText("No licensed financing offer is available.")).toBeVisible();
   });
+
+  it("keeps an accepted offer accepted after its expiry timestamp", async () => {
+    const api = fakeApi();
+    api.get.mockResolvedValueOnce({
+      ...offer(),
+      status: "ACCEPTED",
+      expiresAt: "2026-08-19T12:00:00.000Z",
+    });
+    render(<OfferPanel api={api} applicationId="application-1" />);
+    expect(await screen.findByText("Offer accepted")).toBeVisible();
+    expect(screen.queryByText("This offer has expired.")).not.toBeInTheDocument();
+  });
+
+  it("shows the installment count from the returned schedule for weekly plans", async () => {
+    const api = fakeApi();
+    api.get.mockResolvedValueOnce({
+      ...offer(),
+      frequency: "WEEKLY",
+      installments: [
+        { sequence: 1, dueDate: "2026-09-01", totalMinor: "2933334" },
+        { sequence: 2, dueDate: "2026-09-08", totalMinor: "2933333" },
+        { sequence: 3, dueDate: "2026-09-15", totalMinor: "2933333" },
+      ],
+    });
+    render(<OfferPanel api={api} applicationId="application-1" />);
+    expect(await screen.findByText("3 weekly installments")).toBeVisible();
+  });
 });
 
 function offer() {
   return {
     id: "offer-1",
+    version: 1,
     status: "PENDING" as const,
     expiresAt: "2026-08-21T12:00:00.000Z",
     priceMinor: "10000000",
@@ -53,10 +81,13 @@ function offer() {
     tenureMonths: 6 as const,
     totalPayableMinor: "8800000",
     financeChargeMinor: "800000",
-    installments: [
-      { sequence: 1, dueDate: "2026-01-31", totalMinor: "1466667" },
-    ],
+    installments: Array.from({ length: 6 }, (_, index) => ({
+      sequence: index + 1,
+      dueDate: `2026-0${index + 1}-31`,
+      totalMinor: "1466667",
+    })),
     disclosureVersion: "disclosure-v1",
+    fees: {},
   };
 }
 

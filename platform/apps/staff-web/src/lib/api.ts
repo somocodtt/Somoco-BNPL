@@ -59,6 +59,12 @@ export interface StaffApi {
   }): Promise<StaffSession>;
 }
 
+import type {
+  ProductApi,
+  ProductRuleSummary,
+  StaffExceptionSummary,
+} from "../features/products/product-workspace.js";
+
 export class ProblemError extends Error {
   constructor(
     readonly code: string,
@@ -69,10 +75,13 @@ export class ProblemError extends Error {
   }
 }
 
-export class FetchStaffApi implements StaffApi {
+export class FetchStaffApi implements StaffApi, ProductApi {
   private csrfToken = "";
 
-  constructor(private readonly baseUrl = "") {}
+  constructor(
+    private readonly baseUrl = "",
+    private readonly fetcher: typeof fetch = (input, init) => globalThis.fetch(input, init),
+  ) {}
 
   async login(input: {
     email: string;
@@ -121,11 +130,39 @@ export class FetchStaffApi implements StaffApi {
     )) as { status: string; version: number };
   }
 
+  async listRules(): Promise<ProductRuleSummary[]> {
+    return (await this.request("/v1/staff/products/rule-versions")) as ProductRuleSummary[];
+  }
+
+  async listExceptions(): Promise<StaffExceptionSummary[]> {
+    return (await this.request("/v1/staff/exceptions")) as StaffExceptionSummary[];
+  }
+
+  async publish(
+    ruleId: string,
+    input: { effectiveFrom: string; effectiveUntil?: string; idempotencyKey: string },
+  ): Promise<void> {
+    await this.request(`/v1/staff/products/rule-versions/${encodeURIComponent(ruleId)}/publish`, {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  async decideException(
+    exceptionId: string,
+    input: { expectedVersion: number; decision: "APPROVE" | "REJECT"; reason: string },
+  ): Promise<void> {
+    await this.request(`/v1/staff/exceptions/${encodeURIComponent(exceptionId)}/decide`, {
+      method: "POST",
+      body: { ...input, idempotencyKey: crypto.randomUUID() },
+    });
+  }
+
   private async request(
     path: string,
     options: { method?: string; body?: unknown } = {},
   ): Promise<unknown> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const response = await this.fetcher(`${this.baseUrl}${path}`, {
       method: options.method ?? "GET",
       credentials: "include",
       headers: {

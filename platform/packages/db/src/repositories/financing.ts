@@ -12,6 +12,9 @@ export interface FinancingCommandRecord {
   commandType: string;
   payloadHash: string;
   response: Record<string, unknown>;
+  actorStaffUserId: string | null;
+  actorPersonId: string | null;
+  inserted?: boolean;
 }
 
 export interface FinancingRuleRecord {
@@ -56,6 +59,15 @@ export interface ExceptionRecord {
   decidedBy: string | null;
   decidedAt: Date | null;
   expiresAt: Date | null;
+  ruleVersionId?: string | null;
+  exceptionField?: string | null;
+  valueType?: string | null;
+  proposedAmountMinor?: bigint | null;
+  policyAmountMinor?: bigint | null;
+  proposedFrequency?: string | null;
+  policyFrequency?: string | null;
+  proposedTenureMonths?: number | null;
+  policyTenureMonths?: number | null;
 }
 
 export interface OfferRecord {
@@ -69,6 +81,8 @@ export interface OfferRecord {
   consentAt: Date | null;
   expiresAt: Date | null;
   acceptedByPersonId: string | null;
+  disclosedVersion?: string | null;
+  disclosedHash?: string | null;
   offerVersion: {
     id: string;
     versionNumber: number;
@@ -98,7 +112,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       idempotencyKey: string,
     ): Promise<FinancingCommandRecord | null> {
       const result = await executor.execute<CommandRow>(sql`
-        select id, scope, idempotency_key, command_type, payload_hash, response
+        select id, scope, idempotency_key, command_type, payload_hash,
+               actor_staff_user_id, actor_person_id, response
           from financing_command
          where scope = ${scope} and idempotency_key = ${idempotencyKey}
          limit 1
@@ -128,11 +143,34 @@ export function financingRepo(db: Database | DatabaseTransaction) {
           ${input.actorPersonId ?? null}::uuid, ${input.applicationId ?? null}::uuid,
           ${input.response}::jsonb
         )
-        returning id, scope, idempotency_key, command_type, payload_hash, response
+        on conflict (scope, idempotency_key) do nothing
+        returning id, scope, idempotency_key, command_type, payload_hash,
+                  actor_staff_user_id, actor_person_id, response
       `);
       const row = result.rows[0];
-      if (row === undefined) throw new Error("FINANCING_COMMAND_INSERT_FAILED");
-      return mapCommand(row);
+      if (row !== undefined) return { ...mapCommand(row), inserted: true };
+      const existing = await executor.execute<CommandRow>(sql`
+        select id, scope, idempotency_key, command_type, payload_hash,
+               actor_staff_user_id, actor_person_id, response
+          from financing_command
+         where scope = ${input.scope} and idempotency_key = ${input.idempotencyKey}
+         limit 1
+      `);
+      const existingRow = existing.rows[0];
+      if (existingRow === undefined) throw new Error("FINANCING_COMMAND_INSERT_FAILED");
+      return { ...mapCommand(existingRow), inserted: false };
+    },
+
+    async updateCommandResponse(
+      scope: string,
+      idempotencyKey: string,
+      response: Record<string, unknown>,
+    ): Promise<void> {
+      await executor.execute(sql`
+        update financing_command
+           set response = ${response}::jsonb
+         where scope = ${scope} and idempotency_key = ${idempotencyKey}
+      `);
     },
 
     async insertRule(input: {
@@ -191,6 +229,16 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       effectiveFrom: Date;
       effectiveUntil?: Date;
     }): Promise<FinancingRuleRecord> {
+      // Serialize all publishes for a product before evaluating the overlap
+      // predicate.  A predicate alone permits two concurrent transactions to
+      // both observe an empty range.
+      await executor.execute(sql`
+        select product.id
+          from product
+          join financing_rule_version rule on rule.product_id = product.id
+         where rule.id = ${input.ruleId}::uuid
+         for update of product
+      `);
       const result = await executor.execute<RuleRow>(sql`
         update financing_rule_version as rule
            set approved = true,
@@ -233,6 +281,14 @@ export function financingRepo(db: Database | DatabaseTransaction) {
     async findRule(ruleId: string): Promise<FinancingRuleRecord | null> {
       const result = await executor.execute<RuleRow>(ruleSelect(ruleId));
       return result.rows[0] === undefined ? null : mapRule(result.rows[0]);
+    },
+
+    async listRules(): Promise<FinancingRuleRecord[]> {
+      const result = await executor.execute<RuleRow>(sql`
+        ${ruleSelectBase}
+         order by rule.product_id, rule.version_number desc
+      `);
+      return result.rows.map(mapRule);
     },
 
     async findEffectiveRule(
@@ -288,18 +344,38 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       requestedBy: string;
       requiredApproverRole: string;
       expiresAt?: Date;
+      ruleVersionId?: string;
+      exceptionField?: string;
+      valueType?: string;
+      proposedAmountMinor?: bigint;
+      policyAmountMinor?: bigint;
+      proposedFrequency?: string;
+      policyFrequency?: string;
+      proposedTenureMonths?: number;
+      policyTenureMonths?: number;
     }): Promise<ExceptionRecord> {
       const result = await executor.execute<ExceptionRow>(sql`
         insert into exception_request
           (id, application_id, proposed_value, policy_value, reason,
-           required_approver_role, requested_by, expires_at)
+           required_approver_role, requested_by, expires_at, rule_version_id,
+           exception_field, value_type, proposed_amount_minor, policy_amount_minor,
+           proposed_frequency, policy_frequency, proposed_tenure_months,
+           policy_tenure_months)
         values (${input.id}::uuid, ${input.applicationId}::uuid,
                 ${input.proposedValue}::jsonb, ${input.policyValue}::jsonb,
                 ${input.reason}, ${input.requiredApproverRole},
-                ${input.requestedBy}::uuid, ${input.expiresAt ?? null})
+                ${input.requestedBy}::uuid, ${input.expiresAt ?? null},
+                ${input.ruleVersionId ?? null}::uuid, ${input.exceptionField ?? null},
+                ${input.valueType ?? null}, ${input.proposedAmountMinor ?? null}::bigint,
+                ${input.policyAmountMinor ?? null}::bigint,
+                ${input.proposedFrequency ?? null}, ${input.policyFrequency ?? null},
+                ${input.proposedTenureMonths ?? null}, ${input.policyTenureMonths ?? null})
         returning id, application_id, proposed_value, policy_value, reason,
                   required_approver_role, requested_by, status, version,
-                  decided_by, decided_at, expires_at
+                  decided_by, decided_at, expires_at, rule_version_id,
+                  exception_field, value_type, proposed_amount_minor,
+                  policy_amount_minor, proposed_frequency, policy_frequency,
+                  proposed_tenure_months, policy_tenure_months
       `);
       const row = result.rows[0];
       if (row === undefined) throw new Error("EXCEPTION_INSERT_FAILED");
@@ -310,7 +386,10 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       const result = await executor.execute<ExceptionRow>(sql`
         select id, application_id, proposed_value, policy_value, reason,
                required_approver_role, requested_by, status, version,
-               decided_by, decided_at, expires_at
+               decided_by, decided_at, expires_at, rule_version_id,
+               exception_field, value_type, proposed_amount_minor,
+               policy_amount_minor, proposed_frequency, policy_frequency,
+               proposed_tenure_months, policy_tenure_months
           from exception_request where id = ${exceptionId}::uuid
       `);
       return result.rows[0] === undefined
@@ -318,18 +397,53 @@ export function financingRepo(db: Database | DatabaseTransaction) {
         : mapException(result.rows[0]);
     },
 
+    async listExceptions(): Promise<ExceptionRecord[]> {
+      const result = await executor.execute<ExceptionRow>(sql`
+        select id, application_id, proposed_value, policy_value, reason,
+               required_approver_role, requested_by, status, version,
+               decided_by, decided_at, expires_at, rule_version_id,
+               exception_field, value_type, proposed_amount_minor,
+               policy_amount_minor, proposed_frequency, policy_frequency,
+               proposed_tenure_months, policy_tenure_months
+          from exception_request
+         order by created_at desc, id desc
+      `);
+      return result.rows.map(mapException);
+    },
+
     async findApprovedException(
       applicationId: string,
       now: Date,
+      binding?: {
+        ruleVersionId?: string;
+        field?: string;
+        proposedAmountMinor?: bigint;
+        policyAmountMinor?: bigint;
+        proposedFrequency?: string;
+        policyFrequency?: string;
+        proposedTenureMonths?: number;
+        policyTenureMonths?: number;
+      },
     ): Promise<ExceptionRecord | null> {
       const result = await executor.execute<ExceptionRow>(sql`
         select id, application_id, proposed_value, policy_value, reason,
                required_approver_role, requested_by, status, version,
-               decided_by, decided_at, expires_at
+               decided_by, decided_at, expires_at, rule_version_id,
+               exception_field, value_type, proposed_amount_minor,
+               policy_amount_minor, proposed_frequency, policy_frequency,
+               proposed_tenure_months, policy_tenure_months
           from exception_request
          where application_id = ${applicationId}::uuid
            and status = 'APPROVED'
            and (expires_at is null or expires_at > ${now})
+           and (${binding?.ruleVersionId ?? null}::uuid is null or rule_version_id = ${binding?.ruleVersionId ?? null}::uuid)
+           and (${binding?.field ?? null}::text is null or exception_field = ${binding?.field ?? null})
+           and (${binding?.proposedAmountMinor ?? null}::bigint is null or proposed_amount_minor = ${binding?.proposedAmountMinor ?? null}::bigint)
+           and (${binding?.policyAmountMinor ?? null}::bigint is null or policy_amount_minor = ${binding?.policyAmountMinor ?? null}::bigint)
+           and (${binding?.proposedFrequency ?? null}::text is null or proposed_frequency = ${binding?.proposedFrequency ?? null})
+           and (${binding?.policyFrequency ?? null}::text is null or policy_frequency = ${binding?.policyFrequency ?? null})
+           and (${binding?.proposedTenureMonths ?? null}::integer is null or proposed_tenure_months = ${binding?.proposedTenureMonths ?? null})
+           and (${binding?.policyTenureMonths ?? null}::integer is null or policy_tenure_months = ${binding?.policyTenureMonths ?? null})
          order by decided_at desc nulls last, id desc
          limit 1
       `);
@@ -361,7 +475,10 @@ export function financingRepo(db: Database | DatabaseTransaction) {
            and (expires_at is null or expires_at > ${input.now})
          returning id, application_id, proposed_value, policy_value, reason,
                    required_approver_role, requested_by, status, version,
-                   decided_by, decided_at, expires_at
+                   decided_by, decided_at, expires_at, rule_version_id,
+                   exception_field, value_type, proposed_amount_minor,
+                   policy_amount_minor, proposed_frequency, policy_frequency,
+                   proposed_tenure_months, policy_tenure_months
       `);
       const row = result.rows[0];
       if (row === undefined) throw new Error("EXCEPTION_DECISION_REJECTED");
@@ -379,6 +496,7 @@ export function financingRepo(db: Database | DatabaseTransaction) {
         select o.id, o.application_id, o.status, o.version,
                o.accepted_version_id, o.accepted_at, o.accepted_hash,
                o.consent_at, o.expires_at, o.accepted_by_person_id,
+               o.disclosed_version, o.disclosed_hash,
                ov.id as offer_version_id, ov.version_number,
                ov.financing_rule_version_id, ov.principal_minor_units,
                ov.deposit_minor_units, ov.total_payable_minor_units,
@@ -398,6 +516,7 @@ export function financingRepo(db: Database | DatabaseTransaction) {
         select o.id, o.application_id, o.status, o.version,
                o.accepted_version_id, o.accepted_at, o.accepted_hash,
                o.consent_at, o.expires_at, o.accepted_by_person_id,
+               o.disclosed_version, o.disclosed_hash,
                ov.id as offer_version_id, ov.version_number,
                ov.financing_rule_version_id, ov.principal_minor_units,
                ov.deposit_minor_units, ov.total_payable_minor_units,
@@ -423,11 +542,14 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       terms: Record<string, unknown>;
       canonicalHash: string;
       expiresAt: Date;
+      disclosedVersion?: string | null;
+      disclosedHash?: string | null;
     }): Promise<OfferRecord> {
       await executor.execute(sql`
         insert into offer
-          (id, application_id, status, version, expires_at)
-        values (${input.offerId}::uuid, ${input.applicationId}::uuid, 'PENDING', 1, ${input.expiresAt})
+          (id, application_id, status, version, expires_at, disclosed_version, disclosed_hash)
+        values (${input.offerId}::uuid, ${input.applicationId}::uuid, 'PENDING', 1,
+                ${input.expiresAt}, ${input.disclosedVersion ?? null}, ${input.disclosedHash ?? null})
       `);
       await executor.execute(sql`
         insert into offer_version
@@ -452,35 +574,47 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       consentAt: Date;
       acceptedHash: string;
     }): Promise<OfferRecord> {
-      const result = await executor.execute<OfferRow>(sql`
+      const currentResult = await executor.execute<OfferRow>(sql`
+        select o.id, o.application_id, o.status, o.version,
+               o.accepted_version_id, o.accepted_at, o.accepted_hash,
+               o.consent_at, o.expires_at, o.accepted_by_person_id,
+               o.disclosed_version, o.disclosed_hash,
+               ov.id as offer_version_id, ov.version_number,
+               ov.financing_rule_version_id, ov.principal_minor_units,
+               ov.deposit_minor_units, ov.total_payable_minor_units,
+               ov.terms, ov.canonical_hash
+          from offer o
+          join offer_version ov on ov.offer_id = o.id and ov.version_number = o.version
+         where o.id = ${input.offerId}::uuid
+         for update of o, ov
+      `);
+      const current = currentResult.rows[0];
+      const currentExpiresAt = current === undefined ? null : toDate(current.expires_at);
+      if (
+        current === undefined ||
+        current.status !== "PENDING" ||
+        current.version !== input.expectedVersion ||
+        currentExpiresAt === null ||
+        currentExpiresAt <= input.acceptedAt ||
+        current.offer_version_id === null ||
+        current.canonical_hash === null ||
+        current.canonical_hash !== input.acceptedHash
+      ) throw new Error("OFFER_ACCEPT_REJECTED");
+      await executor.execute(sql`
         update offer
            set status = 'ACCEPTED',
-               accepted_version_id = (
-                 select id from offer_version where offer_id = offer.id and version_number = offer.version
-               ),
+               accepted_version_id = ${current.offer_version_id}::uuid,
                accepted_at = ${input.acceptedAt},
                consent_at = ${input.consentAt},
-               accepted_hash = ${input.acceptedHash},
+               accepted_hash = ${current.canonical_hash},
                accepted_by_person_id = ${input.personId}::uuid,
                version = version + 1,
                updated_at = ${input.acceptedAt}
          where id = ${input.offerId}::uuid
            and version = ${input.expectedVersion}
            and status = 'PENDING'
-           and expires_at > ${input.acceptedAt}
-         returning id, application_id, status, version,
-                   accepted_version_id, accepted_at, accepted_hash,
-                   consent_at, expires_at, accepted_by_person_id,
-                   null::uuid as offer_version_id, null::integer as version_number,
-                   null::uuid as financing_rule_version_id,
-                   null::bigint as principal_minor_units,
-                   null::bigint as deposit_minor_units,
-                   null::bigint as total_payable_minor_units,
-                   null::jsonb as terms, null::text as canonical_hash
       `);
-      const row = result.rows[0];
-      if (row === undefined) throw new Error("OFFER_ACCEPT_REJECTED");
-      const offer = await this.findOffer(row.application_id);
+      const offer = await this.findOffer(current.application_id);
       if (offer === null) throw new Error("OFFER_ACCEPT_FAILED");
       return offer;
     },
@@ -514,6 +648,8 @@ interface CommandRow extends Record<string, unknown> {
   idempotency_key: string;
   command_type: string;
   payload_hash: string;
+  actor_staff_user_id: string | null;
+  actor_person_id: string | null;
   response: Record<string, unknown>;
 }
 
@@ -559,6 +695,15 @@ interface ExceptionRow extends Record<string, unknown> {
   decided_by: string | null;
   decided_at: Date | string | null;
   expires_at: Date | string | null;
+  rule_version_id: string | null;
+  exception_field: string | null;
+  value_type: string | null;
+  proposed_amount_minor: bigint | string | null;
+  policy_amount_minor: bigint | string | null;
+  proposed_frequency: string | null;
+  policy_frequency: string | null;
+  proposed_tenure_months: number | null;
+  policy_tenure_months: number | null;
 }
 
 interface OfferRow extends Record<string, unknown> {
@@ -572,6 +717,8 @@ interface OfferRow extends Record<string, unknown> {
   consent_at: Date | string | null;
   expires_at: Date | string | null;
   accepted_by_person_id: string | null;
+  disclosed_version: string | null;
+  disclosed_hash: string | null;
   offer_version_id: string | null;
   version_number: number | null;
   financing_rule_version_id: string | null;
@@ -589,6 +736,8 @@ function mapCommand(row: CommandRow): FinancingCommandRecord {
     idempotencyKey: row.idempotency_key,
     commandType: row.command_type,
     payloadHash: row.payload_hash,
+    actorStaffUserId: row.actor_staff_user_id,
+    actorPersonId: row.actor_person_id,
     response: row.response,
   };
 }
@@ -642,6 +791,15 @@ function mapException(row: ExceptionRow): ExceptionRecord {
     decidedBy: row.decided_by,
     decidedAt: toDate(row.decided_at),
     expiresAt: toDate(row.expires_at),
+    ruleVersionId: row.rule_version_id,
+    exceptionField: row.exception_field,
+    valueType: row.value_type,
+    proposedAmountMinor: row.proposed_amount_minor === null ? null : BigInt(row.proposed_amount_minor),
+    policyAmountMinor: row.policy_amount_minor === null ? null : BigInt(row.policy_amount_minor),
+    proposedFrequency: row.proposed_frequency,
+    policyFrequency: row.policy_frequency,
+    proposedTenureMonths: row.proposed_tenure_months,
+    policyTenureMonths: row.policy_tenure_months,
   };
 }
 
@@ -657,6 +815,8 @@ function mapOffer(row: OfferRow): OfferRecord {
     consentAt: toDate(row.consent_at),
     expiresAt: toDate(row.expires_at),
     acceptedByPersonId: row.accepted_by_person_id,
+    disclosedVersion: row.disclosed_version,
+    disclosedHash: row.disclosed_hash,
     offerVersion:
       row.offer_version_id === null ||
       row.version_number === null ||

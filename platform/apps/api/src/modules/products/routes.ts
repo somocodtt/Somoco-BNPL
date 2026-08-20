@@ -11,6 +11,7 @@ import type { OtpService } from "../identity/otp-service.js";
 import type { ExceptionService } from "./exception-service.js";
 import type { OfferService } from "./offer-service.js";
 import type { ProductService } from "./service.js";
+import { serializeExceptionDto, serializeOfferDto, serializeRuleDto } from "./dto.js";
 
 const uuid = { type: "string", format: "uuid" } as const;
 const idempotency = { type: "string", minLength: 8, maxLength: 128 } as const;
@@ -50,6 +51,36 @@ export async function registerProductRoutes(
 ): Promise<void> {
   const authenticateStaff = createStaffAuthenticationHook(access, config);
   const staffMutation = [authenticateStaff, app.csrfProtection];
+  app.get(
+    "/v1/staff/products/rule-versions",
+    { preHandler: authenticateStaff },
+    async (_request, reply) => reply.send((await products.listRules()).map(serializeRuleDto)),
+  );
+  app.get<{ Params: { ruleId: string } }>(
+    "/v1/staff/products/rule-versions/:ruleId",
+    { schema: { params: ruleParams }, preHandler: authenticateStaff },
+    async (request, reply) => {
+      const rule = (await products.listRules()).find((item) => item.id === request.params.ruleId);
+      return rule === undefined
+        ? reply.code(404).send({ code: "RULE_NOT_FOUND", detail: "Rule not found." })
+        : reply.send(serializeRuleDto(rule));
+    },
+  );
+  app.get(
+    "/v1/staff/exceptions",
+    { preHandler: authenticateStaff },
+    async (_request, reply) => reply.send((await exceptions.list()).map(serializeExceptionDto)),
+  );
+  app.get<{ Params: { exceptionId: string } }>(
+    "/v1/staff/exceptions/:exceptionId",
+    { schema: { params: exceptionParams }, preHandler: authenticateStaff },
+    async (request, reply) => {
+      const exception = await exceptions.find(request.params.exceptionId);
+      return exception === null
+        ? reply.code(404).send({ code: "EXCEPTION_NOT_FOUND", detail: "Exception not found." })
+        : reply.send(serializeExceptionDto(exception));
+    },
+  );
   app.post<{
     Params: { productId: string };
     Body: {
@@ -145,12 +176,12 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        await products.publishRuleVersion({
+        serializeRuleDto(await products.publishRuleVersion({
           ...request.body,
           ruleId: request.params.ruleId,
           actor: requireStaffPrincipal(request),
           requestId: request.id,
-        }),
+        })),
       ),
   );
 
@@ -159,6 +190,15 @@ export async function registerProductRoutes(
     Body: {
       proposedValue: unknown;
       policyValue: unknown;
+      ruleVersionId: string;
+      exceptionField: string;
+      valueType: "AMOUNT" | "FREQUENCY" | "TENURE";
+      proposedAmountMinor?: string;
+      policyAmountMinor?: string;
+      proposedFrequency?: "WEEKLY" | "MONTHLY";
+      policyFrequency?: "WEEKLY" | "MONTHLY";
+      proposedTenureMonths?: number;
+      policyTenureMonths?: number;
       reason: string;
       requiredApproverRole: Parameters<ExceptionService["request"]>[0]["requiredApproverRole"];
       expiresAt?: string;
@@ -172,10 +212,19 @@ export async function registerProductRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["proposedValue", "policyValue", "reason", "requiredApproverRole", "idempotencyKey"],
+          required: ["proposedValue", "policyValue", "ruleVersionId", "exceptionField", "valueType", "reason", "requiredApproverRole", "idempotencyKey"],
           properties: {
             proposedValue: {},
             policyValue: {},
+            ruleVersionId: uuid,
+            exceptionField: { type: "string", minLength: 1, maxLength: 128 },
+            valueType: { type: "string", enum: ["AMOUNT", "FREQUENCY", "TENURE"] },
+            proposedAmountMinor: { type: "string", pattern: "^[0-9]+$" },
+            policyAmountMinor: { type: "string", pattern: "^[0-9]+$" },
+            proposedFrequency: { type: "string", enum: ["WEEKLY", "MONTHLY"] },
+            policyFrequency: { type: "string", enum: ["WEEKLY", "MONTHLY"] },
+            proposedTenureMonths: { type: "integer" },
+            policyTenureMonths: { type: "integer" },
             reason: { type: "string", minLength: 1, maxLength: 4_000 },
             requiredApproverRole: { type: "string", enum: ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"] },
             expiresAt: { type: "string", format: "date-time" },
@@ -187,12 +236,12 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.code(201).send(
-        await exceptions.request({
+        serializeExceptionDto(await exceptions.request({
           ...request.body,
           applicationId: request.params.applicationId,
           actor: requireStaffPrincipal(request),
           requestId: request.id,
-        }),
+        })),
       ),
   );
 
@@ -220,12 +269,12 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        await exceptions.decide({
+        serializeExceptionDto(await exceptions.decide({
           ...request.body,
           exceptionId: request.params.exceptionId,
           actor: requireStaffPrincipal(request),
           requestId: request.id,
-        }),
+        })),
       ),
   );
 
@@ -240,7 +289,7 @@ export async function registerProductRoutes(
         request.params.applicationId,
         requireCustomerPrincipal(request),
       );
-      return reply.send(offer);
+      return reply.send(offer === null ? null : serializeOfferDto(offer));
     },
   );
   app.post<{
@@ -276,12 +325,12 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.code(201).send(
-        await offers.create({
+        serializeOfferDto(await offers.create({
           ...request.body,
           applicationId: request.params.applicationId,
           actor: requireCustomerPrincipal(request),
           requestId: request.id,
-        }),
+        })),
       ),
   );
   app.post<{
@@ -307,12 +356,12 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        await offers.accept({
+        serializeOfferDto(await offers.accept({
           ...request.body,
           offerId: request.params.offerId,
           actor: requireCustomerPrincipal(request),
           requestId: request.id,
-        }),
+        })),
       ),
   );
 }

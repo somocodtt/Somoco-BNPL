@@ -7,6 +7,9 @@ export interface ProductRuleSummary {
   requestedBy: string | null;
   effectiveFrom: string | null;
   gate: "OPEN" | "CLOSED";
+  effectiveUntil?: string | null;
+  licencePermitted?: boolean;
+  disclosureVersion?: string | null;
 }
 
 export interface StaffExceptionSummary {
@@ -23,19 +26,21 @@ export interface StaffExceptionSummary {
 export interface ProductApi {
   listRules(): Promise<ProductRuleSummary[]>;
   listExceptions(): Promise<StaffExceptionSummary[]>;
-  publish(ruleId: string, input: { idempotencyKey: string }): Promise<void>;
+  publish(ruleId: string, input: { effectiveFrom: string; effectiveUntil?: string; idempotencyKey: string }): Promise<void>;
   decideException(
     exceptionId: string,
-    input: { expectedVersion: number; decision: "APPROVE" | "REJECT" },
+    input: { expectedVersion: number; decision: "APPROVE" | "REJECT"; reason: string },
   ): Promise<void>;
 }
 
 export function ProductWorkspace({
   api,
   actorId,
+  roles,
 }: {
   api: ProductApi;
   actorId: string;
+  roles?: readonly string[];
 }) {
   const [rules, setRules] = useState<ProductRuleSummary[] | null>(null);
   const [exceptions, setExceptions] = useState<StaffExceptionSummary[] | null>(null);
@@ -86,12 +91,13 @@ export function ProductWorkspace({
               const requester = rule.requestedBy === null ? "unknown maker" : rule.requestedBy;
               const canPublish =
                 rule.status === "DRAFT" &&
-                !gateClosed &&
+                rule.gate === "OPEN" &&
                 rule.requestedBy !== actorId;
               return (
                 <li key={rule.id}>
                   <strong>Rule version {rule.versionNumber}</strong>
                   <span>Requested by {requester}</span>
+                  <span>Rule gate: {rule.gate.toLowerCase()}</span>
                   {rule.effectiveFrom ? <time dateTime={rule.effectiveFrom}>{rule.effectiveFrom}</time> : null}
                   <button
                     type="button"
@@ -100,7 +106,11 @@ export function ProductWorkspace({
                       setActionError("");
                       setNotice("");
                       void api
-                        .publish(rule.id, { idempotencyKey: crypto.randomUUID() })
+                        .publish(rule.id, {
+                          effectiveFrom: rule.effectiveFrom ?? new Date().toISOString(),
+                          ...(rule.effectiveUntil ? { effectiveUntil: rule.effectiveUntil } : {}),
+                          idempotencyKey: crypto.randomUUID(),
+                        })
                         .then(() => setNotice("Rule version published"))
                         .catch(() => setActionError("This rule is stale or the fixture gate is closed."));
                     }}
@@ -121,6 +131,7 @@ export function ProductWorkspace({
           <ul>
             {exceptions.map((exception) => {
               const requester = exception.requestedBy === actorId;
+              const authorized = roles === undefined || roles.includes(exception.requiredApproverRole);
               return (
                 <li key={exception.id}>
                   <strong>{exception.reason}</strong>
@@ -129,14 +140,14 @@ export function ProductWorkspace({
                   <span>Policy value: {String(exception.policyValue)}</span>
                   <button
                     type="button"
-                    disabled={requester}
+                    disabled={requester || !authorized}
                     onClick={() => decide(exception, "APPROVE")}
                   >
                     Approve exception
                   </button>
                   <button
                     type="button"
-                    disabled={requester}
+                    disabled={requester || !authorized}
                     onClick={() => decide(exception, "REJECT")}
                   >
                     Reject exception
@@ -156,7 +167,11 @@ export function ProductWorkspace({
     setActionError("");
     setNotice("");
     void api
-      .decideException(exception.id, { expectedVersion: exception.version, decision })
+      .decideException(exception.id, {
+        expectedVersion: exception.version,
+        decision,
+        reason: `${decision === "APPROVE" ? "Approved" : "Rejected"}: ${exception.reason}`,
+      })
       .then(() => setNotice(decision === "APPROVE" ? "Exception approved" : "Exception rejected"))
       .catch((error: unknown) => {
         const code =
@@ -171,4 +186,3 @@ export function ProductWorkspace({
       });
   }
 }
-

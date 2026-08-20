@@ -9,7 +9,9 @@ import {
 } from "@somo/db";
 import {
   FinanceApprovalGate,
+  canonicalizeJson,
   isSupportedTenure,
+  MAX_RATE_BASIS_POINTS,
   type FixtureKey,
 } from "@somo/domain/src/index.js";
 import type { StaffPrincipal } from "../access/policy.js";
@@ -28,7 +30,7 @@ export interface ProductRuleDraftInput {
   eligibilityPolicy?: Record<string, unknown>;
   requiredEvidence?: readonly string[];
   exceptionPolicy?: Record<string, unknown>;
-  disclosureVersion?: string;
+  disclosureVersion?: string | undefined;
   fixtureHashes?: readonly string[];
   licencePermitted?: boolean;
 }
@@ -50,6 +52,7 @@ export interface ProductService {
     },
   ): Promise<{ id: string; versionNumber: number }>;
   publishRuleVersion(input: PublishRuleInput): Promise<FinancingRuleRecord>;
+  listRules(): Promise<FinancingRuleRecord[]>;
   getEffectiveRule(productId: string, now?: Date): Promise<FinancingRuleRecord>;
 }
 
@@ -57,8 +60,7 @@ export function createProductService(options: {
   database: Database;
   fixtureGate?: FinanceApprovalGate;
 }): ProductService {
-  const fixtureGate =
-    options.fixtureGate ?? new FinanceApprovalGate([], true);
+  const fixtureGate = options.fixtureGate ?? FinanceApprovalGate.production();
 
   return {
     async createRuleVersion(input) {
@@ -82,8 +84,18 @@ export function createProductService(options: {
       ) {
         throw new AppError(400, "METHOD_NOT_SUPPORTED", "The method is disabled.");
       }
-      if (!Number.isSafeInteger(input.rateBasisPoints) || input.rateBasisPoints < 0) {
+      if (
+        !Number.isSafeInteger(input.rateBasisPoints) ||
+        input.rateBasisPoints < 0 ||
+        input.rateBasisPoints > MAX_RATE_BASIS_POINTS
+      ) {
         throw new AppError(400, "RATE_INVALID", "The rate is invalid.");
+      }
+      if (input.disclosureVersion === undefined || input.disclosureVersion.trim().length === 0) {
+        throw new AppError(400, "DISCLOSURE_REQUIRED", "A disclosure version is required.");
+      }
+      if (input.permittedFees !== undefined && Object.keys(input.permittedFees).length > 0) {
+        throw new AppError(400, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
       }
       if (
         input.allowedTenuresMonths.length === 0 ||
@@ -166,6 +178,7 @@ export function createProductService(options: {
       );
       if (existing !== null) {
         if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
+        if (existing.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
         const rule = await financingRepo(options.database).findRule(input.ruleId);
         if (rule === null) throw new AppError(404, "RULE_NOT_FOUND", "Rule not found.");
         return rule;
@@ -177,6 +190,15 @@ export function createProductService(options: {
           if (draft === null) throw new AppError(404, "RULE_NOT_FOUND", "Rule not found.");
           if (draft.approved || draft.publishedAt !== null) {
             throw new AppError(409, "RULE_IMMUTABLE", "Published rule versions are immutable.");
+          }
+          if (!draft.licencePermitted) {
+            throw new AppError(403, "LICENCE_PERMISSION_REQUIRED", "A licensed rule is required before publishing.");
+          }
+          if (draft.disclosureVersion === null || draft.disclosureVersion.trim().length === 0) {
+            throw new AppError(403, "DISCLOSURE_REQUIRED", "A disclosure version is required before publishing.");
+          }
+          if (Object.keys(draft.permittedFees).length > 0) {
+            throw new AppError(403, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
           }
           const fixtures = draft.repaymentFrequencies.flatMap((frequency) =>
             draft.allowedTenuresMonths.map((tenureMonths) => {
@@ -192,6 +214,23 @@ export function createProductService(options: {
               return fixture;
             }),
           );
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "PRODUCT_PUBLISH",
+            payloadHash,
+            actorStaffUserId: input.actor.staffUserId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (command.payloadHash !== payloadHash) throw idempotencyConflict();
+            if (command.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
+            const replayId = command.response["id"];
+            if (typeof replayId !== "string") throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is invalid.");
+            const replay = await repo.findRule(replayId);
+            if (replay === null) throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved rule is missing.");
+            return replay;
+          }
           const published = await repo.publishRule({
             ruleId: input.ruleId,
             actorStaffUserId: input.actor.staffUserId,
@@ -199,14 +238,7 @@ export function createProductService(options: {
             ...(effectiveUntil === undefined ? {} : { effectiveUntil }),
           });
           const response = serializeRule(published);
-          await repo.insertCommand({
-            scope,
-            idempotencyKey: input.idempotencyKey,
-            commandType: "PRODUCT_PUBLISH",
-            payloadHash,
-            actorStaffUserId: input.actor.staffUserId,
-            response,
-          });
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "financing_rule_version",
             aggregateId: published.id,
@@ -230,6 +262,14 @@ export function createProductService(options: {
           return published;
         });
       } catch (error) {
+        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
+        if (raced !== null && raced.payloadHash === payloadHash && raced.actorStaffUserId === input.actor.staffUserId) {
+          const ruleId = raced.response["id"];
+          if (typeof ruleId === "string") {
+            const replay = await financingRepo(options.database).findRule(ruleId);
+            if (replay !== null) return replay;
+          }
+        }
         throw mapDatabaseError(error, "RULE_PUBLISH_FAILED");
       }
     },
@@ -240,6 +280,10 @@ export function createProductService(options: {
         throw new AppError(409, "NO_EFFECTIVE_FINANCING_RULE", "No effective licensed financing rule is available.");
       }
       return rule;
+    },
+
+    async listRules() {
+      return financingRepo(options.database).listRules();
     },
   };
 }
@@ -277,9 +321,7 @@ function hashPayload(value: unknown): string {
 }
 
 function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_, child: unknown) =>
-    typeof child === "bigint" ? child.toString() : child,
-  );
+  return canonicalizeJson(value);
 }
 
 function serializeRule(rule: FinancingRuleRecord): Record<string, unknown> {
@@ -297,6 +339,10 @@ function serializeRule(rule: FinancingRuleRecord): Record<string, unknown> {
 
 function idempotencyConflict(): AppError {
   return new AppError(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different command.");
+}
+
+function idempotencyActorConflict(): AppError {
+  return new AppError(409, "IDEMPOTENCY_ACTOR_MISMATCH", "The idempotency key belongs to a different actor.");
 }
 
 function mapDatabaseError(error: unknown, fallback: string): AppError | unknown {

@@ -35,3 +35,16 @@ Self-review found no approved production fixture to transcribe, so production pu
 ## PostgreSQL verification follow-up
 
 The first controller run after the seed fix reached assertions and reported 5/5 failures at `financing.ts:194`: PostgreSQL `42P18` could not infer the type of the optional `effectiveUntil` parameter. The publish overlap predicate now casts that parameter to `timestamptz` and uses a bounded/open-ended interval expression. The controller must rerun the focused API suite and the populated-0009 migration test with its configured disposable URL to append the assertion-level GREEN counts.
+
+## Reviewer-hardening TDD follow-up
+
+| Boundary | RED | GREEN |
+| --- | --- | --- |
+| Domain fixture/canonical gate | `vitest run src/financing/fixtures.test.ts`: 2 tests failed before the gate API and canonical serializer existed. | Same direct command: 2/2 passed after strict boolean validation, deep clone/freeze, ordinal canonical JSON, and fail-closed production construction. |
+| API DTO/validation | `vitest run src/modules/products/dto.test.ts src/modules/products/service.validation.test.ts`: DTO import failed and 2 validation tests failed at the pre-validation database capability guard. | Same direct command: 3/3 passed after explicit DTO serialization, rate upper bound, disclosure requirement, and fee fail-closed checks. |
+| Customer HTTP adapter/state | Focused adapter + OfferPanel run initially had 3 failures (adapter absent; accepted-after-expiry and schedule-length assertions). | `vitest run src/features/offer/offer-panel.test.tsx src/lib/financing-api.test.ts`: 6/6 passed. |
+| Staff HTTP adapter/state | Focused adapter + ProductWorkspace run initially had 1 failure (adapter absent; test fixture was 1 pass). | `vitest run src/lib/financing-api.test.ts src/features/products/product-workspace.test.tsx`: 3/3 passed. |
+
+Reviewer-hardening production changes include explicit product/offer/exception DTO mapping on routes, staff list/read endpoints, atomic command reservation with actor binding, product-row publish serialization, transaction-time offer-version locking and exact accepted hash, exact exception rule/field/value binding, rate/database upper bounds, disclosed offer version/hash persistence, and migration `0011_financing_binding.sql`. The fresh/repeat migration journal is now 12 entries, and the populated 0009 fixture applies 0010 then 0011. No dependency or commercial fixture changes were made. The focused real-PostgreSQL API and migration GREEN counts remain controller-owned because `TEST_DATABASE_URL` is not configured in this worktree.
+
+The real-PG suite now also includes concurrent same-window publishes (one winner/one bounded rejection), concurrent offer creation with one atomic idempotency command and replay, and explicit binding fields for exception bypasses. The API TypeScript check including these tests passes; assertion-level results remain pending the controller database run.

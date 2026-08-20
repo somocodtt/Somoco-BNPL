@@ -160,6 +160,10 @@ export const financingRuleVersion = pgTable(
       sql`${table.annualRateBps} >= 0`,
     ),
     check(
+      "financing_rule_rate_bps_upper_bound",
+      sql`${table.annualRateBps} <= 1000000`,
+    ),
+    check(
       "financing_rule_selling_price_nonnegative",
       sql`${table.sellingPriceMinorUnits} >= 0`,
     ),

@@ -88,6 +88,13 @@ export async function buildApp(
     options.config === undefined
       ? loadConfig()
       : validateConfig(options.config);
+  if (
+    config.environment === "production" &&
+    options.financing?.fixtureGate !== undefined &&
+    !options.financing.fixtureGate.isProduction
+  ) {
+    throw new Error("PRODUCTION_FIXTURE_GATE_REQUIRED");
+  }
   assertProductionIdentityDependencies(config, options.identity);
   const connection =
     options.database === undefined

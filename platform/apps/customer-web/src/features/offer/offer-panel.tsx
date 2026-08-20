@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 export interface CustomerOffer {
   id: string;
+  version: number;
   status: "PENDING" | "EXPIRED" | "ACCEPTED" | "CANCELLED";
   expiresAt: string;
   priceMinor: string;
@@ -16,13 +17,15 @@ export interface CustomerOffer {
     totalMinor: string;
   }[];
   disclosureVersion: string | null;
+  fees: Record<string, unknown>;
+  disclosedHash?: string | null;
 }
 
 export interface OfferApi {
   get(applicationId: string): Promise<CustomerOffer | null>;
   accept(
     offerId: string,
-    input: { consent: boolean; consentAt: string },
+    input: { consent: boolean; consentAt: string; expectedVersion?: number },
   ): Promise<CustomerOffer>;
 }
 
@@ -69,7 +72,7 @@ export function OfferPanel({
   if (offer === null) {
     return <p role="status">No licensed financing offer is available.</p>;
   }
-  if (offer.status === "EXPIRED" || new Date(offer.expiresAt).getTime() <= Date.now()) {
+  if (offer.status !== "ACCEPTED" && (offer.status === "EXPIRED" || new Date(offer.expiresAt).getTime() <= Date.now())) {
     return (
       <section className="panel" aria-labelledby="offer-expired-title">
         <h1 id="offer-expired-title">Financing offer</h1>
@@ -98,7 +101,7 @@ export function OfferPanel({
         <div>
           <dt>Repayment plan</dt>
           <dd>
-            {offer.tenureMonths} {offer.frequency === "MONTHLY" ? "monthly" : "weekly"} installments
+            {offer.installments.length} {offer.frequency === "MONTHLY" ? "monthly" : "weekly"} installments
           </dd>
         </div>
         <div>
@@ -125,6 +128,16 @@ export function OfferPanel({
         ))}
       </ol>
       <p>Disclosure version: {offer.disclosureVersion ?? "Not supplied"}</p>
+      {Object.keys(offer.fees).length > 0 ? (
+        <section aria-labelledby="offer-fees-title">
+          <h2 id="offer-fees-title">Fees</h2>
+          <ul>
+            {Object.entries(offer.fees).map(([name, value]) => (
+              <li key={name}>{name}: {String(value)}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       {!accepted && offer.status !== "ACCEPTED" ? (
         <form
           onSubmit={(event) => {
@@ -133,7 +146,7 @@ export function OfferPanel({
             setAccepting(true);
             setAcceptError("");
             void api
-              .accept(offer.id, { consent: true, consentAt: new Date().toISOString() })
+              .accept(offer.id, { consent: true, consentAt: new Date().toISOString(), expectedVersion: offer.version })
               .then((result) => {
                 setOffer(result);
                 setAccepted(true);
@@ -176,4 +189,3 @@ function formatGhs(minor: string): string {
   const cents = minor.slice(-2).padStart(2, "0");
   return `GHS ${major.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${cents}`;
 }
-

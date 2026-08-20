@@ -3,6 +3,7 @@ import type { ApplicationStatus, ApprovalStage } from "@somo/domain/src/applicat
 import { sql } from "drizzle-orm";
 import {
   check,
+  bigint,
   index,
   integer,
   jsonb,
@@ -15,7 +16,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { staffUser } from "./access.js";
 import { person } from "./privacy.js";
-import { product, vehicleModel } from "./products.js";
+import { financingRuleVersion, product, vehicleModel } from "./products.js";
 
 const APPLICATION_STATUSES = [
   "DRAFT",
@@ -354,6 +355,15 @@ export const exceptionRequest = pgTable(
       .references(() => application.id, { onDelete: "restrict" }),
     proposedValue: jsonb("proposed_value").$type<unknown>().notNull(),
     policyValue: jsonb("policy_value").$type<unknown>().notNull(),
+    ruleVersionId: uuid("rule_version_id").references(() => financingRuleVersion.id, { onDelete: "restrict" }),
+    exceptionField: text("exception_field"),
+    valueType: text("value_type"),
+    proposedAmountMinor: bigint("proposed_amount_minor", { mode: "bigint" }),
+    policyAmountMinor: bigint("policy_amount_minor", { mode: "bigint" }),
+    proposedFrequency: text("proposed_frequency"),
+    policyFrequency: text("policy_frequency"),
+    proposedTenureMonths: integer("proposed_tenure_months"),
+    policyTenureMonths: integer("policy_tenure_months"),
     reason: text("reason").notNull(),
     status: text("status").notNull().default("PENDING"),
     requiredApproverRole: text("required_approver_role")
@@ -377,6 +387,12 @@ export const exceptionRequest = pgTable(
       .notNull(),
   },
   (table) => [
+    index("exception_request_rule_binding_idx").on(
+      table.applicationId,
+      table.ruleVersionId,
+      table.exceptionField,
+      table.status,
+    ),
     check(
       "exception_request_status_allowed",
       sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,

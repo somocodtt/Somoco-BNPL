@@ -10,6 +10,7 @@ import {
 import {
   FinanceApprovalGate,
   FinancingEngine,
+  canonicalizeJson,
   type QuoteResult,
 } from "@somo/domain/src/index.js";
 import type { CustomerPrincipal } from "../access/policy.js";
@@ -50,7 +51,7 @@ export function createOfferService(options: {
   exceptions: ExceptionService;
   fixtureGate?: FinanceApprovalGate;
 }): OfferService {
-  const fixtureGate = options.fixtureGate ?? new FinanceApprovalGate([], true);
+  const fixtureGate = options.fixtureGate ?? FinanceApprovalGate.production();
   return {
     async create(input) {
       const depositMinor = parseMinor(input.depositMinor);
@@ -72,6 +73,7 @@ export function createOfferService(options: {
       const existing = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
       if (existing !== null) {
         if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
+        if (existing.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
         return replayOffer(options.database, existing.response);
       }
       const offerId = randomUUID();
@@ -108,7 +110,16 @@ export function createOfferService(options: {
           if (!rule.fixtureHashes.includes(fixture.canonicalHash)) {
             throw new AppError(403, "FIXTURE_HASH_REQUIRED", "A registered approved fixture is required.");
           }
-          const approvedException = await options.exceptions.findApproved(input.applicationId, now);
+          const approvedException = await options.exceptions.findApproved(input.applicationId, now, {
+            ruleVersionId: rule.id,
+            field: "minimumDepositMinor",
+            proposedAmountMinor: depositMinor,
+            policyAmountMinor: rule.minimumDepositMinor,
+            proposedFrequency: input.frequency,
+            policyFrequency: input.frequency,
+            proposedTenureMonths: input.tenureMonths,
+            policyTenureMonths: input.tenureMonths,
+          });
           if (depositMinor < rule.minimumDepositMinor && approvedException === null) {
             throw new AppError(400, "MINIMUM_DEPOSIT_REQUIRED", "The deposit is below the product minimum.");
           }
@@ -139,7 +150,26 @@ export function createOfferService(options: {
             fixtureHash: fixture.canonicalHash,
             exceptionId: approvedException?.id ?? null,
           });
+          const disclosedHash = hashPayload({
+            disclosureVersion: rule.disclosureVersion,
+            fees: rule.permittedFees,
+          });
+          terms.disclosureHash = disclosedHash;
           const canonicalHash = hashPayload(terms);
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "OFFER_CREATE",
+            payloadHash,
+            actorPersonId: input.actor.personId,
+            applicationId: input.applicationId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (command.payloadHash !== payloadHash) throw idempotencyConflict();
+            if (command.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
+            return replayOffer(options.database, command.response);
+          }
           const created = await repo.insertOffer({
             offerId,
             offerVersionId,
@@ -151,17 +181,11 @@ export function createOfferService(options: {
             terms,
             canonicalHash,
             expiresAt,
+            disclosedVersion: rule.disclosureVersion,
+            disclosedHash,
           });
           const response = serializeOffer(created);
-          await repo.insertCommand({
-            scope,
-            idempotencyKey: input.idempotencyKey,
-            commandType: "OFFER_CREATE",
-            payloadHash,
-            actorPersonId: input.actor.personId,
-            applicationId: input.applicationId,
-            response,
-          });
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "offer",
             aggregateId: created.id,
@@ -186,6 +210,10 @@ export function createOfferService(options: {
           return created;
         });
       } catch (error) {
+        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
+        if (raced !== null && raced.payloadHash === payloadHash && raced.actorPersonId === input.actor.personId) {
+          return replayOffer(options.database, raced.response);
+        }
         throw mapError(error, "OFFER_CREATE_FAILED");
       }
     },
@@ -208,12 +236,12 @@ export function createOfferService(options: {
         offerId: input.offerId,
         expectedVersion: input.expectedVersion,
         consentAt: consentAt.toISOString(),
-        canonicalHash: current.offerVersion.canonicalHash,
       });
       const scope = `offer:${input.offerId}:accept`;
       const existing = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
       if (existing !== null) {
         if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
+        if (existing.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
         return replayOffer(options.database, existing.response);
       }
       try {
@@ -222,6 +250,20 @@ export function createOfferService(options: {
           const application = await repo.lockApplication(current.applicationId);
           if (application === null || application.applicantPersonId !== input.actor.personId) {
             throw new AppError(403, "FORBIDDEN", "This offer does not belong to the customer.");
+          }
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "OFFER_ACCEPT",
+            payloadHash,
+            actorPersonId: input.actor.personId,
+            applicationId: current.applicationId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (command.payloadHash !== payloadHash) throw idempotencyConflict();
+            if (command.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
+            return replayOffer(options.database, command.response);
           }
           const accepted = await repo.acceptOffer({
             offerId: input.offerId,
@@ -232,15 +274,7 @@ export function createOfferService(options: {
             acceptedHash: current.offerVersion!.canonicalHash!,
           });
           const response = serializeOffer(accepted);
-          await repo.insertCommand({
-            scope,
-            idempotencyKey: input.idempotencyKey,
-            commandType: "OFFER_ACCEPT",
-            payloadHash,
-            actorPersonId: input.actor.personId,
-            applicationId: accepted.applicationId,
-            response,
-          });
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "offer",
             aggregateId: accepted.id,
@@ -265,6 +299,10 @@ export function createOfferService(options: {
           return accepted;
         });
       } catch (error) {
+        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
+        if (raced !== null && raced.payloadHash === payloadHash && raced.actorPersonId === input.actor.personId) {
+          return replayOffer(options.database, raced.response);
+        }
         throw mapError(error, "OFFER_ACCEPT_FAILED");
       }
     },
@@ -378,17 +416,22 @@ function hashPayload(value: unknown): string {
 }
 
 function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_, child: unknown) =>
-    typeof child === "bigint" ? child.toString() : child,
-  );
+  return canonicalizeJson(value);
 }
 
 function idempotencyConflict(): AppError {
   return new AppError(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different command.");
 }
 
+function idempotencyActorConflict(): AppError {
+  return new AppError(409, "IDEMPOTENCY_ACTOR_MISMATCH", "The idempotency key belongs to a different actor.");
+}
+
 function mapError(error: unknown, fallback: string): AppError | unknown {
   if (error instanceof AppError) return error;
+  if (error instanceof Error && (error.message.includes("23505") || error.message.includes("offer_application_unique"))) {
+    return new AppError(409, "OFFER_ALREADY_EXISTS", "An offer already exists for this application.");
+  }
   if (error instanceof Error && error.message === "OFFER_ACCEPT_REJECTED") {
     return new AppError(409, "OFFER_STALE_OR_EXPIRED", "The offer is stale, expired, or already accepted.");
   }

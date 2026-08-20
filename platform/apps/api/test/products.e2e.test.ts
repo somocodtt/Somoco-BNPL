@@ -40,7 +40,7 @@ beforeEach(async () => {
   await resetTestDatabase(databaseUrl!);
   await migrateDatabase(database);
   fixture = testFixture();
-  const gate = new FinanceApprovalGate([fixture], false);
+  const gate = FinanceApprovalGate.forTesting([fixture]);
   products = createProductService({ database, fixtureGate: gate });
   exceptions = createExceptionService({ database });
   offers = createOfferService({ database, products, exceptions, fixtureGate: gate });
@@ -115,13 +115,13 @@ describe("controlled financing API against PostgreSQL", () => {
       publish: false,
       licencePermitted: false,
     });
-    await products.publishRuleVersion({
+    await expect(products.publishRuleVersion({
       ruleId: draft.id,
       actor: checker.actor,
       effectiveFrom: new Date(Date.now() - 60_000).toISOString(),
       idempotencyKey: randomUUID(),
       requestId: randomUUID(),
-    });
+    })).rejects.toMatchObject({ code: "LICENCE_PERMISSION_REQUIRED" });
     await expect(products.getEffectiveRule(graph.productId)).rejects.toMatchObject({
       code: "NO_EFFECTIVE_FINANCING_RULE",
     });
@@ -132,7 +132,7 @@ describe("controlled financing API against PostgreSQL", () => {
     const maker = await seedStaff("exception-maker", "PRODUCT_ADMIN");
     const checker = await seedStaff("exception-checker", "PRODUCT_ADMIN");
     const draft = await createRule(graph, maker, { requestedVersion: 1, publish: false });
-    await products.publishRuleVersion({
+    const publishedRule = await products.publishRuleVersion({
       ruleId: draft.id,
       actor: checker.actor,
       effectiveFrom: new Date(Date.now() - 60_000).toISOString(),
@@ -159,6 +159,15 @@ describe("controlled financing API against PostgreSQL", () => {
       applicationId: graph.applicationId,
       proposedValue: { minimumDepositMinor: "10000" },
       policyValue: { minimumDepositMinor: "30000" },
+      ruleVersionId: publishedRule.id,
+      exceptionField: "minimumDepositMinor",
+      valueType: "AMOUNT",
+      proposedAmountMinor: "10000",
+      policyAmountMinor: "30000",
+      proposedFrequency: "MONTHLY",
+      policyFrequency: "MONTHLY",
+      proposedTenureMonths: 6,
+      policyTenureMonths: 6,
       reason: "Documented pilot hardship review.",
       requiredApproverRole: "PRODUCT_ADMIN",
       idempotencyKey: randomUUID(),
@@ -282,6 +291,48 @@ describe("controlled financing API against PostgreSQL", () => {
 
     void checker;
   });
+
+  it("serializes concurrent publishes and offer idempotency reservations", async () => {
+    const graph = await seedGraph();
+    const maker = await seedStaff("concurrency-maker", "PRODUCT_ADMIN");
+    const checkerA = await seedStaff("concurrency-checker-a", "PRODUCT_ADMIN");
+    const checkerB = await seedStaff("concurrency-checker-b", "PRODUCT_ADMIN");
+    const firstRule = await createRule(graph, maker, { requestedVersion: 1, publish: false });
+    const secondRule = await createRule(graph, maker, { requestedVersion: 2, publish: false });
+    const window = {
+      effectiveFrom: new Date(Date.now() - 60_000).toISOString(),
+      effectiveUntil: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const publishes = await Promise.allSettled([
+      products.publishRuleVersion({ ...window, ruleId: firstRule.id, actor: checkerA.actor, idempotencyKey: randomUUID(), requestId: randomUUID() }),
+      products.publishRuleVersion({ ...window, ruleId: secondRule.id, actor: checkerB.actor, idempotencyKey: randomUUID(), requestId: randomUUID() }),
+    ]);
+    expect(publishes.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(publishes.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+    const offerInput = {
+      applicationId: graph.applicationId,
+      depositMinor: "30000",
+      frequency: "MONTHLY" as const,
+      tenureMonths: 6 as const,
+      firstDueDate: "2026-09-01",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      idempotencyKey: randomUUID(),
+      actor: graph.customer,
+      requestId: randomUUID(),
+    };
+    const [firstOffer, replayOffer] = await Promise.all([
+      offers.create(offerInput),
+      offers.create({ ...offerInput, requestId: randomUUID() }),
+    ]);
+    expect(replayOffer.id).toBe(firstOffer.id);
+    const commands = await queryTestSql<{ count: number }>(
+      databaseUrl!,
+      "select count(*)::int as count from financing_command where scope = $1 and idempotency_key = $2",
+      [`application:${graph.applicationId}:offer-create`, offerInput.idempotencyKey],
+    );
+    expect(commands.count).toBe(1);
+  });
 });
 
 async function seedGraph(): Promise<{
@@ -356,6 +407,7 @@ async function createRule(
     repaymentFrequencies: ["MONTHLY"],
     fixtureHashes: [fixture.canonicalHash],
     licencePermitted: input.licencePermitted ?? true,
+    disclosureVersion: "test-disclosure-v1",
     actor: maker.actor,
     requestId: randomUUID(),
   });
