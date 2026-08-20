@@ -42,6 +42,9 @@ export function canonicalizeJson(value: unknown): string {
   return encodeCanonical(value);
 }
 
+const GATE_CONSTRUCTOR_TOKEN = Symbol("finance-approval-gate");
+const GATE_BRANDS = new WeakSet<FinanceApprovalGate>();
+
 export class FinanceApprovalGate {
   readonly #fixtures = new Map<string, WorkedExampleFixture>();
   readonly #production: boolean;
@@ -49,8 +52,13 @@ export class FinanceApprovalGate {
   private constructor(
     fixtures: readonly WorkedExampleFixture[],
     production: boolean,
+    token: symbol,
   ) {
+    if (token !== GATE_CONSTRUCTOR_TOKEN) {
+      throw new Error("FINANCE_GATE_BRAND_INVALID");
+    }
     this.#production = production;
+    GATE_BRANDS.add(this);
     for (const fixture of fixtures) this.#register(fixture);
   }
 
@@ -64,13 +72,13 @@ export class FinanceApprovalGate {
     if (fixtures.length > 0) {
       throw new Error("PRODUCTION_FIXTURE_ATTESTATION_REQUIRED");
     }
-    return new FinanceApprovalGate([], true);
+    return new FinanceApprovalGate([], true, GATE_CONSTRUCTOR_TOKEN);
   }
 
   static forTesting(
     fixtures: readonly WorkedExampleFixture[] = [],
   ): FinanceApprovalGate {
-    return new FinanceApprovalGate(fixtures, false);
+    return new FinanceApprovalGate(fixtures, false, GATE_CONSTRUCTOR_TOKEN);
   }
 
   get size(): number {
@@ -108,6 +116,12 @@ export class FinanceApprovalGate {
   }
 }
 
+export function isTrustedFinanceApprovalGate(
+  value: unknown,
+): value is FinanceApprovalGate {
+  return typeof value === "object" && value !== null && GATE_BRANDS.has(value as FinanceApprovalGate);
+}
+
 export function validateFixture(fixture: WorkedExampleFixture): void {
   if (
     typeof fixture !== "object" ||
@@ -143,28 +157,6 @@ function fixtureKey(value: FixtureKey): string {
   return `${value.method}:${value.frequency}:${value.tenureMonths}`;
 }
 
-function canonicalValue(value: unknown): unknown {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("CANONICAL_JSON_VALUE_INVALID");
-    return Object.is(value, -0) ? 0 : value;
-  }
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (typeof value === "object") {
-    if (Object.getPrototypeOf(value) !== Object.prototype) {
-      throw new Error("CANONICAL_JSON_VALUE_INVALID");
-    }
-    return Object.fromEntries(
-      Object.keys(value)
-        .sort(compareOrdinal)
-        .map((key) => [key, canonicalValue((value as Record<string, unknown>)[key])]),
-    );
-  }
-  throw new Error("CANONICAL_JSON_VALUE_INVALID");
-}
-
 function encodeCanonical(value: unknown): string {
   if (value === null) return "null";
   if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
@@ -177,23 +169,15 @@ function encodeCanonical(value: unknown): string {
     if (Object.getPrototypeOf(value) !== Object.prototype) throw new Error("CANONICAL_JSON_VALUE_INVALID");
     const record = value as Record<string, unknown>;
     return `{${Object.keys(record)
-      .sort(compareOrdinal)
+      .sort(compareJcs)
       .map((key) => `${JSON.stringify(key)}:${encodeCanonical(record[key])}`)
       .join(",")}}`;
   }
   throw new Error("CANONICAL_JSON_VALUE_INVALID");
 }
 
-function compareOrdinal(left: string, right: string): number {
-  const leftPoints = Array.from(left, (value) => value.codePointAt(0)!);
-  const rightPoints = Array.from(right, (value) => value.codePointAt(0)!);
-  const length = Math.min(leftPoints.length, rightPoints.length);
-  for (let index = 0; index < length; index += 1) {
-    if (leftPoints[index]! !== rightPoints[index]!) {
-      return leftPoints[index]! - rightPoints[index]!;
-    }
-  }
-  return leftPoints.length - rightPoints.length;
+function compareJcs(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function deepClone<T>(value: T): T {

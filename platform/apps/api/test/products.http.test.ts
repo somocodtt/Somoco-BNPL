@@ -85,7 +85,31 @@ describe("controlled financing HTTP boundary", () => {
     expect(listed.statusCode).toBe(200);
     expect(Array.isArray(listed.json())).toBe(true);
     expect(() => JSON.stringify(listed.json())).not.toThrow();
-    expect(listed.json()[0]).toMatchObject({ id: ruleId, sellingPriceMinor: "100000", minimumDepositMinor: "30000" });
+    expect(listed.json()[0]).toMatchObject({
+      id: ruleId,
+      sellingPriceMinor: "100000",
+      minimumDepositMinor: "30000",
+      status: "DRAFT",
+      gate: "CLOSED",
+    });
+
+    const financeUser = await createStaffUser(database, {
+      email: `finance-${randomUUID()}@example.test`,
+      passwordHash,
+      roles: ["FINANCE_OFFICER"],
+    });
+    const financeLogin = await app.inject({
+      method: "POST",
+      url: "/v1/staff/sessions",
+      payload: { email: financeUser.email, password: "correct horse battery staple", mfaAssertion: "valid" },
+    });
+    const financeCookie = (Array.isArray(financeLogin.headers["set-cookie"]) ? financeLogin.headers["set-cookie"] : [financeLogin.headers["set-cookie"]])[0];
+    const forbidden = await app.inject({
+      method: "GET",
+      url: "/v1/staff/products/rule-versions",
+      headers: { cookie: String(financeCookie).split(";", 1)[0] },
+    });
+    expect(forbidden.statusCode).toBe(403);
   });
 });
 

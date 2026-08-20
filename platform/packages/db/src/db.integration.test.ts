@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(12);
+    expect(before.rows[0]?.count).toBe(13);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -989,7 +989,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0011", async () => {
+  it("upgrades populated 0009 financing rows safely through 0012", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1060,6 +1060,7 @@ describe("populated legacy schema migration", () => {
 
     await applyMigrationFile(pool, "0010_controlled_financing.sql");
     await applyMigrationFile(pool, "0011_financing_binding.sql");
+    await applyMigrationFile(pool, "0012_financing_disclosures.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;
@@ -1068,10 +1069,13 @@ describe("populated legacy schema migration", () => {
       principal_minor_units: string;
       canonical_hash: string | null;
       disclosed_version: string | null;
+      disclosure_hash: string | null;
+      disclosure_content: Record<string, unknown> | null;
     }>(
       `select rule.calculation_method, rule.minimum_deposit_minor_units,
               offer.status, version.principal_minor_units, version.canonical_hash,
-              offer.disclosed_version
+              offer.disclosed_version, rule.disclosure_hash,
+              rule.disclosure_content
          from financing_rule_version rule
          join offer_version version on version.financing_rule_version_id = rule.id
          join offer on offer.id = version.offer_id
@@ -1085,6 +1089,8 @@ describe("populated legacy schema migration", () => {
       principal_minor_units: "100000",
       canonical_hash: null,
       disclosed_version: null,
+      disclosure_hash: null,
+      disclosure_content: null,
     });
   });
 

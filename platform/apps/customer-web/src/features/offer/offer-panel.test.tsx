@@ -87,6 +87,8 @@ function offer() {
       totalMinor: "1466667",
     })),
     disclosureVersion: "disclosure-v1",
+    disclosureContent: { version: "disclosure-v1", body: "Synthetic test disclosure" },
+    disclosedHash: "a".repeat(64),
     fees: {},
   };
 }

@@ -20,27 +20,57 @@ const approverRoles: readonly StaffRole[] = [
   "COMPLIANCE_AUDITOR",
 ];
 
+type ExceptionRequestBase = {
+  applicationId: string;
+  ruleVersionId: string;
+  reason: string;
+  requiredApproverRole: StaffRole;
+  expiresAt?: string;
+  idempotencyKey: string;
+  actor: StaffPrincipal;
+  requestId: string;
+};
+
+export type ExceptionRequestInput =
+  | (ExceptionRequestBase & {
+      valueType: "AMOUNT";
+      exceptionField: "minimumDepositMinor";
+      proposedValue: { minimumDepositMinor: string | bigint };
+      policyValue: { minimumDepositMinor: string | bigint };
+      proposedAmountMinor: string | bigint;
+      policyAmountMinor: string | bigint;
+      proposedFrequency?: never;
+      policyFrequency?: never;
+      proposedTenureMonths?: never;
+      policyTenureMonths?: never;
+    })
+  | (ExceptionRequestBase & {
+      valueType: "FREQUENCY";
+      exceptionField: "repaymentFrequency";
+      proposedValue: { repaymentFrequency: "WEEKLY" | "MONTHLY" };
+      policyValue: { repaymentFrequency: "WEEKLY" | "MONTHLY" };
+      proposedFrequency: "WEEKLY" | "MONTHLY";
+      policyFrequency: "WEEKLY" | "MONTHLY";
+      proposedAmountMinor?: never;
+      policyAmountMinor?: never;
+      proposedTenureMonths?: never;
+      policyTenureMonths?: never;
+    })
+  | (ExceptionRequestBase & {
+      valueType: "TENURE";
+      exceptionField: "tenureMonths";
+      proposedValue: { tenureMonths: number };
+      policyValue: { tenureMonths: number };
+      proposedTenureMonths: number;
+      policyTenureMonths: number;
+      proposedAmountMinor?: never;
+      policyAmountMinor?: never;
+      proposedFrequency?: never;
+      policyFrequency?: never;
+    });
+
 export interface ExceptionService {
-  request(input: {
-    applicationId: string;
-    proposedValue: unknown;
-    policyValue: unknown;
-    ruleVersionId: string;
-    exceptionField: string;
-    valueType: "AMOUNT" | "FREQUENCY" | "TENURE";
-    proposedAmountMinor?: string | bigint;
-    policyAmountMinor?: string | bigint;
-    proposedFrequency?: "WEEKLY" | "MONTHLY";
-    policyFrequency?: "WEEKLY" | "MONTHLY";
-    proposedTenureMonths?: number;
-    policyTenureMonths?: number;
-    reason: string;
-    requiredApproverRole: StaffRole;
-    expiresAt?: string;
-    idempotencyKey: string;
-    actor: StaffPrincipal;
-    requestId: string;
-  }): Promise<ExceptionRecord>;
+  request(input: ExceptionRequestInput): Promise<ExceptionRecord>;
   decide(input: {
     exceptionId: string;
     expectedVersion: number;
@@ -56,6 +86,7 @@ export interface ExceptionService {
     binding?: {
       ruleVersionId?: string;
       field?: string;
+      valueType?: "AMOUNT" | "FREQUENCY" | "TENURE";
       proposedAmountMinor?: bigint;
       policyAmountMinor?: bigint;
       proposedFrequency?: string;
@@ -76,7 +107,7 @@ export function createExceptionService(options: {
       assertStaffActor(input.actor);
       assertRole(input.requiredApproverRole);
       const reason = normalizeReason(input.reason);
-      assertBinding(input);
+      const binding = normalizeBinding(input);
       const expiresAt =
         input.expiresAt === undefined
           ? undefined
@@ -86,19 +117,19 @@ export function createExceptionService(options: {
       }
       const payloadHash = hashPayload({
         applicationId: input.applicationId,
-        proposedValue: input.proposedValue,
-        policyValue: input.policyValue,
+        proposedValue: binding.proposedValue,
+        policyValue: binding.policyValue,
         reason,
         requiredApproverRole: input.requiredApproverRole,
         ruleVersionId: input.ruleVersionId,
-        exceptionField: input.exceptionField,
-        valueType: input.valueType,
-        proposedAmountMinor: input.proposedAmountMinor?.toString() ?? null,
-        policyAmountMinor: input.policyAmountMinor?.toString() ?? null,
-        proposedFrequency: input.proposedFrequency ?? null,
-        policyFrequency: input.policyFrequency ?? null,
-        proposedTenureMonths: input.proposedTenureMonths ?? null,
-        policyTenureMonths: input.policyTenureMonths ?? null,
+        exceptionField: binding.exceptionField,
+        valueType: binding.valueType,
+        proposedAmountMinor: binding.proposedAmountMinor?.toString() ?? null,
+        policyAmountMinor: binding.policyAmountMinor?.toString() ?? null,
+        proposedFrequency: binding.proposedFrequency ?? null,
+        policyFrequency: binding.policyFrequency ?? null,
+        proposedTenureMonths: binding.proposedTenureMonths ?? null,
+        policyTenureMonths: binding.policyTenureMonths ?? null,
         expiresAt: expiresAt?.toISOString() ?? null,
       });
       const scope = `application:${input.applicationId}:exception-request`;
@@ -138,20 +169,20 @@ export function createExceptionService(options: {
           const created = await repo.insertException({
             id: exceptionId,
             applicationId: input.applicationId,
-            proposedValue: input.proposedValue,
-            policyValue: input.policyValue,
+            proposedValue: binding.proposedValue,
+            policyValue: binding.policyValue,
             reason,
             requestedBy: input.actor.staffUserId,
             requiredApproverRole: input.requiredApproverRole,
             ruleVersionId: input.ruleVersionId,
-            exceptionField: input.exceptionField,
-            valueType: input.valueType,
-            ...(input.proposedAmountMinor === undefined ? {} : { proposedAmountMinor: parseMinor(input.proposedAmountMinor) }),
-            ...(input.policyAmountMinor === undefined ? {} : { policyAmountMinor: parseMinor(input.policyAmountMinor) }),
-            ...(input.proposedFrequency === undefined ? {} : { proposedFrequency: input.proposedFrequency }),
-            ...(input.policyFrequency === undefined ? {} : { policyFrequency: input.policyFrequency }),
-            ...(input.proposedTenureMonths === undefined ? {} : { proposedTenureMonths: input.proposedTenureMonths }),
-            ...(input.policyTenureMonths === undefined ? {} : { policyTenureMonths: input.policyTenureMonths }),
+            exceptionField: binding.exceptionField,
+            valueType: binding.valueType,
+            ...(binding.proposedAmountMinor === undefined ? {} : { proposedAmountMinor: binding.proposedAmountMinor }),
+            ...(binding.policyAmountMinor === undefined ? {} : { policyAmountMinor: binding.policyAmountMinor }),
+            ...(binding.proposedFrequency === undefined ? {} : { proposedFrequency: binding.proposedFrequency }),
+            ...(binding.policyFrequency === undefined ? {} : { policyFrequency: binding.policyFrequency }),
+            ...(binding.proposedTenureMonths === undefined ? {} : { proposedTenureMonths: binding.proposedTenureMonths }),
+            ...(binding.policyTenureMonths === undefined ? {} : { policyTenureMonths: binding.policyTenureMonths }),
             ...(expiresAt === undefined ? {} : { expiresAt }),
           });
           const response = serializeException(created);
@@ -165,8 +196,8 @@ export function createExceptionService(options: {
             data: {
               applicationId: input.applicationId,
               requiredApproverRole: input.requiredApproverRole,
-              proposedValue: input.proposedValue,
-              policyValue: input.policyValue,
+              proposedValue: binding.proposedValue,
+              policyValue: binding.policyValue,
             },
             occurredAt: new Date(),
           });
@@ -323,28 +354,105 @@ function hashPayload(value: unknown): string {
   return createHash("sha256").update(canonicalizeJson(value)).digest("hex");
 }
 
-function assertBinding(input: {
-  ruleVersionId: string;
+type NormalizedBinding = {
   exceptionField: string;
   valueType: "AMOUNT" | "FREQUENCY" | "TENURE";
-  proposedAmountMinor?: string | bigint;
-  policyAmountMinor?: string | bigint;
+  proposedValue: Record<string, string | number>;
+  policyValue: Record<string, string | number>;
+  proposedAmountMinor?: bigint;
+  policyAmountMinor?: bigint;
   proposedFrequency?: "WEEKLY" | "MONTHLY";
   policyFrequency?: "WEEKLY" | "MONTHLY";
   proposedTenureMonths?: number;
   policyTenureMonths?: number;
-}): void {
-  if (!/^[0-9a-f-]{36}$/i.test(input.ruleVersionId) || input.exceptionField.trim().length === 0) {
+};
+
+function normalizeBinding(input: ExceptionRequestInput): NormalizedBinding {
+  if (!/^[0-9a-f-]{36}$/i.test(input.ruleVersionId)) {
     throw new AppError(400, "EXCEPTION_BINDING_REQUIRED", "An exception must bind a rule version and field.");
   }
-  if (input.valueType === "AMOUNT" && (input.proposedAmountMinor === undefined || input.policyAmountMinor === undefined)) {
-    throw new AppError(400, "EXCEPTION_BINDING_REQUIRED", "An amount exception must include proposed and policy amounts.");
+  if (input.valueType === "AMOUNT") {
+    const proposedAmountMinor = parseMinor(input.proposedAmountMinor);
+    const policyAmountMinor = parseMinor(input.policyAmountMinor);
+    const proposedValue = { minimumDepositMinor: proposedAmountMinor.toString() };
+    const policyValue = { minimumDepositMinor: policyAmountMinor.toString() };
+    if (
+      input.exceptionField !== "minimumDepositMinor" ||
+      !sameValue(input.proposedValue, proposedValue) ||
+      !sameValue(input.policyValue, policyValue) ||
+      "proposedFrequency" in input ||
+      "policyFrequency" in input ||
+      "proposedTenureMonths" in input ||
+      "policyTenureMonths" in input
+    ) {
+      throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The amount exception contains an irrelevant or mismatched value.");
+    }
+    return {
+      exceptionField: input.exceptionField,
+      valueType: input.valueType,
+      proposedValue,
+      policyValue,
+      proposedAmountMinor,
+      policyAmountMinor,
+    };
   }
-  if (input.valueType === "FREQUENCY" && (input.proposedFrequency === undefined || input.policyFrequency === undefined)) {
-    throw new AppError(400, "EXCEPTION_BINDING_REQUIRED", "A frequency exception must include proposed and policy frequencies.");
+  if (input.valueType === "FREQUENCY") {
+    if (
+      input.exceptionField !== "repaymentFrequency" ||
+      !sameFrequency(input.proposedFrequency) ||
+      !sameFrequency(input.policyFrequency) ||
+      !sameValue(input.proposedValue, { repaymentFrequency: input.proposedFrequency }) ||
+      !sameValue(input.policyValue, { repaymentFrequency: input.policyFrequency }) ||
+      "proposedAmountMinor" in input ||
+      "policyAmountMinor" in input ||
+      "proposedTenureMonths" in input ||
+      "policyTenureMonths" in input
+    ) {
+      throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The frequency exception contains an irrelevant or mismatched value.");
+    }
+    return {
+      exceptionField: input.exceptionField,
+      valueType: input.valueType,
+      proposedValue: { repaymentFrequency: input.proposedFrequency },
+      policyValue: { repaymentFrequency: input.policyFrequency },
+      proposedFrequency: input.proposedFrequency,
+      policyFrequency: input.policyFrequency,
+    };
   }
-  if (input.valueType === "TENURE" && (input.proposedTenureMonths === undefined || input.policyTenureMonths === undefined)) {
-    throw new AppError(400, "EXCEPTION_BINDING_REQUIRED", "A tenure exception must include proposed and policy tenures.");
+  if (
+    input.valueType !== "TENURE" ||
+    input.exceptionField !== "tenureMonths" ||
+    !Number.isSafeInteger(input.proposedTenureMonths) ||
+    !Number.isSafeInteger(input.policyTenureMonths) ||
+    !sameValue(input.proposedValue, { tenureMonths: input.proposedTenureMonths }) ||
+    !sameValue(input.policyValue, { tenureMonths: input.policyTenureMonths }) ||
+    "proposedAmountMinor" in input ||
+    "policyAmountMinor" in input ||
+    "proposedFrequency" in input ||
+    "policyFrequency" in input
+  ) {
+    throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The tenure exception contains an irrelevant or mismatched value.");
+  }
+  return {
+    exceptionField: input.exceptionField,
+    valueType: input.valueType,
+    proposedValue: { tenureMonths: input.proposedTenureMonths },
+    policyValue: { tenureMonths: input.policyTenureMonths },
+    proposedTenureMonths: input.proposedTenureMonths,
+    policyTenureMonths: input.policyTenureMonths,
+  };
+}
+
+function sameFrequency(value: unknown): value is "WEEKLY" | "MONTHLY" {
+  return value === "WEEKLY" || value === "MONTHLY";
+}
+
+function sameValue(value: unknown, normalized: Record<string, string | number>): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  try {
+    return canonicalizeJson(value) === canonicalizeJson(normalized);
+  } catch {
+    return false;
   }
 }
 

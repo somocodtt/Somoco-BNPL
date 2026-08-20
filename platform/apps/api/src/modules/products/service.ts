@@ -11,6 +11,7 @@ import {
   FinanceApprovalGate,
   canonicalizeJson,
   isSupportedTenure,
+  isTrustedFinanceApprovalGate,
   MAX_RATE_BASIS_POINTS,
   type FixtureKey,
 } from "@somo/domain/src/index.js";
@@ -31,6 +32,8 @@ export interface ProductRuleDraftInput {
   requiredEvidence?: readonly string[];
   exceptionPolicy?: Record<string, unknown>;
   disclosureVersion?: string | undefined;
+  disclosureContent?: Record<string, unknown> | undefined;
+  disclosureHash?: string | undefined;
   fixtureHashes?: readonly string[];
   licencePermitted?: boolean;
 }
@@ -60,6 +63,9 @@ export function createProductService(options: {
   database: Database;
   fixtureGate?: FinanceApprovalGate;
 }): ProductService {
+  if (options.fixtureGate !== undefined && !isTrustedFinanceApprovalGate(options.fixtureGate)) {
+    throw new Error("FINANCE_FIXTURE_GATE_INVALID");
+  }
   const fixtureGate = options.fixtureGate ?? FinanceApprovalGate.production();
 
   return {
@@ -94,6 +100,11 @@ export function createProductService(options: {
       if (input.disclosureVersion === undefined || input.disclosureVersion.trim().length === 0) {
         throw new AppError(400, "DISCLOSURE_REQUIRED", "A disclosure version is required.");
       }
+      const disclosure = validateDisclosure(
+        input.disclosureVersion,
+        input.disclosureContent,
+        input.disclosureHash,
+      );
       if (input.permittedFees !== undefined && Object.keys(input.permittedFees).length > 0) {
         throw new AppError(400, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
       }
@@ -132,7 +143,11 @@ export function createProductService(options: {
             exceptionPolicy: input.exceptionPolicy ?? {},
             ...(input.disclosureVersion === undefined
               ? {}
-              : { disclosureVersion: input.disclosureVersion }),
+              : {
+                  disclosureVersion: input.disclosureVersion,
+                  disclosureContent: disclosure.content,
+                  disclosureHash: disclosure.hash,
+                }),
             fixtureHashes: input.fixtureHashes ?? [],
             licencePermitted: input.licencePermitted ?? false,
             requestedBy: input.actor.staffUserId,
@@ -197,6 +212,12 @@ export function createProductService(options: {
           if (draft.disclosureVersion === null || draft.disclosureVersion.trim().length === 0) {
             throw new AppError(403, "DISCLOSURE_REQUIRED", "A disclosure version is required before publishing.");
           }
+          validateDisclosure(
+            draft.disclosureVersion,
+            draft.disclosureContent ?? undefined,
+            draft.disclosureHash ?? undefined,
+            403,
+          );
           if (Object.keys(draft.permittedFees).length > 0) {
             throw new AppError(403, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
           }
@@ -283,9 +304,43 @@ export function createProductService(options: {
     },
 
     async listRules() {
-      return financingRepo(options.database).listRules();
+      return (await financingRepo(options.database).listRules()).map((rule) => ({
+        ...rule,
+        gateStatus: ruleGateStatus(rule, fixtureGate),
+      }));
     },
   };
+}
+
+function ruleGateStatus(
+  rule: FinancingRuleRecord,
+  gate: FinanceApprovalGate,
+): "OPEN" | "CLOSED" {
+  if (!rule.licencePermitted || rule.fixtureHashes.length === 0) return "CLOSED";
+  try {
+    validateDisclosure(
+      rule.disclosureVersion ?? "",
+      rule.disclosureContent ?? undefined,
+      rule.disclosureHash ?? undefined,
+    );
+  } catch {
+    return "CLOSED";
+  }
+  for (const frequency of rule.repaymentFrequencies) {
+    for (const tenureMonths of rule.allowedTenuresMonths) {
+      try {
+        const fixture = gate.assertEnabled({
+          method: rule.calculationMethod,
+          frequency,
+          tenureMonths: tenureMonths as FixtureKey["tenureMonths"],
+        });
+        if (!rule.fixtureHashes.includes(fixture.canonicalHash)) return "CLOSED";
+      } catch {
+        return "CLOSED";
+      }
+    }
+  }
+  return "OPEN";
 }
 
 function assertProductManager(actor: StaffPrincipal): void {
@@ -314,6 +369,36 @@ function parseDate(value: string, code: string): Date {
     throw new AppError(400, code, "The date is invalid.");
   }
   return parsed;
+}
+
+function validateDisclosure(
+  version: string,
+  content: Record<string, unknown> | undefined,
+  suppliedHash: string | undefined,
+  status = 400,
+): { content: Record<string, unknown>; hash: string } {
+  if (version.trim().length === 0 || !isRecord(content) || suppliedHash === undefined) {
+    throw new AppError(status, "DISCLOSURE_REQUIRED", "Versioned disclosure content is required.");
+  }
+  if (!/^[0-9a-f]{64}$/.test(suppliedHash)) {
+    throw new AppError(status, "DISCLOSURE_INVALID", "The disclosure hash is invalid.");
+  }
+  let expectedHash: string;
+  try {
+    expectedHash = createHash("sha256")
+      .update(canonicalizeJson({ version, content }))
+      .digest("hex");
+  } catch {
+    throw new AppError(status, "DISCLOSURE_INVALID", "The disclosure content is invalid.");
+  }
+  if (suppliedHash !== expectedHash) {
+    throw new AppError(status, "DISCLOSURE_INVALID", "The disclosure hash does not match its content.");
+  }
+  return { content, hash: suppliedHash };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hashPayload(value: unknown): string {

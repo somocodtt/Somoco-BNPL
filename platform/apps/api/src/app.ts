@@ -43,7 +43,7 @@ import { registerProductRoutes } from "./modules/products/routes.js";
 import { createProductService } from "./modules/products/service.js";
 import { createExceptionService } from "./modules/products/exception-service.js";
 import { createOfferService } from "./modules/products/offer-service.js";
-import type { FinanceApprovalGate } from "@somo/domain/src/index.js";
+import { isTrustedFinanceApprovalGate, type FinanceApprovalGate } from "@somo/domain/src/index.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -91,7 +91,8 @@ export async function buildApp(
   if (
     config.environment === "production" &&
     options.financing?.fixtureGate !== undefined &&
-    !options.financing.fixtureGate.isProduction
+    (!isTrustedFinanceApprovalGate(options.financing.fixtureGate) ||
+      !options.financing.fixtureGate.isProduction)
   ) {
     throw new Error("PRODUCTION_FIXTURE_GATE_REQUIRED");
   }

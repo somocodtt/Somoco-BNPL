@@ -28,6 +28,8 @@ export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unkn
     requiredEvidence: [...rule.requiredEvidence],
     exceptionPolicy: rule.exceptionPolicy,
     disclosureVersion: rule.disclosureVersion,
+    disclosureContent: rule.disclosureContent ?? null,
+    disclosureHash: rule.disclosureHash ?? null,
     fixtureHashes: [...rule.fixtureHashes],
     licencePermitted: rule.licencePermitted,
     approved: rule.approved,
@@ -37,9 +39,8 @@ export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unkn
     effectiveFrom: rule.effectiveFrom?.toISOString() ?? null,
     effectiveUntil: rule.effectiveUntil?.toISOString() ?? null,
     publishedAt: rule.publishedAt?.toISOString() ?? null,
-    gate: rule.licencePermitted && rule.fixtureHashes.length > 0 && (rule.disclosureVersion?.trim().length ?? 0) > 0
-      ? "OPEN"
-      : "CLOSED",
+    status: rule.approved && rule.publishedAt !== null ? "PUBLISHED" : "DRAFT",
+    gate: rule.gateStatus ?? "CLOSED",
   };
 }
 
@@ -88,8 +89,6 @@ export function serializeOfferDto(offer: OfferRecord): Record<string, unknown> {
     version: offer.version,
     expiresAt: offer.expiresAt?.toISOString() ?? null,
     acceptedAt: offer.acceptedAt?.toISOString() ?? null,
-    acceptedVersionId: offer.acceptedVersionId,
-    acceptedHash: offer.acceptedHash,
     disclosedVersion: offer.disclosedVersion ?? terms.disclosureVersion ?? null,
     disclosedHash: offer.disclosedHash ?? null,
     consentAt: offer.consentAt?.toISOString() ?? null,
@@ -104,8 +103,8 @@ export function serializeOfferDto(offer: OfferRecord): Record<string, unknown> {
     rateBasisPoints: numberValue(terms.rateBasisPoints),
     fees: isRecord(terms.fees) ? terms.fees : {},
     disclosureVersion: stringValue(terms.disclosureVersion) ?? offer.disclosedVersion,
+    disclosureContent: isRecord(terms.disclosureContent) ? terms.disclosureContent : null,
     installments,
-    terms: serializeValue(terms),
   };
 }
 
@@ -135,14 +134,4 @@ function numberValue(value: unknown): number | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function serializeValue(value: unknown): unknown {
-  if (typeof value === "bigint") return value.toString();
-  if (value instanceof Date) return value.toISOString();
-  if (Array.isArray(value)) return value.map(serializeValue);
-  if (isRecord(value)) {
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, serializeValue(child)]));
-  }
-  return value;
 }

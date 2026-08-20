@@ -131,11 +131,15 @@ export class FetchStaffApi implements StaffApi, ProductApi {
   }
 
   async listRules(): Promise<ProductRuleSummary[]> {
-    return (await this.request("/v1/staff/products/rule-versions")) as ProductRuleSummary[];
+    const body = await this.request("/v1/staff/products/rule-versions");
+    if (!Array.isArray(body)) throw malformedStaff("MALFORMED_RULE_LIST");
+    return body.map(mapRuleSummary);
   }
 
   async listExceptions(): Promise<StaffExceptionSummary[]> {
-    return (await this.request("/v1/staff/exceptions")) as StaffExceptionSummary[];
+    const body = await this.request("/v1/staff/exceptions");
+    if (!Array.isArray(body)) throw malformedStaff("MALFORMED_EXCEPTION_LIST");
+    return body.map(mapExceptionSummary);
   }
 
   async publish(
@@ -190,4 +194,71 @@ export class FetchStaffApi implements StaffApi, ProductApi {
     }
     return body;
   }
+}
+
+function mapRuleSummary(value: unknown): ProductRuleSummary {
+  if (!isRecord(value)) throw malformedStaff("MALFORMED_RULE_LIST");
+  const id = requiredString(value.id, "MALFORMED_RULE_LIST");
+  const versionNumber = requiredInteger(value.versionNumber, "MALFORMED_RULE_LIST");
+  const status = value.status === "DRAFT" || value.status === "PUBLISHED" ? value.status : malformedStaff("MALFORMED_RULE_LIST");
+  const gate = value.gate === "OPEN" || value.gate === "CLOSED" ? value.gate : malformedStaff("MALFORMED_RULE_LIST");
+  const requestedBy = value.requestedBy === null ? null : requiredString(value.requestedBy, "MALFORMED_RULE_LIST");
+  const effectiveFrom = value.effectiveFrom === null ? null : requiredString(value.effectiveFrom, "MALFORMED_RULE_LIST");
+  const effectiveUntil = value.effectiveUntil === undefined || value.effectiveUntil === null
+    ? null
+    : requiredString(value.effectiveUntil, "MALFORMED_RULE_LIST");
+  const result: ProductRuleSummary = {
+    id,
+    versionNumber,
+    status,
+    requestedBy,
+    effectiveFrom,
+    gate,
+    effectiveUntil,
+  };
+  if (typeof value.licencePermitted === "boolean") result.licencePermitted = value.licencePermitted;
+  if (value.disclosureVersion !== undefined) {
+    result.disclosureVersion = value.disclosureVersion === null
+      ? null
+      : requiredString(value.disclosureVersion, "MALFORMED_RULE_LIST");
+  }
+  return result;
+}
+
+function mapExceptionSummary(value: unknown): StaffExceptionSummary {
+  if (!isRecord(value)) throw malformedStaff("MALFORMED_EXCEPTION_LIST");
+  if (!("proposedValue" in value) || !("policyValue" in value)) {
+    throw malformedStaff("MALFORMED_EXCEPTION_LIST");
+  }
+  const status = value.status === "PENDING" || value.status === "APPROVED" || value.status === "REJECTED"
+    ? value.status
+    : malformedStaff("MALFORMED_EXCEPTION_LIST");
+  return {
+    id: requiredString(value.id, "MALFORMED_EXCEPTION_LIST"),
+    status,
+    requestedBy: requiredString(value.requestedBy, "MALFORMED_EXCEPTION_LIST"),
+    requiredApproverRole: requiredString(value.requiredApproverRole, "MALFORMED_EXCEPTION_LIST"),
+    proposedValue: value.proposedValue,
+    policyValue: value.policyValue,
+    reason: requiredString(value.reason, "MALFORMED_EXCEPTION_LIST"),
+    version: requiredInteger(value.version, "MALFORMED_EXCEPTION_LIST"),
+  };
+}
+
+function malformedStaff(code: string): never {
+  throw new ProblemError(code, 502, "The staff financing response is invalid.");
+}
+
+function requiredString(value: unknown, code = "MALFORMED_FINANCING_DTO"): string {
+  if (typeof value !== "string" || value.trim().length === 0) return malformedStaff(code);
+  return value;
+}
+
+function requiredInteger(value: unknown, code = "MALFORMED_FINANCING_DTO"): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return malformedStaff(code);
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -11,6 +11,7 @@ import {
   FinanceApprovalGate,
   FinancingEngine,
   canonicalizeJson,
+  isTrustedFinanceApprovalGate,
   type QuoteResult,
 } from "@somo/domain/src/index.js";
 import type { CustomerPrincipal } from "../access/policy.js";
@@ -33,7 +34,10 @@ export interface OfferService {
   accept(input: {
     offerId: string;
     expectedVersion: number;
+    consent: boolean;
     consentAt: string;
+    disclosedVersion: string;
+    disclosedHash: string;
     idempotencyKey: string;
     actor: CustomerPrincipal;
     requestId: string;
@@ -51,6 +55,9 @@ export function createOfferService(options: {
   exceptions: ExceptionService;
   fixtureGate?: FinanceApprovalGate;
 }): OfferService {
+  if (options.fixtureGate !== undefined && !isTrustedFinanceApprovalGate(options.fixtureGate)) {
+    throw new Error("FINANCE_FIXTURE_GATE_INVALID");
+  }
   const fixtureGate = options.fixtureGate ?? FinanceApprovalGate.production();
   return {
     async create(input) {
@@ -96,6 +103,7 @@ export function createOfferService(options: {
           if (!rule.licencePermitted || rule.fixtureHashes.length === 0) {
             throw new AppError(403, "FINANCING_GATE_CLOSED", "The financing rule is not licensed and approved.");
           }
+          const disclosure = assertOfferDisclosure(rule);
           if (!rule.repaymentFrequencies.includes(input.frequency)) {
             throw new AppError(400, "FREQUENCY_NOT_ALLOWED", "The repayment frequency is not permitted.");
           }
@@ -113,12 +121,9 @@ export function createOfferService(options: {
           const approvedException = await options.exceptions.findApproved(input.applicationId, now, {
             ruleVersionId: rule.id,
             field: "minimumDepositMinor",
+            valueType: "AMOUNT",
             proposedAmountMinor: depositMinor,
             policyAmountMinor: rule.minimumDepositMinor,
-            proposedFrequency: input.frequency,
-            policyFrequency: input.frequency,
-            proposedTenureMonths: input.tenureMonths,
-            policyTenureMonths: input.tenureMonths,
           });
           if (depositMinor < rule.minimumDepositMinor && approvedException === null) {
             throw new AppError(400, "MINIMUM_DEPOSIT_REQUIRED", "The deposit is below the product minimum.");
@@ -149,12 +154,11 @@ export function createOfferService(options: {
             expiresAt: expiresAt.toISOString(),
             fixtureHash: fixture.canonicalHash,
             exceptionId: approvedException?.id ?? null,
+            disclosureContent: disclosure.content,
+            disclosureHash: disclosure.hash,
           });
-          const disclosedHash = hashPayload({
-            disclosureVersion: rule.disclosureVersion,
-            fees: rule.permittedFees,
-          });
-          terms.disclosureHash = disclosedHash;
+          const disclosedHash = disclosure.hash;
+          terms.disclosureHash = disclosure.hash;
           const canonicalHash = hashPayload(terms);
           const command = await repo.insertCommand({
             scope,
@@ -219,6 +223,9 @@ export function createOfferService(options: {
     },
 
     async accept(input) {
+      if (input.consent !== true) {
+        throw new AppError(400, "CONSENT_REQUIRED", "Affirmative financing consent is required.");
+      }
       const consentAt = parseDate(input.consentAt, "CONSENT_DATE_INVALID");
       const now = new Date();
       if (consentAt > now) {
@@ -227,30 +234,47 @@ export function createOfferService(options: {
       if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
         throw new AppError(400, "VERSION_INVALID", "The offer version is invalid.");
       }
-      const current = await findOfferById(options.database, input.offerId);
-      if (current === null) throw new AppError(404, "OFFER_NOT_FOUND", "Offer not found.");
-      if (current.offerVersion === null || current.offerVersion.canonicalHash === null) {
-        throw new AppError(409, "OFFER_LOCK_INVALID", "The offer terms are incomplete.");
-      }
-      const payloadHash = hashPayload({
-        offerId: input.offerId,
-        expectedVersion: input.expectedVersion,
-        consentAt: consentAt.toISOString(),
-      });
       const scope = `offer:${input.offerId}:accept`;
-      const existing = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
-      if (existing !== null) {
-        if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
-        if (existing.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
-        return replayOffer(options.database, existing.response);
-      }
       try {
         return await withTransaction(options.database, async (tx) => {
           const repo = financingRepo(tx);
-          const application = await repo.lockApplication(current.applicationId);
-          if (application === null || application.applicantPersonId !== input.actor.personId) {
-            throw new AppError(403, "FORBIDDEN", "This offer does not belong to the customer.");
+          const current = await repo.lockOffer(input.offerId);
+          if (current === null) throw new AppError(404, "OFFER_NOT_FOUND", "Offer not found.");
+          if (current.offerVersion === null || current.offerVersion.canonicalHash === null) {
+            throw new AppError(409, "OFFER_LOCK_INVALID", "The offer terms are incomplete.");
           }
+          const disclosure = assertOfferDisclosure({
+            disclosureVersion: current.disclosedVersion,
+            disclosureContent: isRecord(current.offerVersion.terms.disclosureContent)
+              ? current.offerVersion.terms.disclosureContent
+              : null,
+            disclosureHash: current.disclosedHash,
+            permittedFees: isRecord(current.offerVersion.terms.fees)
+              ? current.offerVersion.terms.fees
+              : null,
+          });
+          if (current.offerVersion.terms.disclosureHash !== disclosure.hash) {
+            throw new AppError(409, "DISCLOSURE_INVALID", "The offer disclosure hash is inconsistent.");
+          }
+          if (
+            input.disclosedVersion !== disclosure.version ||
+            input.disclosedHash !== disclosure.hash
+          ) {
+            throw new AppError(409, "DISCLOSURE_MISMATCH", "The accepted disclosure does not match the offer.");
+          }
+          const payloadHash = hashPayload({
+            offerId: input.offerId,
+            expectedVersion: input.expectedVersion,
+            lockedOfferVersion: current.offerVersion.versionNumber,
+            canonicalHash: current.offerVersion.canonicalHash,
+            disclosedVersion: disclosure.version,
+            disclosedHash: disclosure.hash,
+            acceptedDisclosureVersion: input.disclosedVersion,
+            acceptedDisclosureHash: input.disclosedHash,
+            consent: input.consent,
+            consentAt: consentAt.toISOString(),
+            actorPersonId: input.actor.personId,
+          });
           const command = await repo.insertCommand({
             scope,
             idempotencyKey: input.idempotencyKey,
@@ -265,13 +289,17 @@ export function createOfferService(options: {
             if (command.actorPersonId !== input.actor.personId) throw idempotencyActorConflict();
             return replayOffer(options.database, command.response);
           }
+          const application = await repo.lockApplication(current.applicationId);
+          if (application === null || application.applicantPersonId !== input.actor.personId) {
+            throw new AppError(403, "FORBIDDEN", "This offer does not belong to the customer.");
+          }
           const accepted = await repo.acceptOffer({
             offerId: input.offerId,
             expectedVersion: input.expectedVersion,
             personId: input.actor.personId,
             acceptedAt: now,
             consentAt,
-            acceptedHash: current.offerVersion!.canonicalHash!,
+            acceptedHash: current.offerVersion.canonicalHash,
           });
           const response = serializeOffer(accepted);
           await repo.updateCommandResponse(scope, input.idempotencyKey, response);
@@ -284,6 +312,9 @@ export function createOfferService(options: {
             data: {
               acceptedVersionId: accepted.acceptedVersionId,
               canonicalHash: accepted.acceptedHash,
+              disclosedVersion: input.disclosedVersion,
+              disclosedHash: input.disclosedHash,
+              consent: input.consent,
               consentAt: consentAt.toISOString(),
             },
             occurredAt: now,
@@ -299,10 +330,6 @@ export function createOfferService(options: {
           return accepted;
         });
       } catch (error) {
-        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
-        if (raced !== null && raced.payloadHash === payloadHash && raced.actorPersonId === input.actor.personId) {
-          return replayOffer(options.database, raced.response);
-        }
         throw mapError(error, "OFFER_ACCEPT_FAILED");
       }
     },
@@ -319,10 +346,6 @@ export function createOfferService(options: {
       return financingRepo(options.database).findOffer(applicationId);
     },
   };
-}
-
-async function findOfferById(database: Database, offerId: string): Promise<OfferRecord | null> {
-  return financingRepo(database).findOfferById(offerId);
 }
 
 function parseMinor(value: string | bigint): bigint {
@@ -348,6 +371,40 @@ function validateDateOnly(value: string): string {
   return value;
 }
 
+function assertOfferDisclosure(input: {
+  disclosureVersion?: string | null | undefined;
+  disclosureContent?: unknown;
+  disclosureHash?: string | null | undefined;
+  permittedFees?: unknown;
+}): { version: string; content: Record<string, unknown>; hash: string } {
+  if (
+    typeof input.disclosureVersion !== "string" ||
+    input.disclosureVersion.trim().length === 0 ||
+    !isRecord(input.disclosureContent) ||
+    !isRecord(input.permittedFees) ||
+    typeof input.disclosureHash !== "string" ||
+    !/^[0-9a-f]{64}$/.test(input.disclosureHash)
+  ) {
+    throw new AppError(403, "DISCLOSURE_REQUIRED", "A versioned disclosure and structured fee policy are required.");
+  }
+  const expectedHash = hashPayload({
+    version: input.disclosureVersion,
+    content: input.disclosureContent,
+  });
+  if (expectedHash !== input.disclosureHash) {
+    throw new AppError(403, "DISCLOSURE_INVALID", "The disclosure hash does not match its content.");
+  }
+  return {
+    version: input.disclosureVersion,
+    content: input.disclosureContent,
+    hash: input.disclosureHash,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function serializeTerms(input: {
   applicationId: string;
   rule: Awaited<ReturnType<ProductService["getEffectiveRule"]>>;
@@ -359,6 +416,8 @@ function serializeTerms(input: {
   expiresAt: string;
   fixtureHash: string;
   exceptionId: string | null;
+  disclosureContent: Record<string, unknown>;
+  disclosureHash: string;
 }): Record<string, unknown> {
   return {
     applicationId: input.applicationId,
@@ -374,6 +433,8 @@ function serializeTerms(input: {
     rateBasisPoints: input.rule.annualRateBps,
     fees: input.rule.permittedFees,
     disclosureVersion: input.rule.disclosureVersion,
+    disclosureContent: input.disclosureContent,
+    disclosureHash: input.disclosureHash,
     fixtureHash: input.fixtureHash,
     exceptionId: input.exceptionId,
     principalMinor: input.quote.principalMinor.toString(),

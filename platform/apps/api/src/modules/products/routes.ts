@@ -12,6 +12,11 @@ import type { ExceptionService } from "./exception-service.js";
 import type { OfferService } from "./offer-service.js";
 import type { ProductService } from "./service.js";
 import { serializeExceptionDto, serializeOfferDto, serializeRuleDto } from "./dto.js";
+import type { StaffRole } from "../access/policy.js";
+import { AppError } from "../../plugins/errors.js";
+
+const productRoles: readonly StaffRole[] = ["PRODUCT_ADMIN"];
+const exceptionRoles: readonly StaffRole[] = ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"];
 
 const uuid = { type: "string", format: "uuid" } as const;
 const idempotency = { type: "string", minLength: 8, maxLength: 128 } as const;
@@ -54,12 +59,16 @@ export async function registerProductRoutes(
   app.get(
     "/v1/staff/products/rule-versions",
     { preHandler: authenticateStaff },
-    async (_request, reply) => reply.send((await products.listRules()).map(serializeRuleDto)),
+    async (request, reply) => {
+      requireStaffRole(request, productRoles);
+      return reply.send((await products.listRules()).map(serializeRuleDto));
+    },
   );
   app.get<{ Params: { ruleId: string } }>(
     "/v1/staff/products/rule-versions/:ruleId",
     { schema: { params: ruleParams }, preHandler: authenticateStaff },
     async (request, reply) => {
+      requireStaffRole(request, productRoles);
       const rule = (await products.listRules()).find((item) => item.id === request.params.ruleId);
       return rule === undefined
         ? reply.code(404).send({ code: "RULE_NOT_FOUND", detail: "Rule not found." })
@@ -69,12 +78,16 @@ export async function registerProductRoutes(
   app.get(
     "/v1/staff/exceptions",
     { preHandler: authenticateStaff },
-    async (_request, reply) => reply.send((await exceptions.list()).map(serializeExceptionDto)),
+    async (request, reply) => {
+      requireStaffRole(request, exceptionRoles);
+      return reply.send((await exceptions.list()).map(serializeExceptionDto));
+    },
   );
   app.get<{ Params: { exceptionId: string } }>(
     "/v1/staff/exceptions/:exceptionId",
     { schema: { params: exceptionParams }, preHandler: authenticateStaff },
     async (request, reply) => {
+      requireStaffRole(request, exceptionRoles);
       const exception = await exceptions.find(request.params.exceptionId);
       return exception === null
         ? reply.code(404).send({ code: "EXCEPTION_NOT_FOUND", detail: "Exception not found." })
@@ -96,6 +109,8 @@ export async function registerProductRoutes(
       requiredEvidence?: string[];
       exceptionPolicy?: Record<string, unknown>;
       disclosureVersion?: string;
+      disclosureContent?: Record<string, unknown>;
+      disclosureHash?: string;
       fixtureHashes?: string[];
       licencePermitted?: boolean;
     };
@@ -134,6 +149,8 @@ export async function registerProductRoutes(
             requiredEvidence: { type: "array", items: { type: "string" } },
             exceptionPolicy: { type: "object" },
             disclosureVersion: { type: "string", minLength: 1, maxLength: 128 },
+            disclosureContent: { type: "object" },
+            disclosureHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
             fixtureHashes: { type: "array", items: { type: "string", pattern: "^[0-9a-f]{64}$" } },
             licencePermitted: { type: "boolean" },
           },
@@ -142,7 +159,7 @@ export async function registerProductRoutes(
       preHandler: staffMutation,
     },
     async (request, reply) => {
-      const actor = requireStaffPrincipal(request);
+      const actor = requireStaffRole(request, productRoles);
       const created = await products.createRuleVersion({
         ...request.body,
         productId: request.params.productId,
@@ -179,7 +196,7 @@ export async function registerProductRoutes(
         serializeRuleDto(await products.publishRuleVersion({
           ...request.body,
           ruleId: request.params.ruleId,
-          actor: requireStaffPrincipal(request),
+          actor: requireStaffRole(request, productRoles),
           requestId: request.id,
         })),
       ),
@@ -239,9 +256,9 @@ export async function registerProductRoutes(
         serializeExceptionDto(await exceptions.request({
           ...request.body,
           applicationId: request.params.applicationId,
-          actor: requireStaffPrincipal(request),
+          actor: requireStaffRole(request, exceptionRoles),
           requestId: request.id,
-        })),
+        } as unknown as Parameters<ExceptionService["request"]>[0])),
       ),
   );
 
@@ -272,7 +289,7 @@ export async function registerProductRoutes(
         serializeExceptionDto(await exceptions.decide({
           ...request.body,
           exceptionId: request.params.exceptionId,
-          actor: requireStaffPrincipal(request),
+          actor: requireStaffRole(request, exceptionRoles),
           requestId: request.id,
         })),
       ),
@@ -335,7 +352,7 @@ export async function registerProductRoutes(
   );
   app.post<{
     Params: { offerId: string };
-    Body: { expectedVersion: number; consentAt: string; idempotencyKey: string };
+    Body: { consent: boolean; expectedVersion: number; consentAt: string; disclosedVersion: string; disclosedHash: string; idempotencyKey: string };
   }>(
     "/v1/customer/offers/:offerId/accept",
     {
@@ -344,10 +361,13 @@ export async function registerProductRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["expectedVersion", "consentAt", "idempotencyKey"],
+          required: ["consent", "expectedVersion", "consentAt", "disclosedVersion", "disclosedHash", "idempotencyKey"],
           properties: {
+            consent: { type: "boolean", const: true },
             expectedVersion: { type: "integer", minimum: 1 },
             consentAt: { type: "string", format: "date-time" },
+            disclosedVersion: { type: "string", minLength: 1, maxLength: 128 },
+            disclosedHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
             idempotencyKey: idempotency,
           },
         },
@@ -364,4 +384,15 @@ export async function registerProductRoutes(
         })),
       ),
   );
+}
+
+function requireStaffRole(
+  request: Parameters<typeof requireStaffPrincipal>[0],
+  roles: readonly StaffRole[],
+) {
+  const principal = requireStaffPrincipal(request);
+  if (!principal.roles.some((role) => roles.includes(role))) {
+    throw new AppError(403, "FORBIDDEN", "This financing control is not permitted for the staff role.");
+  }
+  return principal;
 }

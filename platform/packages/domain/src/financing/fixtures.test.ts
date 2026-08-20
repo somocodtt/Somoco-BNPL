@@ -3,6 +3,7 @@ import {
   FinanceApprovalGate,
   canonicalizeJson,
   hashWorkedExample,
+  isTrustedFinanceApprovalGate,
   type WorkedExampleFixture,
 } from "./fixtures.js";
 
@@ -29,6 +30,7 @@ describe("finance fixture provenance and canonicalization", () => {
 
     expect(canonicalizeJson({ b: 1, a: 2 })).toBe('{"a":2,"b":1}');
     expect(canonicalizeJson({ "2": "two", "10": "ten" })).toBe('{"10":"ten","2":"two"}');
+    expect(canonicalizeJson(unsigned.workedExample)).toBe('{"𐀀":1,"":2}');
     expect(registered).not.toBeNull();
     expect(Object.isFrozen(registered)).toBe(true);
     expect(Object.isFrozen(registered!.workedExample)).toBe(true);
@@ -62,5 +64,21 @@ describe("finance fixture provenance and canonicalization", () => {
     expect(() => FinanceApprovalGate.production([{ ...fixture, synthetic: false }])).toThrow(
       "PRODUCTION_FIXTURE_ATTESTATION_REQUIRED",
     );
+  });
+
+  it("rejects runtime constructor, prototype, and plain-object gate forgeries", () => {
+    const RuntimeConstructor = FinanceApprovalGate as unknown as new (
+      fixtures: readonly WorkedExampleFixture[],
+      production: boolean,
+    ) => FinanceApprovalGate;
+    expect(() => new RuntimeConstructor([], false)).toThrow("FINANCE_GATE_BRAND_INVALID");
+    expect(isTrustedFinanceApprovalGate(Object.create(FinanceApprovalGate.prototype))).toBe(false);
+    expect(isTrustedFinanceApprovalGate({ isProduction: true })).toBe(false);
+  });
+
+  it("rejects non-finite and non-JSON values instead of hashing ambiguous terms", () => {
+    expect(() => canonicalizeJson({ amount: Number.NaN })).toThrow("CANONICAL_JSON_VALUE_INVALID");
+    expect(() => canonicalizeJson({ amount: Number.POSITIVE_INFINITY })).toThrow("CANONICAL_JSON_VALUE_INVALID");
+    expect(() => canonicalizeJson({ amount: BigInt(1) })).toThrow("CANONICAL_JSON_VALUE_INVALID");
   });
 });

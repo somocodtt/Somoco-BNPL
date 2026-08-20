@@ -328,42 +328,59 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
 
   async accept(
     offerId: string,
-    input: { consent: boolean; consentAt: string; expectedVersion?: number },
+    input: { consent: boolean; consentAt: string; expectedVersion?: number; disclosedVersion: string; disclosedHash: string },
   ): Promise<CustomerOffer> {
     if (!input.consent) throw new Error("CONSENT_REQUIRED");
     const expectedVersion = input.expectedVersion ?? this.#offerVersions.get(offerId);
     if (expectedVersion === undefined) throw new Error("OFFER_VERSION_REQUIRED");
     const result = await this.request<Record<string, unknown>>(
       `/v1/customer/offers/${encodeURIComponent(offerId)}/accept`,
-      { method: "POST", body: JSON.stringify({ expectedVersion, consentAt: input.consentAt, idempotencyKey: crypto.randomUUID() }) },
+      { method: "POST", body: JSON.stringify({ consent: true, expectedVersion, consentAt: input.consentAt, disclosedVersion: input.disclosedVersion, disclosedHash: input.disclosedHash, idempotencyKey: crypto.randomUUID() }) },
     );
     return this.mapOffer(result);
   }
 
   private mapOffer(value: Record<string, unknown>): CustomerOffer {
-    const installments = Array.isArray(value.installments) ? value.installments : [];
+    if (!isRecord(value)) throw malformedOffer();
+    const id = requiredString(value.id ?? value.offerId, "id");
+    const status = requiredStatus(value.status);
+    const version = requiredInteger(value.version, "version", 1);
+    const expiresAt = requiredDate(value.expiresAt, "expiresAt");
+    const priceMinor = requiredMoney(value.priceMinor, "priceMinor");
+    const depositMinor = requiredMoney(value.depositMinor, "depositMinor");
+    const totalPayableMinor = requiredMoney(value.totalPayableMinor, "totalPayableMinor");
+    const financeChargeMinor = requiredMoney(value.financeChargeMinor, "financeChargeMinor");
+    const frequency = value.frequency === "WEEKLY" || value.frequency === "MONTHLY" ? value.frequency : malformedOffer();
+    const tenureMonths = requiredTenure(value.tenureMonths);
+    const disclosureVersion = requiredString(value.disclosureVersion, "disclosureVersion");
+    const disclosedHash = requiredHash(value.disclosedHash, "disclosedHash");
+    const disclosureContent = isRecord(value.disclosureContent) ? value.disclosureContent : malformedOffer();
+    const fees = isRecord(value.fees) ? value.fees : malformedOffer();
+    if (!Array.isArray(value.installments) || value.installments.length === 0) throw malformedOffer();
+    const installments = value.installments.map((item) => {
+      if (!isRecord(item)) throw malformedOffer();
+      return {
+        sequence: requiredInteger(item.sequence, "installment.sequence", 1),
+        dueDate: requiredDateOnly(item.dueDate, "installment.dueDate"),
+        totalMinor: requiredMoney(item.totalMinor, "installment.totalMinor"),
+      };
+    });
     const offer: CustomerOffer = {
-      id: stringValue(value.id) ?? stringValue(value.offerId) ?? "",
-      version: numberValue(value.version) ?? 1,
-      status: statusValue(value.status),
-      expiresAt: stringValue(value.expiresAt) ?? "",
-      priceMinor: moneyValue(value.priceMinor),
-      depositMinor: moneyValue(value.depositMinor),
-      frequency: value.frequency === "WEEKLY" ? "WEEKLY" : "MONTHLY",
-      tenureMonths: tenureValue(value.tenureMonths),
-      totalPayableMinor: moneyValue(value.totalPayableMinor),
-      financeChargeMinor: moneyValue(value.financeChargeMinor),
-      installments: installments.map((item) => {
-        const row = (item ?? {}) as Record<string, unknown>;
-        return {
-          sequence: numberValue(row.sequence) ?? 0,
-          dueDate: stringValue(row.dueDate) ?? "",
-          totalMinor: moneyValue(row.totalMinor),
-        };
-      }),
-      disclosureVersion: stringValue(value.disclosureVersion),
-      fees: isRecord(value.fees) ? value.fees : {},
-      disclosedHash: stringValue(value.disclosedHash),
+      id,
+      version,
+      status,
+      expiresAt,
+      priceMinor,
+      depositMinor,
+      frequency,
+      tenureMonths,
+      totalPayableMinor,
+      financeChargeMinor,
+      installments,
+      disclosureVersion,
+      disclosureContent,
+      fees,
+      disclosedHash,
     };
     this.#offerVersions.set(offer.id, offer.version);
     return offer;
@@ -392,24 +409,56 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
   }
 }
 
-function stringValue(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
+export class CustomerApiError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+  }
 }
 
-function moneyValue(value: unknown): string {
-  return typeof value === "string" && /^\d+$/.test(value) ? value : "0";
+function malformedOffer(field = "offer"): never {
+  throw new CustomerApiError("MALFORMED_OFFER_DTO", `The financing offer ${field} is invalid.`);
 }
 
-function numberValue(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) return malformedOffer(field);
+  return value;
 }
 
-function tenureValue(value: unknown): CustomerOffer["tenureMonths"] {
-  return value === 8 || value === 12 || value === 24 || value === 36 || value === 48 ? value : 6;
+function requiredMoney(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return malformedOffer(field);
+  return value;
 }
 
-function statusValue(value: unknown): CustomerOffer["status"] {
-  return value === "EXPIRED" || value === "ACCEPTED" || value === "CANCELLED" ? value : "PENDING";
+function requiredHash(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) return malformedOffer(field);
+  return value;
+}
+
+function requiredInteger(value: unknown, field: string, minimum: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) return malformedOffer(field);
+  return value;
+}
+
+function requiredDate(value: unknown, field: string): string {
+  const result = requiredString(value, field);
+  if (!Number.isFinite(Date.parse(result))) return malformedOffer(field);
+  return result;
+}
+
+function requiredDateOnly(value: unknown, field: string): string {
+  const result = requiredString(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(result) || !Number.isFinite(Date.parse(`${result}T00:00:00Z`))) return malformedOffer(field);
+  return result;
+}
+
+function requiredTenure(value: unknown): CustomerOffer["tenureMonths"] {
+  if (value === 6 || value === 8 || value === 12 || value === 24 || value === 36 || value === 48) return value;
+  return malformedOffer();
+}
+
+function requiredStatus(value: unknown): CustomerOffer["status"] {
+  if (value === "PENDING" || value === "EXPIRED" || value === "ACCEPTED" || value === "CANCELLED") return value;
+  return malformedOffer();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

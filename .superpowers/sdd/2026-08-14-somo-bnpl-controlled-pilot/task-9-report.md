@@ -48,3 +48,27 @@ The first controller run after the seed fix reached assertions and reported 5/5 
 Reviewer-hardening production changes include explicit product/offer/exception DTO mapping on routes, staff list/read endpoints, atomic command reservation with actor binding, product-row publish serialization, transaction-time offer-version locking and exact accepted hash, exact exception rule/field/value binding, rate/database upper bounds, disclosed offer version/hash persistence, and migration `0011_financing_binding.sql`. The fresh/repeat migration journal is now 12 entries, and the populated 0009 fixture applies 0010 then 0011. No dependency or commercial fixture changes were made. The focused real-PostgreSQL API and migration GREEN counts remain controller-owned because `TEST_DATABASE_URL` is not configured in this worktree.
 
 The real-PG suite now also includes concurrent same-window publishes (one winner/one bounded rejection), concurrent offer creation with one atomic idempotency command and replay, and explicit binding fields for exception bypasses. The API TypeScript check including these tests passes; assertion-level results remain pending the controller database run.
+
+## Reviewer-hardening round 2 — trust boundaries
+
+| Boundary | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Domain canonical/gate | `vitest run src/financing/fixtures.test.ts` initially failed 2/3: JCS UTF-16 ordering and runtime constructor forgery. | Same focused file passes 4/4: RFC-8785-compatible key ordering vector, non-finite/unsupported rejection, deep freeze, and WeakSet/token gate brand checks. |
+| API DTO/validation/exception | DTO test failed on missing explicit rule status/disclosure fields; disclosure validation reached the DB capability guard; strict exception tests reached the DB capability guard (2 failures). | Focused API command passes 6/6 across DTO, product disclosure/rate/fee validation, and strict discriminated exception binding. |
+| Customer adapter/UI | Adapter test failed because acceptance omitted affirmative consent; malformed DTO test exposed zero/default behavior. | Customer focused adapter + offer panel passes 7/7; acceptance sends consent plus disclosed version/hash, validates exact money/status/schedule/disclosures, and accepted offers remain accepted after expiry. |
+| Staff adapter/UI | Workspace tests failed on structured values, non-pending actions, and non-product-admin publish controls; adapter accepted malformed rule lists. | Staff focused adapter + workspace passes 6/6; list mapping rejects malformed DTOs, publish is PRODUCT_ADMIN-only, only pending exceptions have actions, and values render as JSON. |
+| Static verification | — | Direct no-emit TypeScript passes for domain, db, api, customer-web, and staff-web; `git diff --check` passes with only Git line-ending warnings. |
+
+### Persistence and HTTP hardening
+
+- Added additive migration `0012_financing_disclosures.sql` for versioned disclosure content/hash and the exception value-type check. The complete-journal test now expects 13 entries and the populated 0009 fixture applies 0010, 0011, and 0012, asserting legacy disclosure columns remain nullable. Fresh/repeat/populated PostgreSQL execution remains controller-owned because this shell has no `TEST_DATABASE_URL`.
+- Rule DTOs now expose explicit persisted-state status and trusted gate status. Product list/read/publish routes require `PRODUCT_ADMIN`; exception routes require configured exception roles, while service-level checker/requester separation remains authoritative.
+- Offer creation and acceptance fail closed without actual disclosure content/hash and structured fees. Acceptance locks and re-reads the pending offer version inside the transaction, binds the exact canonical offer hash plus actor/consent/disclosed version/hash in the atomic command payload, and stores audit/outbox evidence.
+- Exception requests are a strict amount/frequency/tenure union. Irrelevant fields are rejected, typed values are normalized and persisted, and approved-exception lookup matches rule, field, type, and exact policy/proposed values.
+- Customer HTTP DTOs whitelist public terms and exclude fixture hashes, exception IDs, internal rule IDs, raw terms, and bigint values. No commercial fees or signed production fixtures were invented; production fixture gating remains closed.
+
+### Closeout checks
+
+- Final focused non-PG counts: domain 4/4, API 6/6, customer 7/7, staff 6/6.
+- Final no-emit TypeScript and package builds passed for domain, db, api, customer-web, and staff-web. API/db/customer/staff lint passed; the pre-existing domain-wide lint command still reports unrelated `schedule.ts` unused-import/prefer-const errors, while the changed fixture files lint clean. Staff's package script references a non-existent `test` directory, so its equivalent `eslint src` check passed.
+- `git diff --check` passed with only Git LF/CRLF warnings. Real-PG products/HTTP and fresh/repeat/populated migration execution was not possible here because `TEST_DATABASE_URL` is absent; controller verification is required before deployment.

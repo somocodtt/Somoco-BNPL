@@ -23,6 +23,15 @@ describe("staff financing API adapter", () => {
       expect.objectContaining({ body: expect.stringContaining("effectiveFrom") }),
     );
   });
+
+  it("rejects malformed financing control lists instead of fabricating gate state", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ csrfToken: "csrf-1", staffUserId: "staff-1", roles: ["PRODUCT_ADMIN"] }))
+      .mockResolvedValueOnce(jsonResponse([{ id: "rule-1", status: "PUBLISHED" }]));
+    const api = new FetchStaffApi("", fetcher);
+    await api.login({ email: "staff@example.test", password: "password", mfaAssertion: "valid" });
+    await expect(api.listRules()).rejects.toMatchObject({ code: "MALFORMED_RULE_LIST" });
+  });
 });
 
 function jsonResponse(body: unknown): Response {

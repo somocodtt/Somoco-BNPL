@@ -35,6 +35,8 @@ export interface FinancingRuleRecord {
   requiredEvidence: string[];
   exceptionPolicy: Record<string, unknown>;
   disclosureVersion: string | null;
+  disclosureContent?: Record<string, unknown> | null;
+  disclosureHash?: string | null;
   fixtureHashes: string[];
   licencePermitted: boolean;
   approved: boolean;
@@ -44,6 +46,7 @@ export interface FinancingRuleRecord {
   effectiveFrom: Date | null;
   effectiveUntil: Date | null;
   publishedAt: Date | null;
+  gateStatus?: "OPEN" | "CLOSED";
 }
 
 export interface ExceptionRecord {
@@ -188,6 +191,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       requiredEvidence: readonly string[];
       exceptionPolicy: Record<string, unknown>;
       disclosureVersion?: string;
+      disclosureContent?: Record<string, unknown>;
+      disclosureHash?: string;
       fixtureHashes: readonly string[];
       licencePermitted: boolean;
       requestedBy: string;
@@ -203,7 +208,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
            minimum_deposit_minor_units, annual_rate_bps, allowed_tenures_months,
            repayment_frequencies, calculation_method, permitted_fees,
            eligibility_policy, required_evidence, exception_policy,
-           disclosure_version, fixture_hashes, licence_permitted, requested_by,
+           disclosure_version, disclosure_content, disclosure_hash, fixture_hashes,
+           licence_permitted, requested_by,
            effective_from, effective_until)
         values (
           ${input.id}::uuid, ${input.productId}::uuid, ${input.versionNumber},
@@ -212,7 +218,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
           ${JSON.stringify(input.repaymentFrequencies)}::jsonb, ${input.calculationMethod},
           ${input.permittedFees}::jsonb, ${input.eligibilityPolicy}::jsonb,
           ${JSON.stringify(input.requiredEvidence)}::jsonb, ${input.exceptionPolicy}::jsonb,
-          ${input.disclosureVersion ?? null}, ${JSON.stringify(input.fixtureHashes)}::jsonb,
+          ${input.disclosureVersion ?? null}, ${input.disclosureContent ?? null}::jsonb,
+          ${input.disclosureHash ?? null}, ${JSON.stringify(input.fixtureHashes)}::jsonb,
           ${input.licencePermitted}, ${input.requestedBy}::uuid,
           ${input.effectiveFrom ?? null}, ${input.effectiveUntil ?? null}
         )
@@ -266,7 +273,8 @@ export function financingRepo(db: Database | DatabaseTransaction) {
                    rule.repayment_frequencies, rule.calculation_method,
                    rule.permitted_fees, rule.eligibility_policy,
                    rule.required_evidence, rule.exception_policy,
-                   rule.disclosure_version, rule.fixture_hashes,
+                   rule.disclosure_version, rule.disclosure_content,
+                   rule.disclosure_hash, rule.fixture_hashes,
                    rule.licence_permitted, rule.approved, rule.requested_by,
                    rule.approved_by, rule.approved_at, rule.effective_from,
                    rule.effective_until, rule.published_at,
@@ -417,6 +425,7 @@ export function financingRepo(db: Database | DatabaseTransaction) {
       binding?: {
         ruleVersionId?: string;
         field?: string;
+        valueType?: "AMOUNT" | "FREQUENCY" | "TENURE";
         proposedAmountMinor?: bigint;
         policyAmountMinor?: bigint;
         proposedFrequency?: string;
@@ -438,6 +447,7 @@ export function financingRepo(db: Database | DatabaseTransaction) {
            and (expires_at is null or expires_at > ${now})
            and (${binding?.ruleVersionId ?? null}::uuid is null or rule_version_id = ${binding?.ruleVersionId ?? null}::uuid)
            and (${binding?.field ?? null}::text is null or exception_field = ${binding?.field ?? null})
+           and (${binding?.valueType ?? null}::text is null or value_type = ${binding?.valueType ?? null})
            and (${binding?.proposedAmountMinor ?? null}::bigint is null or proposed_amount_minor = ${binding?.proposedAmountMinor ?? null}::bigint)
            and (${binding?.policyAmountMinor ?? null}::bigint is null or policy_amount_minor = ${binding?.policyAmountMinor ?? null}::bigint)
            and (${binding?.proposedFrequency ?? null}::text is null or proposed_frequency = ${binding?.proposedFrequency ?? null})
@@ -527,6 +537,27 @@ export function financingRepo(db: Database | DatabaseTransaction) {
          where o.id = ${offerId}::uuid
          order by ov.version_number desc nulls last
          limit 1
+      `);
+      return result.rows[0] === undefined ? null : mapOffer(result.rows[0]);
+    },
+
+    async lockOffer(offerId: string): Promise<OfferRecord | null> {
+      const result = await executor.execute<OfferRow>(sql`
+        select o.id, o.application_id, o.status, o.version,
+               o.accepted_version_id, o.accepted_at, o.accepted_hash,
+               o.consent_at, o.expires_at, o.accepted_by_person_id,
+               o.disclosed_version, o.disclosed_hash,
+               ov.id as offer_version_id, ov.version_number,
+               ov.financing_rule_version_id, ov.principal_minor_units,
+               ov.deposit_minor_units, ov.total_payable_minor_units,
+               ov.terms, ov.canonical_hash
+          from offer o
+          join offer_version ov on ov.id = o.accepted_version_id
+             or (ov.offer_id = o.id and ov.version_number = o.version)
+         where o.id = ${offerId}::uuid
+         order by ov.version_number desc nulls last
+         limit 1
+         for update of o, ov
       `);
       return result.rows[0] === undefined ? null : mapOffer(result.rows[0]);
     },
@@ -628,7 +659,8 @@ const ruleSelectBase = sql`
          rule.repayment_frequencies, rule.calculation_method,
          rule.permitted_fees, rule.eligibility_policy,
          rule.required_evidence, rule.exception_policy,
-         rule.disclosure_version, rule.fixture_hashes,
+         rule.disclosure_version, rule.disclosure_content,
+         rule.disclosure_hash, rule.fixture_hashes,
          rule.licence_permitted, rule.approved, rule.requested_by,
          rule.approved_by, rule.approved_at, rule.effective_from,
          rule.effective_until, rule.published_at,
@@ -671,6 +703,8 @@ interface RuleRow extends Record<string, unknown> {
   required_evidence: string[];
   exception_policy: Record<string, unknown>;
   disclosure_version: string | null;
+  disclosure_content: Record<string, unknown> | null;
+  disclosure_hash: string | null;
   fixture_hashes: string[];
   licence_permitted: boolean;
   approved: boolean;
@@ -765,6 +799,8 @@ function mapRule(row: RuleRow): FinancingRuleRecord {
     requiredEvidence: row.required_evidence,
     exceptionPolicy: row.exception_policy,
     disclosureVersion: row.disclosure_version,
+    disclosureContent: row.disclosure_content,
+    disclosureHash: row.disclosure_hash,
     fixtureHashes: row.fixture_hashes,
     licencePermitted: row.licence_permitted,
     approved: row.approved,

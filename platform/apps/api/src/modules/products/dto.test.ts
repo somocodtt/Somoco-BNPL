@@ -21,6 +21,8 @@ describe("financing HTTP DTOs", () => {
       requiredEvidence: [],
       exceptionPolicy: {},
       disclosureVersion: "test-disclosure-v1",
+      disclosureContent: { version: "test-disclosure-v1", body: "Synthetic test disclosure" },
+      disclosureHash: "c".repeat(64),
       fixtureHashes: ["a".repeat(64)],
       licencePermitted: true,
       approved: true,
@@ -30,6 +32,7 @@ describe("financing HTTP DTOs", () => {
       effectiveFrom: new Date("2026-08-20T00:00:00.000Z"),
       effectiveUntil: null,
       publishedAt: new Date("2026-08-20T00:00:01.000Z"),
+      gateStatus: "OPEN",
     });
     const offer = serializeOfferDto({
       id: "offer-1",
@@ -57,12 +60,25 @@ describe("financing HTTP DTOs", () => {
           totalPayableMinor: "77000",
           fees: {},
           disclosureVersion: "test-disclosure-v1",
+          disclosureContent: { version: "test-disclosure-v1", body: "Synthetic test disclosure" },
+          disclosureHash: "c".repeat(64),
+          ruleVersionId: "rule-1",
+          fixtureHash: "d".repeat(64),
+          exceptionId: "exception-1",
+          acceptedHash: "e".repeat(64),
           installments: [{ sequence: 1, dueDate: "2026-09-01", totalMinor: "38500" }],
         },
       },
     });
 
-    expect(rule).toMatchObject({ sellingPriceMinor: "100000", minimumDepositMinor: "30000" });
+    expect(rule).toMatchObject({
+      sellingPriceMinor: "100000",
+      minimumDepositMinor: "30000",
+      status: "PUBLISHED",
+      gate: "OPEN",
+      disclosureContent: { body: "Synthetic test disclosure" },
+      disclosureHash: "c".repeat(64),
+    });
     expect(offer).toMatchObject({
       priceMinor: "100000",
       depositMinor: "30000",
@@ -71,7 +87,13 @@ describe("financing HTTP DTOs", () => {
       installments: [{ totalMinor: "38500" }],
       fees: {},
       disclosureVersion: "test-disclosure-v1",
+      disclosureContent: { body: "Synthetic test disclosure" },
     });
+    expect(offer).not.toHaveProperty("terms");
+    expect(offer).not.toHaveProperty("fixtureHash");
+    expect(offer).not.toHaveProperty("exceptionId");
+    expect(offer).not.toHaveProperty("ruleVersionId");
+    expect(offer).not.toHaveProperty("acceptedHash");
     expect(JSON.stringify(rule)).not.toContain("BigInt");
     expect(() => JSON.stringify(offer)).not.toThrow();
   });

@@ -40,6 +40,43 @@ describe("staff product workspace", () => {
     expect(api.decideException).toHaveBeenCalledWith("exception-1", expect.objectContaining({ expectedVersion: 1 }));
     expect(await screen.findByText("Refresh the exception before deciding.")).toBeVisible();
   });
+
+  it("only enables pending exception actions and renders structured values", async () => {
+    const api = fakeApi();
+    api.listRules.mockResolvedValueOnce([]);
+    api.listExceptions.mockResolvedValueOnce([
+      {
+        id: "exception-approved",
+        status: "APPROVED",
+        requestedBy: "maker-1",
+        requiredApproverRole: "CFO",
+        proposedValue: { minimumDepositMinor: "10000" },
+        policyValue: { minimumDepositMinor: "30000" },
+        reason: "Already approved",
+        version: 2,
+      },
+    ]);
+    render(<ProductWorkspace api={api} actorId="cfo-1" roles={["CFO"]} />);
+    expect(await screen.findByText(/minimumDepositMinor.*10000/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Approve exception" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject exception" })).toBeNull();
+  });
+
+  it("keeps publishing restricted to product administrators", async () => {
+    const api = fakeApi();
+    api.listRules.mockResolvedValueOnce([
+      {
+        id: "rule-open",
+        versionNumber: 1,
+        status: "DRAFT",
+        requestedBy: "maker-1",
+        effectiveFrom: null,
+        gate: "OPEN",
+      },
+    ]);
+    render(<ProductWorkspace api={api} actorId="checker-1" roles={["CFO"]} />);
+    expect(await screen.findByRole("button", { name: "Publish rule version" })).toBeDisabled();
+  });
 });
 
 function fakeApi(): ProductApi & {

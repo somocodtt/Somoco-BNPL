@@ -398,6 +398,10 @@ export const exceptionRequest = pgTable(
       sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,
     ),
     check(
+      "exception_request_value_type_allowed",
+      sql`${table.valueType} is null or ${table.valueType} in ('AMOUNT', 'FREQUENCY', 'TENURE')`,
+    ),
+    check(
       "exception_request_decision_consistent",
       sql`${table.status} <> 'PENDING' or (${table.decidedBy} is null and ${table.decidedAt} is null)`,
     ),

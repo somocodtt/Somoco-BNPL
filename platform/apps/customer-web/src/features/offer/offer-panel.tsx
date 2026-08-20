@@ -16,16 +16,17 @@ export interface CustomerOffer {
     dueDate: string;
     totalMinor: string;
   }[];
-  disclosureVersion: string | null;
+  disclosureVersion: string;
+  disclosureContent: Record<string, unknown>;
   fees: Record<string, unknown>;
-  disclosedHash?: string | null;
+  disclosedHash: string;
 }
 
 export interface OfferApi {
   get(applicationId: string): Promise<CustomerOffer | null>;
   accept(
     offerId: string,
-    input: { consent: boolean; consentAt: string; expectedVersion?: number },
+    input: { consent: boolean; consentAt: string; expectedVersion?: number; disclosedVersion: string; disclosedHash: string },
   ): Promise<CustomerOffer>;
 }
 
@@ -127,7 +128,8 @@ export function OfferPanel({
           </li>
         ))}
       </ol>
-      <p>Disclosure version: {offer.disclosureVersion ?? "Not supplied"}</p>
+      <p>Disclosure version: {offer.disclosureVersion}</p>
+      <pre aria-label="Financing disclosures">{JSON.stringify(offer.disclosureContent, null, 2)}</pre>
       {Object.keys(offer.fees).length > 0 ? (
         <section aria-labelledby="offer-fees-title">
           <h2 id="offer-fees-title">Fees</h2>
@@ -146,7 +148,13 @@ export function OfferPanel({
             setAccepting(true);
             setAcceptError("");
             void api
-              .accept(offer.id, { consent: true, consentAt: new Date().toISOString(), expectedVersion: offer.version })
+              .accept(offer.id, {
+                consent: true,
+                consentAt: new Date().toISOString(),
+                expectedVersion: offer.version,
+                disclosedVersion: offer.disclosureVersion,
+                disclosedHash: offer.disclosedHash,
+              })
               .then((result) => {
                 setOffer(result);
                 setAccepted(true);

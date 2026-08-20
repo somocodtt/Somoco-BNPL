@@ -126,6 +126,9 @@ export const financingRuleVersion = pgTable(
       .notNull()
       .default({}),
     disclosureVersion: text("disclosure_version"),
+    disclosureContent: jsonb("disclosure_content")
+      .$type<Record<string, unknown>>(),
+    disclosureHash: text("disclosure_hash"),
     fixtureHashes: jsonb("fixture_hashes")
       .$type<string[]>()
       .notNull()

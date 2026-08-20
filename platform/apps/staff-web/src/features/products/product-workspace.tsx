@@ -90,6 +90,7 @@ export function ProductWorkspace({
             {rules.map((rule) => {
               const requester = rule.requestedBy === null ? "unknown maker" : rule.requestedBy;
               const canPublish =
+                (roles === undefined || roles.includes("PRODUCT_ADMIN")) &&
                 rule.status === "DRAFT" &&
                 rule.gate === "OPEN" &&
                 rule.requestedBy !== actorId;
@@ -135,23 +136,28 @@ export function ProductWorkspace({
               return (
                 <li key={exception.id}>
                   <strong>{exception.reason}</strong>
+                  <span>Status: {exception.status}</span>
                   <span>Required authority: {exception.requiredApproverRole}</span>
-                  <span>Proposed value: {String(exception.proposedValue)}</span>
-                  <span>Policy value: {String(exception.policyValue)}</span>
-                  <button
-                    type="button"
-                    disabled={requester || !authorized}
-                    onClick={() => decide(exception, "APPROVE")}
-                  >
-                    Approve exception
-                  </button>
-                  <button
-                    type="button"
-                    disabled={requester || !authorized}
-                    onClick={() => decide(exception, "REJECT")}
-                  >
-                    Reject exception
-                  </button>
+                  <span>Proposed value: {formatStructured(exception.proposedValue)}</span>
+                  <span>Policy value: {formatStructured(exception.policyValue)}</span>
+                  {exception.status === "PENDING" ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={requester || !authorized}
+                        onClick={() => decide(exception, "APPROVE")}
+                      >
+                        Approve exception
+                      </button>
+                      <button
+                        type="button"
+                        disabled={requester || !authorized}
+                        onClick={() => decide(exception, "REJECT")}
+                      >
+                        Reject exception
+                      </button>
+                    </>
+                  ) : null}
                 </li>
               );
             })}
@@ -184,5 +190,14 @@ export function ProductWorkspace({
             : "The exception could not be decided.",
         );
       });
+  }
+}
+
+function formatStructured(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "Unavailable";
   }
 }

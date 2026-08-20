@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   createDatabase,
@@ -9,6 +9,7 @@ import {
 } from "@somo/db";
 import {
   FinanceApprovalGate,
+  canonicalizeJson,
   hashWorkedExample,
   type WorkedExampleFixture,
 } from "@somo/domain/src/index.js";
@@ -164,10 +165,6 @@ describe("controlled financing API against PostgreSQL", () => {
       valueType: "AMOUNT",
       proposedAmountMinor: "10000",
       policyAmountMinor: "30000",
-      proposedFrequency: "MONTHLY",
-      policyFrequency: "MONTHLY",
-      proposedTenureMonths: 6,
-      policyTenureMonths: 6,
       reason: "Documented pilot hardship review.",
       requiredApproverRole: "PRODUCT_ADMIN",
       idempotencyKey: randomUUID(),
@@ -197,6 +194,9 @@ describe("controlled financing API against PostgreSQL", () => {
     expect(approved.status).toBe("APPROVED");
     await expect(offers.create({ ...baseOffer, idempotencyKey: randomUUID() })).resolves.toMatchObject({
       status: "PENDING",
+    });
+    await expect(offers.create({ ...baseOffer, depositMinor: "9000", idempotencyKey: randomUUID() })).rejects.toMatchObject({
+      code: "MINIMUM_DEPOSIT_REQUIRED",
     });
     await expect(
       exceptions.decide({
@@ -241,15 +241,30 @@ describe("controlled financing API against PostgreSQL", () => {
     });
     expect(replay.id).toBe(first.id);
 
+    const acceptIdempotencyKey = randomUUID();
     const accepted = await offers.accept({
       offerId: first.id,
       expectedVersion: 1,
+      consent: true,
       consentAt: new Date().toISOString(),
-      idempotencyKey: randomUUID(),
+      disclosedVersion: first.disclosedVersion!,
+      disclosedHash: first.disclosedHash!,
+      idempotencyKey: acceptIdempotencyKey,
       actor: graph.customer,
       requestId: randomUUID(),
     });
     expect(accepted.status).toBe("ACCEPTED");
+    await expect(offers.accept({
+      offerId: first.id,
+      expectedVersion: 1,
+      consent: true,
+      consentAt: new Date(Date.now() - 1_000).toISOString(),
+      disclosedVersion: first.disclosedVersion!,
+      disclosedHash: first.disclosedHash!,
+      idempotencyKey: acceptIdempotencyKey,
+      actor: graph.customer,
+      requestId: randomUUID(),
+    })).rejects.toMatchObject({ code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
     await expect(
       executeTestSql(databaseUrl!, "update offer set expires_at = expires_at where id = $1", [first.id]),
     ).rejects.toMatchObject({ code: "55000" });
@@ -282,7 +297,10 @@ describe("controlled financing API against PostgreSQL", () => {
       offers.accept({
         offerId: expiring.id,
         expectedVersion: 1,
+        consent: true,
         consentAt: new Date().toISOString(),
+        disclosedVersion: expiring.disclosedVersion!,
+        disclosedHash: expiring.disclosedHash!,
         idempotencyKey: randomUUID(),
         actor: expiringGraph.customer,
         requestId: randomUUID(),
@@ -408,6 +426,13 @@ async function createRule(
     fixtureHashes: [fixture.canonicalHash],
     licencePermitted: input.licencePermitted ?? true,
     disclosureVersion: "test-disclosure-v1",
+    disclosureContent: { version: "test-disclosure-v1", body: "Synthetic test disclosure" },
+    disclosureHash: createHash("sha256")
+      .update(canonicalizeJson({
+        version: "test-disclosure-v1",
+        content: { version: "test-disclosure-v1", body: "Synthetic test disclosure" },
+      }))
+      .digest("hex"),
     actor: maker.actor,
     requestId: randomUUID(),
   });
