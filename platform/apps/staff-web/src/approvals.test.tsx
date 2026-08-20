@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { StaffRouter } from "./app/router.js";
-import type { StaffApi } from "./lib/api.js";
+import { ProblemError, type StaffApi } from "./lib/api.js";
 
 describe("staff approval workspace", () => {
   it("shows one actionable queue and an accessible review detail", async () => {
@@ -76,6 +76,78 @@ describe("staff approval workspace", () => {
       idempotencyKey: expect.any(String),
     });
     expect(await screen.findByText("Decision saved")).toBeInTheDocument();
+  });
+
+  it("renders a real stale conflict and refresh affordance", async () => {
+    const api = fakeApi();
+    api.decide.mockRejectedValue(
+      new ProblemError("STALE_VERSION", 409, "The application changed."),
+    );
+    render(
+      <StaffRouter
+        api={api}
+        initialSession={{
+          staffUserId: "staff-1",
+          roles: ["VERIFICATION_OFFICER"],
+        }}
+      />,
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Open application" }),
+    );
+    await userEvent.type(
+      screen.getByLabelText("Decision note"),
+      "Evidence verified",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Approve application" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This application is stale. Refresh the review before deciding.",
+    );
+    expect(
+      screen.getByRole("button", { name: "Refresh stale application" }),
+    ).toBeInTheDocument();
+  });
+
+  it("exposes explicit request-information and reject outcomes", async () => {
+    const api = fakeApi();
+    render(
+      <StaffRouter
+        api={api}
+        initialSession={{
+          staffUserId: "staff-1",
+          roles: ["VERIFICATION_OFFICER"],
+        }}
+      />,
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Open application" }),
+    );
+    await userEvent.type(
+      screen.getByLabelText("Decision note"),
+      "More evidence needed",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Request information" }),
+    );
+    expect(api.decide).toHaveBeenCalledWith(
+      "application-1",
+      expect.objectContaining({ action: "REQUEST_INFORMATION" }),
+    );
+    expect(
+      await screen.findByText("Information requested"),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Reject application" }),
+    );
+    expect(api.decide).toHaveBeenLastCalledWith(
+      "application-1",
+      expect.objectContaining({ action: "REJECT" }),
+    );
+    expect(await screen.findByText("Application rejected")).toBeInTheDocument();
   });
 });
 

@@ -12,6 +12,7 @@ export interface LockedApprovalApplication {
   status: string;
   version: number;
   applicantPersonId: string;
+  informationRequestedStage: string | null;
 }
 
 export interface ApplicationVersionRecord {
@@ -31,10 +32,31 @@ export interface ApprovalQueueRecord {
 export interface ApprovalDetailRecord extends ApprovalQueueRecord {
   decisions: Array<Record<string, unknown>>;
   underwriting: Array<Record<string, unknown>>;
+  informationRequestedStage: string | null;
 }
 
 export interface ApprovalDecisionRecord extends Record<string, unknown> {
   id: string;
+}
+
+export interface WorkflowCommandRecord {
+  id: string;
+  applicationId: string;
+  idempotencyKey: string;
+  commandType: string;
+  payloadHash: string;
+  response: Record<string, unknown>;
+}
+
+export interface DelegationRecord {
+  id: string;
+  delegateId: string;
+  role: string;
+  scope: string[];
+  approvedBy: string;
+  approvedAt: Date | string;
+  effectiveFrom: Date | string;
+  effectiveUntil: Date | string;
 }
 
 export function approvalRepo(db: Database | DatabaseTransaction) {
@@ -49,8 +71,10 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
         status: string;
         version: number;
         applicant_person_id: string;
+        information_requested_stage: string | null;
       }>(sql`
-        select id, status, version, applicant_person_id
+        select id, status, version, applicant_person_id,
+               information_requested_stage
           from application
          where id = ${applicationId}::uuid
          for update
@@ -63,6 +87,7 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
             status: row.status,
             version: row.version,
             applicantPersonId: row.applicant_person_id,
+            informationRequestedStage: row.information_requested_stage,
           };
     },
 
@@ -121,6 +146,7 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
       expectedVersion: number,
       status: string,
       updatedAt: Date,
+      informationRequestedStage: string | null = null,
     ): Promise<{ id: string; status: string; version: number }> {
       const result = await executor.execute<{
         id: string;
@@ -129,6 +155,7 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
       }>(sql`
         update application
            set status = ${status}::application_status,
+               information_requested_stage = ${informationRequestedStage}::approval_stage,
                version = version + 1,
                updated_at = ${updatedAt}
          where id = ${applicationId}::uuid
@@ -138,6 +165,140 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
       const row = result.rows[0];
       if (row === undefined) throw new Error("STALE_VERSION");
       return row;
+    },
+
+    async latestInformationRequestStage(
+      applicationId: string,
+    ): Promise<string | null> {
+      const result = await executor.execute<{ stage: string }>(sql`
+        select d.stage
+          from approval_decision d
+          join application_version av on av.id = d.application_version_id
+         where av.application_id = ${applicationId}::uuid
+           and d.action = 'REQUEST_INFORMATION'::approval_action
+         order by d.decided_at desc, d.id desc
+         limit 1
+      `);
+      return result.rows[0]?.stage ?? null;
+    },
+
+    async findWorkflowCommand(
+      applicationId: string,
+      idempotencyKey: string,
+    ): Promise<WorkflowCommandRecord | null> {
+      const result = await executor.execute<{
+        id: string;
+        application_id: string;
+        idempotency_key: string;
+        command_type: string;
+        payload_hash: string;
+        response: Record<string, unknown>;
+      }>(sql`
+        select id, application_id, idempotency_key, command_type, payload_hash, response
+          from workflow_command
+         where application_id = ${applicationId}::uuid
+           and idempotency_key = ${idempotencyKey}::uuid
+         limit 1
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            applicationId: row.application_id,
+            idempotencyKey: row.idempotency_key,
+            commandType: row.command_type,
+            payloadHash: row.payload_hash,
+            response: row.response,
+          };
+    },
+
+    async insertWorkflowCommand(input: {
+      applicationId: string;
+      idempotencyKey: string;
+      commandType: string;
+      payloadHash: string;
+      requestId: string;
+      actorStaffUserId?: string;
+      actorPersonId?: string;
+      response: Record<string, unknown>;
+    }): Promise<WorkflowCommandRecord> {
+      const result = await executor.execute<{
+        id: string;
+        application_id: string;
+        idempotency_key: string;
+        command_type: string;
+        payload_hash: string;
+        response: Record<string, unknown>;
+      }>(sql`
+        insert into workflow_command
+          (application_id, idempotency_key, command_type, payload_hash, request_id,
+           actor_staff_user_id, actor_person_id, response)
+        values (
+          ${input.applicationId}::uuid,
+          ${input.idempotencyKey}::uuid,
+          ${input.commandType},
+          ${input.payloadHash},
+          ${input.requestId}::uuid,
+          ${input.actorStaffUserId ?? null}::uuid,
+          ${input.actorPersonId ?? null}::uuid,
+          ${input.response}::jsonb
+        )
+        returning id, application_id, idempotency_key, command_type, payload_hash, response
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("WORKFLOW_COMMAND_INSERT_FAILED");
+      return {
+        id: row.id,
+        applicationId: row.application_id,
+        idempotencyKey: row.idempotency_key,
+        commandType: row.command_type,
+        payloadHash: row.payload_hash,
+        response: row.response,
+      };
+    },
+
+    async findActiveDelegation(
+      staffUserId: string,
+      stage: string,
+      now: Date,
+    ): Promise<DelegationRecord | null> {
+      const result = await executor.execute<{
+        id: string;
+        delegated_staff_user_id: string;
+        delegated_role: string;
+        scope: string[];
+        approved_by: string;
+        approved_at: Date | string;
+        effective_from: Date | string;
+        effective_until: Date | string;
+      }>(sql`
+        select id, delegated_staff_user_id, delegated_role, scope, approved_by,
+               approved_at, effective_from, effective_until
+          from staff_delegation
+         where delegated_staff_user_id = ${staffUserId}::uuid
+           and status = 'APPROVED'
+           and revoked_at is null
+           and approved_at is not null
+           and effective_from <= ${now}
+           and effective_until > ${now}
+           and scope @> ${JSON.stringify([stage])}::jsonb
+         order by effective_until asc, id asc
+         limit 1
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            delegateId: row.delegated_staff_user_id,
+            role: row.delegated_role,
+            scope: row.scope,
+            approvedBy: row.approved_by,
+            approvedAt: row.approved_at,
+            effectiveFrom: row.effective_from,
+            effectiveUntil: row.effective_until,
+          };
     },
 
     async insertApplicationVersion(input: {
@@ -279,9 +440,11 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
         status: string;
         version: number;
         submitted_at: Date | string | null;
+        information_requested_stage: string | null;
         snapshot: Record<string, unknown>;
       }>(sql`
         select a.id, a.status, a.version, a.submitted_at,
+               a.information_requested_stage,
                coalesce((
                  select av.snapshot from application_version av
                   where av.application_id = a.id
@@ -318,6 +481,7 @@ export function approvalRepo(db: Database | DatabaseTransaction) {
         version: row.version,
         submittedAt: row.submitted_at,
         snapshot: row.snapshot,
+        informationRequestedStage: row.information_requested_stage,
         decisions: decisions.rows,
         underwriting: underwriting.rows,
       };

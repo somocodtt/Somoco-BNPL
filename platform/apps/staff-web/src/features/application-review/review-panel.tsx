@@ -22,7 +22,11 @@ export function ReviewPanel({
 }: {
   api: StaffApi;
   detail: ApplicationDetail;
-  onDecisionSaved: (result: { status: string; version: number }) => void;
+  onDecisionSaved: (result: {
+    action: DecisionAction;
+    status: string;
+    version: number;
+  }) => void;
   onBack: () => void;
 }) {
   const [note, setNote] = useState("");
@@ -44,7 +48,7 @@ export function ReviewPanel({
         note: note.trim(),
         idempotencyKey: crypto.randomUUID(),
       });
-      onDecisionSaved(result);
+      onDecisionSaved({ ...result, action });
     } catch (caught) {
       const code =
         typeof caught === "object" && caught !== null && "code" in caught

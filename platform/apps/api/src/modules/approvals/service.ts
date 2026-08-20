@@ -7,16 +7,26 @@ import {
   type Database,
 } from "@somo/db";
 import { AppError } from "../../plugins/errors.js";
-import type { CustomerPrincipal, StaffPrincipal } from "../access/policy.js";
+import type {
+  CustomerPrincipal,
+  StaffPrincipal,
+  StaffRole,
+} from "../access/policy.js";
 import {
   assertDecisionAllowed,
   nextStatusForApproval,
+  reviewStatusForStage,
   stageForReviewStatus,
+  stageRole,
   type ApprovalAction,
   type ApprovalStage,
   type DecisionActor,
   type TemporaryDelegation,
 } from "./policy.js";
+import {
+  replayWorkflowCommand,
+  workflowPayloadHash,
+} from "./command-idempotency.js";
 
 export interface ApprovalCommandInput {
   applicationId: string;
@@ -51,7 +61,7 @@ export interface ResubmissionInput {
 export interface ResubmissionResult {
   id: string;
   applicationId: string;
-  status: "VERIFICATION_REVIEW";
+  status: string;
   version: number;
   applicationVersion: number;
 }
@@ -121,6 +131,15 @@ export function createApprovalService(options: {
           "Application was not found.",
         );
       }
+      const currentStage =
+        stageForReviewStatus(record.status) ?? record.informationRequestedStage;
+      if (
+        currentStage === null ||
+        currentStage === undefined ||
+        !actor.roles.includes(stageRole(currentStage as ApprovalStage))
+      ) {
+        throw new AppError(403, "FORBIDDEN", "Action is not permitted.");
+      }
       return {
         ...record,
         submittedAt:
@@ -153,9 +172,26 @@ async function decide(
 ): Promise<ApprovalResult> {
   assertCommand(input);
   const note = normalizeNote(input.note);
+  const payloadHash = workflowPayloadHash({
+    applicationId: input.applicationId,
+    expectedVersion: input.expectedVersion,
+    stage: input.stage,
+    action,
+    note,
+    actorStaffUserId: input.actor.staffUserId,
+  });
   try {
     return await withTransaction(database, async (tx) => {
       const repo = approvalRepo(tx);
+      const replay = replayWorkflowCommand<ApprovalResult>(
+        await repo.findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "APPROVAL",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
       const current = await repo.lockApplication(input.applicationId);
       if (current === null)
         throw new AppError(
@@ -191,14 +227,33 @@ async function decide(
         input.applicationId,
         input.actor.staffUserId,
       );
+      const persistedDelegation = await repo.findActiveDelegation(
+        input.actor.staffUserId,
+        input.stage,
+        clock.now(),
+      );
+      const delegation =
+        persistedDelegation === null
+          ? null
+          : {
+              delegateId: persistedDelegation.delegateId,
+              role: persistedDelegation.role as StaffRole,
+              scope: persistedDelegation.scope as ApprovalStage[],
+              approvedBy: persistedDelegation.approvedBy,
+              effectiveFrom: new Date(
+                persistedDelegation.effectiveFrom,
+              ).toISOString(),
+              effectiveUntil: new Date(
+                persistedDelegation.effectiveUntil,
+              ).toISOString(),
+              id: persistedDelegation.id,
+            };
       try {
         assertDecisionAllowed(input.actor, input.stage, {
           ...(exceptionRequestedBy
             ? { exceptionRequestedBy: input.actor.staffUserId }
             : {}),
-          ...(input.delegation === undefined
-            ? {}
-            : { delegation: input.delegation }),
+          ...(delegation === null ? {} : { delegation }),
           now: clock.now(),
         });
       } catch (error) {
@@ -239,11 +294,14 @@ async function decide(
         input.expectedVersion,
         nextStatus,
         clock.now(),
+        action === "REQUEST_INFORMATION" ? input.stage : null,
       );
+      const actorRole = actorRoleFor(input.actor, input.stage, delegation);
       const eventData = {
         decisionId: decision.id,
         actorStaffUserId: input.actor.staffUserId,
-        role: input.stage,
+        role: actorRole,
+        actorRole,
         stage: input.stage,
         note,
         requestId: input.requestId,
@@ -251,7 +309,36 @@ async function decide(
         expectedVersion: input.expectedVersion,
         outcome: action,
         status: updated.status,
+        ...(delegation === null
+          ? {}
+          : {
+              delegationId: delegation.id,
+              delegationApprovedBy: delegation.approvedBy,
+              delegationEffectiveFrom: new Date(
+                delegation.effectiveFrom,
+              ).toISOString(),
+              delegationEffectiveUntil: new Date(
+                delegation.effectiveUntil,
+              ).toISOString(),
+            }),
       };
+      const response = {
+        id: decision.id,
+        applicationId: input.applicationId,
+        stage: input.stage,
+        action,
+        status: updated.status,
+        version: updated.version,
+      } satisfies ApprovalResult;
+      await repo.insertWorkflowCommand({
+        applicationId: input.applicationId,
+        idempotencyKey: input.idempotencyKey,
+        commandType: "APPROVAL",
+        payloadHash,
+        requestId: input.requestId,
+        actorStaffUserId: input.actor.staffUserId,
+        response,
+      });
       await appendAuditEvent(tx, {
         aggregateType: "application",
         aggregateId: input.applicationId,
@@ -269,16 +356,20 @@ async function decide(
         payload: eventData,
         occurredAt: clock.now(),
       });
-      return {
-        id: decision.id,
-        applicationId: input.applicationId,
-        stage: input.stage,
-        action,
-        status: updated.status,
-        version: updated.version,
-      };
+      return response;
     });
   } catch (error) {
+    if (databaseErrorCode(error) === "23505") {
+      const replay = replayWorkflowCommand<ApprovalResult>(
+        await approvalRepo(database).findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "APPROVAL",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
+    }
     throw mapServiceError(error);
   }
 }
@@ -292,9 +383,23 @@ async function resubmit(
   assertUuid(input.requestId, "REQUEST_ID_INVALID");
   assertUuid(input.idempotencyKey, "IDEMPOTENCY_KEY_INVALID");
   assertExpectedVersion(input.expectedVersion, input.expectedVersion);
+  const payloadHash = workflowPayloadHash({
+    applicationId: input.applicationId,
+    expectedVersion: input.expectedVersion,
+    actorPersonId: input.actor.personId,
+  });
   try {
     return await withTransaction(database, async (tx) => {
       const repo = approvalRepo(tx);
+      const replay = replayWorkflowCommand<ResubmissionResult>(
+        await repo.findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "RESUBMISSION",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
       const current = await repo.lockApplication(input.applicationId);
       if (current === null)
         throw new AppError(
@@ -319,6 +424,16 @@ async function resubmit(
       }
       const latest = await repo.latestVersion(input.applicationId);
       if (latest === null) throw new Error("APPLICATION_VERSION_MISSING");
+      const requestedStage =
+        current.informationRequestedStage ??
+        (await repo.latestInformationRequestStage(input.applicationId));
+      if (requestedStage === null) {
+        throw new AppError(
+          409,
+          "APPLICATION_STATE_INVALID",
+          "The application is missing its controlled review stage.",
+        );
+      }
       const now = clock.now();
       const snapshot = {
         ...latest.snapshot,
@@ -327,6 +442,7 @@ async function resubmit(
           requestId: input.requestId,
           idempotencyKey: input.idempotencyKey,
           priorVersion: latest.versionNumber,
+          controlledStage: requestedStage,
         },
       };
       await repo.insertApplicationVersion({
@@ -338,12 +454,14 @@ async function resubmit(
       const updated = await repo.updateApplication(
         input.applicationId,
         input.expectedVersion,
-        "VERIFICATION_REVIEW",
+        reviewStatusForStage(requestedStage as ApprovalStage),
         now,
+        null,
       );
       const eventData = {
         actorPersonId: input.actor.personId,
         role: "APPLICANT",
+        actorRole: "APPLICANT",
         stage: "CUSTOMER_RESUBMISSION",
         note: "Application resubmitted after requested information.",
         requestId: input.requestId,
@@ -352,6 +470,22 @@ async function resubmit(
         status: updated.status,
         version: updated.version,
       };
+      const response = {
+        id: updated.id,
+        applicationId: input.applicationId,
+        status: reviewStatusForStage(requestedStage as ApprovalStage),
+        version: updated.version,
+        applicationVersion: latest.versionNumber + 1,
+      } satisfies ResubmissionResult;
+      await repo.insertWorkflowCommand({
+        applicationId: input.applicationId,
+        idempotencyKey: input.idempotencyKey,
+        commandType: "RESUBMISSION",
+        payloadHash,
+        requestId: input.requestId,
+        actorPersonId: input.actor.personId,
+        response,
+      });
       await appendAuditEvent(tx, {
         aggregateType: "application",
         aggregateId: input.applicationId,
@@ -368,17 +502,31 @@ async function resubmit(
         payload: eventData,
         occurredAt: now,
       });
-      return {
-        id: updated.id,
-        applicationId: input.applicationId,
-        status: "VERIFICATION_REVIEW",
-        version: updated.version,
-        applicationVersion: latest.versionNumber + 1,
-      };
+      return response;
     });
   } catch (error) {
+    if (databaseErrorCode(error) === "23505") {
+      const replay = replayWorkflowCommand<ResubmissionResult>(
+        await approvalRepo(database).findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "RESUBMISSION",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
+    }
     throw mapServiceError(error);
   }
+}
+
+function actorRoleFor(
+  actor: StaffPrincipal,
+  stage: ApprovalStage,
+  delegation: { role: string } | null,
+): string {
+  if (actor.roles.includes(stageRole(stage))) return stageRole(stage);
+  return actor.roles[0] ?? delegation?.role ?? "UNKNOWN";
 }
 
 function assertCommand(input: ApprovalCommandInput): void {

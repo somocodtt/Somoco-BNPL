@@ -103,6 +103,7 @@ export const application = pgTable(
       onDelete: "restrict",
     }),
     status: applicationStatus("status").notNull().default("DRAFT"),
+    informationRequestedStage: approvalStage("information_requested_stage"),
     version: integer("version").notNull().default(1),
     submittedAt: timestamp("submitted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -277,6 +278,50 @@ export const underwritingAssessment = pgTable(
   ],
 );
 
+export const workflowCommand = pgTable(
+  "workflow_command",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    idempotencyKey: uuid("idempotency_key").notNull(),
+    commandType: text("command_type").notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    requestId: uuid("request_id").notNull(),
+    actorStaffUserId: uuid("actor_staff_user_id").references(
+      () => staffUser.id,
+      { onDelete: "restrict" },
+    ),
+    actorPersonId: uuid("actor_person_id").references(() => person.id, {
+      onDelete: "restrict",
+    }),
+    response: jsonb("response").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("workflow_command_application_key_unique").on(
+      table.applicationId,
+      table.idempotencyKey,
+    ),
+    index("workflow_command_application_idx").on(table.applicationId),
+    check(
+      "workflow_command_type_allowed",
+      sql`${table.commandType} in ('APPROVAL', 'RESUBMISSION', 'MANUAL_CREDIT_BUREAU')`,
+    ),
+    check(
+      "workflow_command_payload_hash_sha256",
+      sql`${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "workflow_command_actor_exclusive",
+      sql`(${table.actorStaffUserId} is null) <> (${table.actorPersonId} is null)`,
+    ),
+  ],
+);
+
 export const approvalDecision = pgTable(
   "approval_decision",
   {
@@ -328,5 +373,54 @@ export const exceptionRequest = pgTable(
       sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,
     ),
     check("exception_request_version_positive", sql`${table.version} > 0`),
+  ],
+);
+
+export const staffDelegation = pgTable(
+  "staff_delegation",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    delegatedStaffUserId: uuid("delegated_staff_user_id")
+      .notNull()
+      .references(() => staffUser.id, { onDelete: "restrict" }),
+    delegatedRole: text("delegated_role").notNull(),
+    scope: jsonb("scope").$type<string[]>().notNull(),
+    approvedBy: uuid("approved_by")
+      .notNull()
+      .references(() => staffUser.id, { onDelete: "restrict" }),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    effectiveFrom: timestamp("effective_from", {
+      withTimezone: true,
+    }).notNull(),
+    effectiveUntil: timestamp("effective_until", {
+      withTimezone: true,
+    }).notNull(),
+    status: text("status").notNull().default("PENDING"),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("staff_delegation_delegate_idx").on(
+      table.delegatedStaffUserId,
+      table.status,
+    ),
+    check(
+      "staff_delegation_role_allowed",
+      sql`${table.delegatedRole} in ('VERIFICATION_OFFICER', 'BSM', 'AGM', 'CFO', 'MD')`,
+    ),
+    check(
+      "staff_delegation_status_allowed",
+      sql`${table.status} in ('PENDING', 'APPROVED', 'REVOKED', 'EXPIRED')`,
+    ),
+    check(
+      "staff_delegation_window_ordered",
+      sql`${table.effectiveUntil} > ${table.effectiveFrom}`,
+    ),
+    check(
+      "staff_delegation_approval_consistent",
+      sql`(${table.status} = 'APPROVED') = (${table.approvedAt} is not null)`,
+    ),
   ],
 );

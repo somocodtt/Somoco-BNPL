@@ -8,15 +8,13 @@
     "outDir": "dist",
     "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "types": ["node", "vitest/globals"],
-    "baseUrl": ".",
-    "ignoreDeprecations": "6.0",
-    "paths": {
-      "react": ["../customer-web/node_modules/@types/react"],
-      "react/*": ["../customer-web/node_modules/@types/react/*"],
-      "react-dom/*": ["../customer-web/node_modules/@types/react-dom/*"],
-      "@testing-library/*": ["../customer-web/node_modules/@testing-library/*"],
-      "vite/*": ["../customer-web/node_modules/vite/*"]
-    }
+    "ignoreDeprecations": "6.0"
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx", "vite.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx",
+    "vite.config.ts"
+  ]
 }

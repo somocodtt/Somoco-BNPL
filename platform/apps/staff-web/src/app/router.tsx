@@ -79,7 +79,13 @@ export function StaffRouter({
               (current) =>
                 current?.filter((item) => item.id !== detail.id) ?? current,
             );
-            setNotice("Decision saved");
+            setNotice(
+              result.action === "REQUEST_INFORMATION"
+                ? "Information requested"
+                : result.action === "REJECT"
+                  ? "Application rejected"
+                  : "Decision saved",
+            );
           }}
         />
       </main>

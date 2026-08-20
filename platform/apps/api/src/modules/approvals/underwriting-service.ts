@@ -8,6 +8,10 @@ import {
 } from "@somo/db";
 import { AppError } from "../../plugins/errors.js";
 import type { StaffPrincipal } from "../access/policy.js";
+import {
+  replayWorkflowCommand,
+  workflowPayloadHash,
+} from "./command-idempotency.js";
 import { assertDecisionAllowed } from "./policy.js";
 
 export type ManualCreditBureauResult = "CLEAN" | "ADVERSE" | "REVIEW";
@@ -88,10 +92,28 @@ async function recordManualCreditBureauCheck(
       "The bureau check date is invalid.",
     );
   }
+  const payloadHash = workflowPayloadHash({
+    applicationId: input.applicationId,
+    expectedVersion: input.expectedVersion,
+    actorStaffUserId: input.actor.staffUserId,
+    result: input.result,
+    checkedAt: checkedAt.toISOString(),
+    bureauReference: input.bureauReference,
+    evidenceDocumentId: input.evidenceDocumentId,
+  });
 
   try {
     return await withTransaction(database, async (tx) => {
       const repo = approvalRepo(tx);
+      const replay = replayWorkflowCommand<ManualCreditBureauCheckResult>(
+        await repo.findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "MANUAL_CREDIT_BUREAU",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
       const current = await repo.lockApplication(input.applicationId);
       if (current === null) {
         throw new AppError(
@@ -124,21 +146,6 @@ async function recordManualCreditBureauCheck(
         );
       }
 
-      const prior = await repo.findManualCheckByIdempotency(
-        input.applicationId,
-        input.idempotencyKey,
-      );
-      if (prior !== null) {
-        return {
-          applicationId: input.applicationId,
-          applicationVersionId: String(prior.applicationVersionId),
-          result: prior.result as ManualCreditBureauResult,
-          checkedAt: String(prior.checkedAt),
-          officer: String(prior.officer),
-          bureauReference: String(prior.bureauReference),
-          evidenceDocumentId: String(prior.evidenceDocumentId),
-        };
-      }
       if (
         !(await repo.evidenceDocumentBelongsToApplication(
           input.applicationId,
@@ -178,7 +185,9 @@ async function recordManualCreditBureauCheck(
         requestId: input.requestId,
         data: {
           ...assessment,
-          role: "VERIFICATION",
+          role: "VERIFICATION_OFFICER",
+          actorRole: "VERIFICATION_OFFICER",
+          stage: "VERIFICATION",
           outcome: "RECORDED",
         },
         occurredAt: now,
@@ -191,7 +200,7 @@ async function recordManualCreditBureauCheck(
         payload: assessment,
         occurredAt: now,
       });
-      return {
+      const response = {
         applicationId: input.applicationId,
         applicationVersionId: latest.id,
         result: input.result,
@@ -200,8 +209,29 @@ async function recordManualCreditBureauCheck(
         bureauReference: input.bureauReference,
         evidenceDocumentId: input.evidenceDocumentId,
       };
+      await repo.insertWorkflowCommand({
+        applicationId: input.applicationId,
+        idempotencyKey: input.idempotencyKey,
+        commandType: "MANUAL_CREDIT_BUREAU",
+        payloadHash,
+        requestId: input.requestId,
+        actorStaffUserId: input.actor.staffUserId,
+        response,
+      });
+      return response;
     });
   } catch (error) {
+    if (databaseErrorCode(error) === "23505") {
+      const replay = replayWorkflowCommand<ManualCreditBureauCheckResult>(
+        await approvalRepo(database).findWorkflowCommand(
+          input.applicationId,
+          input.idempotencyKey,
+        ),
+        "MANUAL_CREDIT_BUREAU",
+        payloadHash,
+      );
+      if (replay !== null) return replay;
+    }
     if (error instanceof AppError) throw error;
     if (
       error instanceof Error &&
@@ -215,6 +245,18 @@ async function recordManualCreditBureauCheck(
     }
     throw error;
   }
+}
+
+function databaseErrorCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== null; depth += 1) {
+    if (typeof current !== "object") return undefined;
+    if ("code" in current && typeof current.code === "string") {
+      return current.code;
+    }
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
 }
 
 function assertUuid(value: string, code: string): void {
