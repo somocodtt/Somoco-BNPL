@@ -553,6 +553,217 @@ describe("approval separation of duties", () => {
   });
 });
 
+describe("delegated approval access", () => {
+  it("includes only active persisted scoped delegations in queue and detail", async () => {
+    const fixture = await seedSubmittedApplication();
+    const activeUser = await seedStaff(
+      "queue-active-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const activeApprover = await seedStaff("queue-active-approver", "MD");
+    const activeDelegationId = await seedDelegation({
+      delegatedUser: activeUser,
+      approvedBy: activeApprover,
+      role: "VERIFICATION_OFFICER",
+      scope: ["VERIFICATION"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2099-01-01T00:00:00.000Z",
+      status: "APPROVED",
+    });
+
+    const expiredUser = await seedStaff(
+      "queue-expired-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const expiredApprover = await seedStaff("queue-expired-approver", "MD");
+    await seedDelegation({
+      delegatedUser: expiredUser,
+      approvedBy: expiredApprover,
+      role: "VERIFICATION_OFFICER",
+      scope: ["VERIFICATION"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2021-01-01T00:00:00.000Z",
+      status: "APPROVED",
+    });
+    const pendingUser = await seedStaff(
+      "queue-pending-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const pendingApprover = await seedStaff("queue-pending-approver", "MD");
+    await seedDelegation({
+      delegatedUser: pendingUser,
+      approvedBy: pendingApprover,
+      role: "VERIFICATION_OFFICER",
+      scope: ["VERIFICATION"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2099-01-01T00:00:00.000Z",
+      status: "PENDING",
+    });
+    const wrongScopeUser = await seedStaff(
+      "queue-wrong-scope-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const wrongScopeApprover = await seedStaff(
+      "queue-wrong-scope-approver",
+      "MD",
+    );
+    await seedDelegation({
+      delegatedUser: wrongScopeUser,
+      approvedBy: wrongScopeApprover,
+      role: "VERIFICATION_OFFICER",
+      scope: ["AGM"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2099-01-01T00:00:00.000Z",
+      status: "APPROVED",
+    });
+
+    const activeActor = staffPrincipal(activeUser, "CUSTOMER_SUPPORT");
+    expect(await approvals.getQueue({ actor: activeActor })).toContainEqual(
+      expect.objectContaining({
+        id: fixture.applicationId,
+        delegationId: activeDelegationId,
+      }),
+    );
+    expect(
+      await approvals.getApplication({
+        actor: activeActor,
+        applicationId: fixture.applicationId,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        id: fixture.applicationId,
+        delegationId: activeDelegationId,
+      }),
+    );
+    await expect(
+      approvals.getQueue({
+        actor: staffPrincipal(expiredUser, "CUSTOMER_SUPPORT"),
+      }),
+    ).resolves.toEqual([]);
+    await expect(
+      approvals.getQueue({
+        actor: staffPrincipal(pendingUser, "CUSTOMER_SUPPORT"),
+      }),
+    ).resolves.toEqual([]);
+    await expect(
+      approvals.getQueue({
+        actor: staffPrincipal(wrongScopeUser, "CUSTOMER_SUPPORT"),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("keeps prior decision actors read-only through terminal approval and rejection", async () => {
+    const approvedFixture = await seedSubmittedApplication();
+    const delegatedUser = await seedStaff(
+      "history-delegated-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const delegationApprover = await seedStaff(
+      "history-delegation-approver",
+      "MD",
+    );
+    const delegationId = await seedDelegation({
+      delegatedUser,
+      approvedBy: delegationApprover,
+      role: "VERIFICATION_OFFICER",
+      scope: ["VERIFICATION"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2099-01-01T00:00:00.000Z",
+      status: "APPROVED",
+    });
+    const delegatedApproval = await approvals.approve({
+      applicationId: approvedFixture.applicationId,
+      expectedVersion: 1,
+      stage: "VERIFICATION",
+      actor: staffPrincipal(delegatedUser, "CUSTOMER_SUPPORT"),
+      note: "Delegated verification.",
+      requestId: randomUUID(),
+      idempotencyKey: randomUUID(),
+    });
+    expect(delegatedApproval.delegationId).toBe(delegationId);
+    await expect(
+      approvals.getApplication({
+        actor: staffPrincipal(approvedFixture.staff.BSM, "BSM"),
+        applicationId: approvedFixture.applicationId,
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({ status: "BSM_INITIAL_REVIEW" }),
+    );
+
+    let expectedVersion = delegatedApproval.version;
+    const remainingStages = [
+      ["BSM_INITIAL", "BSM", "AGM_REVIEW"],
+      ["AGM", "AGM", "CFO_REVIEW"],
+      ["CFO", "CFO", "BSM_FINAL_REVIEW"],
+      ["BSM_FINAL", "BSM", "MD_REVIEW"],
+      ["MD", "MD", "APPROVED"],
+    ] as const;
+    for (const [stage, role, expectedStatus] of remainingStages) {
+      const result = await approvals.approve({
+        applicationId: approvedFixture.applicationId,
+        expectedVersion,
+        stage,
+        actor: staffPrincipal(approvedFixture.staff[role], role),
+        note: `${stage} approved`,
+        requestId: randomUUID(),
+        idempotencyKey: randomUUID(),
+      });
+      expect(result.status).toBe(expectedStatus);
+      expectedVersion = result.version;
+    }
+    expect(
+      await approvals.getApplication({
+        actor: staffPrincipal(delegatedUser, "CUSTOMER_SUPPORT"),
+        applicationId: approvedFixture.applicationId,
+      }),
+    ).toEqual(expect.objectContaining({ status: "APPROVED" }));
+    await expect(
+      approvals.approve({
+        applicationId: approvedFixture.applicationId,
+        expectedVersion,
+        stage: "VERIFICATION",
+        actor: staffPrincipal(delegatedUser, "CUSTOMER_SUPPORT"),
+        note: "Late mutation must remain blocked.",
+        requestId: randomUUID(),
+        idempotencyKey: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "APPLICATION_TERMINAL" });
+
+    const rejectedFixture = await seedSubmittedApplication();
+    await approvals.reject({
+      applicationId: rejectedFixture.applicationId,
+      expectedVersion: 1,
+      stage: "VERIFICATION",
+      actor: staffPrincipal(
+        rejectedFixture.staff.VERIFICATION_OFFICER,
+        "VERIFICATION_OFFICER",
+      ),
+      note: "Rejected for history access.",
+      requestId: randomUUID(),
+      idempotencyKey: randomUUID(),
+    });
+    expect(
+      await approvals.getApplication({
+        actor: staffPrincipal(
+          rejectedFixture.staff.VERIFICATION_OFFICER,
+          "VERIFICATION_OFFICER",
+        ),
+        applicationId: rejectedFixture.applicationId,
+      }),
+    ).toEqual(expect.objectContaining({ status: "REJECTED" }));
+    const unrelated = await seedStaff(
+      "history-unrelated-support",
+      "CUSTOMER_SUPPORT",
+    );
+    await expect(
+      approvals.getApplication({
+        actor: staffPrincipal(unrelated, "CUSTOMER_SUPPORT"),
+        applicationId: approvedFixture.applicationId,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+});
+
 describe("approval detail access", () => {
   it("does not expose an actionable application to an unrelated staff role", async () => {
     const fixture = await seedSubmittedApplication();
@@ -640,6 +851,84 @@ describe("approval HTTP routes", () => {
     });
     expect(response.statusCode).toBe(403);
     expect(response.json()).toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("lets an active persisted delegation use queue, detail, and decision routes", async () => {
+    const fixture = await seedSubmittedApplication();
+    const delegatedUser = await seedHttpStaff(
+      "http-delegated-support",
+      "CUSTOMER_SUPPORT",
+    );
+    const approver = await seedStaff("http-delegation-approver", "MD");
+    const delegationId = await seedDelegation({
+      delegatedUser: delegatedUser.id,
+      approvedBy: approver,
+      role: "VERIFICATION_OFFICER",
+      scope: ["VERIFICATION"],
+      effectiveFrom: "2020-01-01T00:00:00.000Z",
+      effectiveUntil: "2099-01-01T00:00:00.000Z",
+      status: "APPROVED",
+    });
+    const login = await app.inject({
+      method: "POST",
+      url: "/v1/staff/sessions",
+      payload: {
+        email: delegatedUser.email,
+        password: "correct horse battery staple",
+        mfaAssertion: "valid-test-assertion",
+      },
+    });
+    expect(login.statusCode).toBe(201);
+    const setCookies = (
+      Array.isArray(login.headers["set-cookie"])
+        ? login.headers["set-cookie"]
+        : [login.headers["set-cookie"]]
+    ).filter((value): value is string => typeof value === "string");
+    expect(
+      setCookies.some((value) =>
+        value.startsWith(`${httpTestConfig.cookieName}=`),
+      ),
+    ).toBe(true);
+    const cookieHeader = setCookies
+      .map((value) => value.split(";", 1)[0])
+      .join("; ");
+    const csrfToken = login.json<{ csrfToken: string }>().csrfToken;
+    const headers = { cookie: cookieHeader };
+
+    const queue = await app.inject({
+      method: "GET",
+      url: "/v1/staff/applications/queue",
+      headers,
+    });
+    expect(queue.statusCode).toBe(200);
+    expect(queue.json()).toContainEqual(
+      expect.objectContaining({ id: fixture.applicationId, delegationId }),
+    );
+    const detail = await app.inject({
+      method: "GET",
+      url: `/v1/staff/applications/${fixture.applicationId}`,
+      headers,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json()).toEqual(
+      expect.objectContaining({ id: fixture.applicationId, delegationId }),
+    );
+    const decision = await app.inject({
+      method: "POST",
+      url: `/v1/staff/applications/${fixture.applicationId}/approve`,
+      headers: { ...headers, "x-csrf-token": csrfToken },
+      payload: {
+        expectedVersion: 1,
+        stage: "VERIFICATION",
+        note: "Delegated route approval.",
+        idempotencyKey: randomUUID(),
+      },
+    });
+    expect(decision.statusCode).toBe(200);
+    expect(decision.json()).toMatchObject({
+      status: "BSM_INITIAL_REVIEW",
+      delegationId,
+    });
   });
 });
 

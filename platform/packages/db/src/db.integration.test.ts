@@ -871,6 +871,124 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ count: 0 }] });
   });
 
+  it("adds approval controls to a populated 0008 schema without changing existing rows", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+
+    const applicantId = randomUUID();
+    const guarantorId = randomUUID();
+    const applicationId = randomUUID();
+    const relationshipId = randomUUID();
+    const applicationVersionId = randomUUID();
+    const delegatedStaffUserId = randomUUID();
+    const approvingStaffUserId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164)
+       values ($1, '+233200009908'), ($2, '+233200009909')`,
+      [applicantId, guarantorId],
+    );
+    await pool.query(
+      `insert into application
+         (id, applicant_person_id, status, version, submitted_at)
+       values ($1, $2, 'VERIFICATION_REVIEW', 1, '2026-08-20T12:00:00.000Z')`,
+      [applicationId, applicantId],
+    );
+    await pool.query(
+      `insert into application_version
+         (id, application_id, version_number, snapshot, submitted_at)
+       values ($1, $2, 1, '{"legacy":true,"source":"0008"}'::jsonb,
+               '2026-08-20T12:00:00.000Z')`,
+      [applicationVersionId, applicationId],
+    );
+    await pool.query(
+      `insert into guarantor_relationship
+         (id, application_id, guarantor_person_id, status)
+       values ($1, $2, $3, 'CONFIRMED')`,
+      [relationshipId, applicationId, guarantorId],
+    );
+    await pool.query(
+      `insert into staff_user (id, email, password_hash)
+       values ($1, 'delegated-legacy@example.test', 'legacy-hash'),
+              ($2, 'approver-legacy@example.test', 'legacy-hash')`,
+      [delegatedStaffUserId, approvingStaffUserId],
+    );
+
+    await applyMigrationFile(pool, "0009_whole_nightmare.sql");
+
+    const preserved = await pool.query<{
+      application_id: string;
+      status: string;
+      version: number;
+      information_requested_stage: string | null;
+      snapshot: Record<string, unknown>;
+      relationship_id: string;
+    }>(
+      `select a.id application_id, a.status, a.version,
+              a.information_requested_stage, av.snapshot,
+              gr.id relationship_id
+         from application a
+         join application_version av on av.application_id = a.id
+         join guarantor_relationship gr on gr.application_id = a.id
+        where a.id = $1`,
+      [applicationId],
+    );
+    expect(preserved.rows[0]).toEqual({
+      application_id: applicationId,
+      status: "VERIFICATION_REVIEW",
+      version: 1,
+      information_requested_stage: null,
+      snapshot: { legacy: true, source: "0008" },
+      relationship_id: relationshipId,
+    });
+
+    const commandId = randomUUID();
+    const delegationId = randomUUID();
+    await pool.query(
+      `insert into staff_delegation
+         (id, delegated_staff_user_id, delegated_role, scope, approved_by,
+          approved_at, effective_from, effective_until, status)
+       values ($1, $2, 'VERIFICATION_OFFICER', '["VERIFICATION"]'::jsonb,
+               $3, '2026-08-20T11:00:00.000Z', '2026-08-20T11:00:00.000Z',
+               '2026-08-20T13:00:00.000Z', 'APPROVED')`,
+      [delegationId, delegatedStaffUserId, approvingStaffUserId],
+    );
+    await pool.query(
+      `insert into workflow_command
+         (id, application_id, idempotency_key, command_type, payload_hash,
+          request_id, actor_staff_user_id, response)
+       values ($1, $2, $3, 'APPROVAL', repeat('a', 64), $4, $5, '{}'::jsonb)`,
+      [
+        commandId,
+        applicationId,
+        randomUUID(),
+        randomUUID(),
+        delegatedStaffUserId,
+      ],
+    );
+    await expect(
+      pool.query(
+        `select id from staff_delegation where id = $1 and status = 'APPROVED'`,
+        [delegationId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ id: delegationId }] });
+    await expect(
+      pool.query(
+        `select id from workflow_command where id = $1 and application_id = $2`,
+        [commandId, applicationId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ id: commandId }] });
+  });
+
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",

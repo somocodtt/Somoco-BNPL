@@ -5,6 +5,7 @@ import {
   enqueueOutbox,
   withTransaction,
   type Database,
+  type DelegationRecord,
 } from "@somo/db";
 import { AppError } from "../../plugins/errors.js";
 import type {
@@ -46,6 +47,7 @@ export interface ApprovalResult {
   action: ApprovalAction;
   status: string;
   version: number;
+  delegationId?: string;
 }
 
 export interface ResubmissionInput {
@@ -74,6 +76,7 @@ export interface ApprovalService {
       version: number;
       submittedAt: string | null;
       snapshot: Record<string, unknown>;
+      delegationId?: string;
     }>
   >;
   getApplication(input: {
@@ -94,28 +97,32 @@ export function createApprovalService(options: {
   return {
     async getQueue({ actor }) {
       if (actor.roles.includes("SYSTEM_ADMIN")) return [];
-      const statuses = new Set<string>();
-      for (const role of actor.roles) {
-        if (role === "VERIFICATION_OFFICER")
-          statuses.add("VERIFICATION_REVIEW");
-        if (role === "BSM") {
-          statuses.add("BSM_INITIAL_REVIEW");
-          statuses.add("BSM_FINAL_REVIEW");
-        }
-        if (role === "AGM") statuses.add("AGM_REVIEW");
-        if (role === "CFO") statuses.add("CFO_REVIEW");
-        if (role === "MD") statuses.add("MD_REVIEW");
+      const repo = approvalRepo(options.database);
+      const records = await repo.listQueue(reviewStatuses);
+      const now = clock.now();
+      const visible = [];
+      for (const record of records) {
+        const stage = stageForReviewStatus(record.status);
+        if (stage === null) continue;
+        const hasNativeRole = actor.roles.includes(stageRole(stage));
+        const delegation = hasNativeRole
+          ? null
+          : usableDelegation(
+              await repo.findActiveDelegation(actor.staffUserId, stage, now),
+              actor.staffUserId,
+              stage,
+            );
+        if (!hasNativeRole && delegation === null) continue;
+        visible.push({
+          ...record,
+          submittedAt:
+            record.submittedAt === null
+              ? null
+              : new Date(record.submittedAt).toISOString(),
+          ...(delegation === null ? {} : { delegationId: delegation.id }),
+        });
       }
-      const records = await approvalRepo(options.database).listQueue([
-        ...statuses,
-      ]);
-      return records.map((record) => ({
-        ...record,
-        submittedAt:
-          record.submittedAt === null
-            ? null
-            : new Date(record.submittedAt).toISOString(),
-      }));
+      return visible;
     },
 
     async getApplication({ actor, applicationId }) {
@@ -133,11 +140,28 @@ export function createApprovalService(options: {
       }
       const currentStage =
         stageForReviewStatus(record.status) ?? record.informationRequestedStage;
-      if (
-        currentStage === null ||
-        currentStage === undefined ||
-        !actor.roles.includes(stageRole(currentStage as ApprovalStage))
-      ) {
+      const stage =
+        currentStage === null || currentStage === undefined
+          ? null
+          : (currentStage as ApprovalStage);
+      const hasNativeRole =
+        stage === null ? false : actor.roles.includes(stageRole(stage));
+      const delegation =
+        stage === null || hasNativeRole
+          ? null
+          : usableDelegation(
+              await approvalRepo(options.database).findActiveDelegation(
+                actor.staffUserId,
+                stage,
+                clock.now(),
+              ),
+              actor.staffUserId,
+              stage,
+            );
+      const isPriorDecisionActor = record.decisions.some(
+        (decision) => decision.decidedBy === actor.staffUserId,
+      );
+      if (!hasNativeRole && delegation === null && !isPriorDecisionActor) {
         throw new AppError(403, "FORBIDDEN", "Action is not permitted.");
       }
       return {
@@ -146,6 +170,7 @@ export function createApprovalService(options: {
           record.submittedAt === null
             ? null
             : new Date(record.submittedAt).toISOString(),
+        ...(delegation === null ? {} : { delegationId: delegation.id }),
       };
     },
 
@@ -329,6 +354,7 @@ async function decide(
         action,
         status: updated.status,
         version: updated.version,
+        ...(delegation === null ? {} : { delegationId: delegation.id }),
       } satisfies ApprovalResult;
       await repo.insertWorkflowCommand({
         applicationId: input.applicationId,
@@ -518,6 +544,27 @@ async function resubmit(
     }
     throw mapServiceError(error);
   }
+}
+
+const reviewStatuses = [
+  "VERIFICATION_REVIEW",
+  "BSM_INITIAL_REVIEW",
+  "AGM_REVIEW",
+  "CFO_REVIEW",
+  "BSM_FINAL_REVIEW",
+  "MD_REVIEW",
+] as const;
+
+function usableDelegation(
+  delegation: DelegationRecord | null,
+  staffUserId: string,
+  stage: ApprovalStage,
+): DelegationRecord | null {
+  if (delegation === null) return null;
+  if (delegation.delegateId !== staffUserId) return null;
+  if (delegation.role !== stageRole(stage)) return null;
+  if (delegation.approvedBy === staffUserId) return null;
+  return delegation;
 }
 
 function actorRoleFor(
