@@ -989,6 +989,101 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
+  it("upgrades populated 0009 financing rows safely into 0010", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+      "0009_whole_nightmare.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+
+    const applicantId = randomUUID();
+    const vehicleModelId = randomUUID();
+    const productId = randomUUID();
+    const ruleId = randomUUID();
+    const applicationId = randomUUID();
+    const offerId = randomUUID();
+    const offerVersionId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164) values ($1, '+233200009910')`,
+      [applicantId],
+    );
+    await pool.query(
+      `insert into vehicle_model (id, manufacturer, model_name, model_year)
+       values ($1, 'Legacy Motors', 'Legacy Pilot', 2025)`,
+      [vehicleModelId],
+    );
+    await pool.query(
+      `insert into product (id, code, name, vehicle_model_id)
+       values ($1, 'LEGACY-0010', 'Legacy financing product', $2)`,
+      [productId, vehicleModelId],
+    );
+    await pool.query(
+      `insert into financing_rule_version
+         (id, product_id, version_number, minimum_deposit_minor_units,
+          annual_rate_bps, allowed_tenures_months, repayment_frequencies,
+          calculation_method)
+       values ($1, $2, 1, 10000, 1200, '[12]'::jsonb, '["MONTHLY"]'::jsonb,
+               'DECLINING_BALANCE')`,
+      [ruleId, productId],
+    );
+    await pool.query(
+      `insert into application
+         (id, applicant_person_id, product_id, status, version, submitted_at)
+       values ($1, $2, $3, 'APPROVED', 7, '2026-08-20T12:00:00.000Z')`,
+      [applicationId, applicantId, productId],
+    );
+    await pool.query(
+      `insert into offer (id, application_id, accepted_at)
+       values ($1, $2, '2026-08-20T12:05:00.000Z')`,
+      [offerId, applicationId],
+    );
+    await pool.query(
+      `insert into offer_version
+         (id, offer_id, financing_rule_version_id, version_number,
+          principal_minor_units, deposit_minor_units, total_payable_minor_units,
+          terms)
+       values ($1, $2, $3, 1, 100000, 10000, 110000, '{}'::jsonb)`,
+      [offerVersionId, offerId, ruleId],
+    );
+    await pool.query(
+      `update offer set accepted_version_id = $2 where id = $1`,
+      [offerId, offerVersionId],
+    );
+
+    await applyMigrationFile(pool, "0010_controlled_financing.sql");
+
+    const migrated = await pool.query<{
+      calculation_method: string;
+      minimum_deposit_minor_units: string;
+      status: string;
+      principal_minor_units: string;
+      canonical_hash: string | null;
+    }>(
+      `select rule.calculation_method, rule.minimum_deposit_minor_units,
+              offer.status, version.principal_minor_units, version.canonical_hash
+         from financing_rule_version rule
+         join offer_version version on version.financing_rule_version_id = rule.id
+         join offer on offer.id = version.offer_id
+        where rule.id = $1`,
+      [ruleId],
+    );
+    expect(migrated.rows[0]).toEqual({
+      calculation_method: "REDUCING_BALANCE",
+      minimum_deposit_minor_units: "10000",
+      status: "ACCEPTED",
+      principal_minor_units: "100000",
+      canonical_hash: null,
+    });
+  });
+
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",

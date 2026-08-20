@@ -295,17 +295,28 @@ async function seedGraph(): Promise<{
   const vehicleModelId = randomUUID();
   const productId = randomUUID();
   const applicationId = randomUUID();
+  const phone = `+2332${Math.floor(Math.random() * 100000000).toString().padStart(8, "0")}`;
+  const modelName = `Pilot-${productId.slice(0, 8)}`;
+  const productCode = `PILOT-${productId.slice(0, 8)}`;
   await executeTestSql(
     databaseUrl!,
-    `insert into privacy.person (id, phone_e164) values ($1, $2);
-     insert into vehicle_model (id, manufacturer, model_name, model_year, active)
-       values ($3, 'Synthetic Motors', $4, 2026, true);
-     insert into product (id, code, name, vehicle_model_id, status)
-       values ($5, $6, 'Controlled pilot product', $3, 'ACTIVE');
-     insert into application
-       (id, applicant_person_id, product_id, status, version, submitted_at)
-       values ($7, $1, $5, 'APPROVED', 7, now())`,
-    [applicantId, `+2332${Math.floor(Math.random() * 100000000).toString().padStart(8, "0")}`, vehicleModelId, `Pilot-${productId.slice(0, 8)}`, productId, `PILOT-${productId.slice(0, 8)}`, applicationId],
+    "insert into privacy.person (id, phone_e164) values ($1, $2)",
+    [applicantId, phone],
+  );
+  await executeTestSql(
+    databaseUrl!,
+    "insert into vehicle_model (id, manufacturer, model_name, model_year, active) values ($1, 'Synthetic Motors', $2, 2026, true)",
+    [vehicleModelId, modelName],
+  );
+  await executeTestSql(
+    databaseUrl!,
+    "insert into product (id, code, name, vehicle_model_id, status) values ($1, $2, 'Controlled pilot product', $3, 'ACTIVE')",
+    [productId, productCode, vehicleModelId],
+  );
+  await executeTestSql(
+    databaseUrl!,
+    "insert into application (id, applicant_person_id, product_id, status, version, submitted_at) values ($1, $2, $3, 'APPROVED', 7, now())",
+    [applicationId, applicantId, productId],
   );
   return {
     applicantId,

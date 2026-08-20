@@ -13,6 +13,10 @@ ALTER TABLE "financing_rule_version"
   ADD COLUMN "effective_until" timestamp with time zone,
   ADD COLUMN "published_at" timestamp with time zone;
 --> statement-breakpoint
+UPDATE "financing_rule_version"
+   SET "calculation_method" = 'REDUCING_BALANCE'
+ WHERE "calculation_method" = 'DECLINING_BALANCE';
+--> statement-breakpoint
 ALTER TABLE "financing_rule_version"
   ADD CONSTRAINT "financing_rule_selling_price_nonnegative"
     CHECK ("selling_price_minor_units" >= 0),

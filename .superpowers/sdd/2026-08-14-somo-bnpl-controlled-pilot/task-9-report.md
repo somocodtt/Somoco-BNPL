@@ -22,12 +22,12 @@
 
 ## Migration safety
 
-Migration `0010_controlled_financing.sql` is additive. Existing accepted offers are backfilled to `status = 'ACCEPTED'` before the status constraint; the legacy rows are not required to have newly introduced hash/consent columns. New rule/offer immutability is enforced by database triggers, and all new command/audit/outbox writes are transactionally coupled by the services.
+Migration `0010_controlled_financing.sql` is additive. Existing legacy `DECLINING_BALANCE` rows are normalized to the supported `REDUCING_BALANCE` name before the method constraint; existing accepted offers are backfilled to `status = 'ACCEPTED'` before the status constraint, and legacy rows are not required to have newly introduced hash/consent columns. New rule/offer immutability is enforced by database triggers, and all new command/audit/outbox writes are transactionally coupled by the services.
 
-The migration and real-PG e2e suite could not be executed in this worktree because `TEST_DATABASE_URL` is not configured. No database was started or mutated as a substitute. Before deployment, run the migration and the focused e2e command against a disposable PostgreSQL database and inspect the resulting schema and trigger behavior.
+The populated-through-0009 integration fixture now covers preservation of legacy money values, method normalization, accepted-offer status backfill, and nullable canonical hashes. The existing complete-journal test covers fresh application and repeat-safe migration. These real-PostgreSQL checks require `TEST_DATABASE_URL`; this agent worktree does not have that URL configured, so no database was started or mutated as a substitute. Before deployment, run the migration and focused e2e commands against the disposable PostgreSQL database and record their assertion-level GREEN counts here.
 
 ## Dependency and self-review
 
 No dependency was added. Financing arithmetic uses bounded bigint rational math, so no Temporal or decimal.js package action was needed. The API workspace link to `@somo/domain` was recorded in the manifest/lock; an offline pnpm linking attempt encountered registry `EACCES` retries and was stopped rather than silently installing or relinking packages.
 
-Self-review found no approved production fixture to transcribe, so production publishing and offer creation remain blocked until signed examples and licence approval are supplied. The only unverified boundary is the real PostgreSQL migration/e2e execution noted above.
+Self-review found no approved production fixture to transcribe, so production publishing and offer creation remain blocked until signed examples and licence approval are supplied. The API e2e seed now sends one SQL statement per `executeTestSql` call, avoiding pg prepared-statement multi-command failures without weakening production code.
