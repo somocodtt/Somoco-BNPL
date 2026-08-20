@@ -3,6 +3,7 @@ export * from "./applications.js";
 export * from "./assets.js";
 export * from "./audit.js";
 export * from "./contracts.js";
+export * from "./financing.js";
 export * from "./integrations.js";
 export * from "./migration.js";
 export * from "./offers.js";

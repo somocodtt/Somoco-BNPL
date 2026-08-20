@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(10);
+    expect(before.rows[0]?.count).toBe(11);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 

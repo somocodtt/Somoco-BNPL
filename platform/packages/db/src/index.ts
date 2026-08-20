@@ -77,6 +77,14 @@ export {
   type NewAuditEvent,
 } from "./repositories/audit.js";
 export {
+  financingRepo,
+  type ApplicationGateRecord,
+  type ExceptionRecord,
+  type FinancingCommandRecord,
+  type FinancingRuleRecord,
+  type OfferRecord,
+} from "./repositories/financing.js";
+export {
   completeOwnershipTransfer,
   type CompleteOwnershipTransferCommand,
 } from "./repositories/contracts.js";

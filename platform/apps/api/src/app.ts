@@ -39,6 +39,11 @@ import { registerApprovalRoutes } from "./modules/approvals/routes.js";
 import { createApprovalService } from "./modules/approvals/service.js";
 import { createUnderwritingService } from "./modules/approvals/underwriting-service.js";
 import type { OtpService } from "./modules/identity/otp-service.js";
+import { registerProductRoutes } from "./modules/products/routes.js";
+import { createProductService } from "./modules/products/service.js";
+import { createExceptionService } from "./modules/products/exception-service.js";
+import { createOfferService } from "./modules/products/offer-service.js";
+import type { FinanceApprovalGate } from "@somo/domain/src/index.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -73,6 +78,7 @@ export interface BuildAppOptions {
     invitationTtlMs: number;
     requiredDocumentTypes: readonly string[];
   };
+  financing?: { fixtureGate?: FinanceApprovalGate };
 }
 
 export async function buildApp(
@@ -136,6 +142,21 @@ export async function buildApp(
   await registerAccessRoutes(app, config, accessService);
   const approvalService = createApprovalService({ database });
   const underwritingService = createUnderwritingService({ database });
+  const productService = createProductService({
+    database,
+    ...(options.financing?.fixtureGate === undefined
+      ? {}
+      : { fixtureGate: options.financing.fixtureGate }),
+  });
+  const exceptionService = createExceptionService({ database });
+  const offerService = createOfferService({
+    database,
+    products: productService,
+    exceptions: exceptionService,
+    ...(options.financing?.fixtureGate === undefined
+      ? {}
+      : { fixtureGate: options.financing.fixtureGate }),
+  });
   let customerOtp: Pick<OtpService, "authenticateSessionToken"> | undefined;
   if (options.identity !== undefined) {
     const otp = createOtpService({
@@ -187,6 +208,15 @@ export async function buildApp(
     accessService,
     approvalService,
     underwritingService,
+    customerOtp,
+  );
+  await registerProductRoutes(
+    app,
+    config,
+    accessService,
+    productService,
+    exceptionService,
+    offerService,
     customerOtp,
   );
   return app;

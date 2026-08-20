@@ -356,9 +356,18 @@ export const exceptionRequest = pgTable(
     policyValue: jsonb("policy_value").$type<unknown>().notNull(),
     reason: text("reason").notNull(),
     status: text("status").notNull().default("PENDING"),
+    requiredApproverRole: text("required_approver_role")
+      .notNull()
+      .default("PRODUCT_ADMIN"),
     requestedBy: uuid("requested_by")
       .notNull()
       .references(() => staffUser.id, { onDelete: "restrict" }),
+    decidedBy: uuid("decided_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    decisionReason: text("decision_reason"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
     version: integer("version").notNull().default(1),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -371,6 +380,14 @@ export const exceptionRequest = pgTable(
     check(
       "exception_request_status_allowed",
       sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,
+    ),
+    check(
+      "exception_request_decision_consistent",
+      sql`${table.status} <> 'PENDING' or (${table.decidedBy} is null and ${table.decidedAt} is null)`,
+    ),
+    check(
+      "exception_request_requester_separate",
+      sql`${table.decidedBy} is null or ${table.decidedBy} <> ${table.requestedBy}`,
     ),
     check("exception_request_version_positive", sql`${table.version} > 0`),
   ],

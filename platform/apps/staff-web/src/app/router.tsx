@@ -3,6 +3,7 @@ import { StaffLogin } from "../features/auth/session.js";
 import { canReview } from "../features/access/role-access.js";
 import { ReviewPanel } from "../features/application-review/review-panel.js";
 import { QueueList, queueTitle } from "../features/queues/queue-list.js";
+import { ProductWorkspace, type ProductApi } from "../features/products/product-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
@@ -13,9 +14,11 @@ import type {
 export function StaffRouter({
   api,
   initialSession = null,
+  productsApi,
 }: {
   api: StaffApi;
   initialSession?: StaffSession | null;
+  productsApi?: ProductApi;
 }) {
   const [session, setSession] = useState<StaffSession | null>(initialSession);
   const [queue, setQueue] = useState<QueueApplication[] | null>(null);
@@ -43,6 +46,9 @@ export function StaffRouter({
 
   if (session === null) {
     return <StaffLogin api={api} onAuthenticated={setSession} />;
+  }
+  if (productsApi !== undefined && session.roles.includes("PRODUCT_ADMIN")) {
+    return <ProductWorkspace api={productsApi} actorId={session.staffUserId} />;
   }
   if (!canReview(session.roles)) {
     return (

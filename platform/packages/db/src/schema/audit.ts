@@ -7,6 +7,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { staffUser } from "./access.js";
+import { person } from "./privacy.js";
 
 export const auditEvent = pgTable(
   "audit_event",
@@ -21,6 +22,9 @@ export const auditEvent = pgTable(
         onDelete: "restrict",
       },
     ),
+    actorPersonId: uuid("actor_person_id").references(() => person.id, {
+      onDelete: "restrict",
+    }),
     requestId: uuid("request_id"),
     data: jsonb("data").$type<Record<string, unknown>>().notNull().default({}),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),

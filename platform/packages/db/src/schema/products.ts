@@ -14,6 +14,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+import { staffUser } from "./access.js";
 
 export const repaymentFrequency = pgEnum("repayment_frequency", [
   "WEEKLY",
@@ -92,6 +93,11 @@ export const financingRuleVersion = pgTable(
     minimumDepositMinorUnits: bigint("minimum_deposit_minor_units", {
       mode: "bigint",
     }).notNull(),
+    sellingPriceMinorUnits: bigint("selling_price_minor_units", {
+      mode: "bigint",
+    })
+      .notNull()
+      .default(0n),
     annualRateBps: numeric("annual_rate_bps", {
       precision: 9,
       scale: 0,
@@ -103,8 +109,39 @@ export const financingRuleVersion = pgTable(
       .$type<Array<"WEEKLY" | "MONTHLY">>()
       .notNull(),
     calculationMethod: text("calculation_method").notNull(),
+    permittedFees: jsonb("permitted_fees")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    eligibilityPolicy: jsonb("eligibility_policy")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    requiredEvidence: jsonb("required_evidence")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    exceptionPolicy: jsonb("exception_policy")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    disclosureVersion: text("disclosure_version"),
+    fixtureHashes: jsonb("fixture_hashes")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    licencePermitted: boolean("licence_permitted").notNull().default(false),
     approved: boolean("approved").notNull().default(false),
+    requestedBy: uuid("requested_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    approvedBy: uuid("approved_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
     effectiveFrom: timestamp("effective_from", { withTimezone: true }),
+    effectiveUntil: timestamp("effective_until", { withTimezone: true }),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -121,6 +158,22 @@ export const financingRuleVersion = pgTable(
     check(
       "financing_rule_rate_bps_nonnegative",
       sql`${table.annualRateBps} >= 0`,
+    ),
+    check(
+      "financing_rule_selling_price_nonnegative",
+      sql`${table.sellingPriceMinorUnits} >= 0`,
+    ),
+    check(
+      "financing_rule_method_allowed",
+      sql`${table.calculationMethod} in ('FLAT_MARKUP', 'REDUCING_BALANCE')`,
+    ),
+    check(
+      "financing_rule_approval_actor_separate",
+      sql`${table.requestedBy} is null or ${table.approvedBy} is null or ${table.requestedBy} <> ${table.approvedBy}`,
+    ),
+    check(
+      "financing_rule_effective_window_ordered",
+      sql`${table.effectiveUntil} is null or ${table.effectiveFrom} is null or ${table.effectiveUntil} > ${table.effectiveFrom}`,
     ),
     check("financing_rule_version_positive", sql`${table.versionNumber} > 0`),
   ],

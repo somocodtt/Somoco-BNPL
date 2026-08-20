@@ -29,6 +29,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@somo/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
       '@fastify/cookie':
         specifier: ^11.1.2
         version: 11.1.2

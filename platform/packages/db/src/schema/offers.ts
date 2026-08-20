@@ -5,11 +5,13 @@ import {
   integer,
   jsonb,
   pgTable,
+  text,
   timestamp,
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
 import { application } from "./applications.js";
+import { person } from "./privacy.js";
 import { financingRuleVersion } from "./products.js";
 
 export const offer = pgTable(
@@ -20,8 +22,16 @@ export const offer = pgTable(
       .notNull()
       .references(() => application.id, { onDelete: "restrict" }),
     acceptedVersionId: uuid("accepted_version_id"),
+    status: text("status").notNull().default("PENDING"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    acceptedByPersonId: uuid("accepted_by_person_id").references(
+      () => person.id,
+      { onDelete: "restrict" },
+    ),
     version: integer("version").notNull().default(1),
     acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    acceptedHash: text("accepted_hash"),
+    consentAt: timestamp("consent_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -32,6 +42,10 @@ export const offer = pgTable(
   (table) => [
     uniqueIndex("offer_application_unique").on(table.applicationId),
     check("offer_version_positive", sql`${table.version} > 0`),
+    check(
+      "offer_status_allowed",
+      sql`${table.status} in ('PENDING', 'EXPIRED', 'ACCEPTED', 'CANCELLED')`,
+    ),
   ],
 );
 
@@ -55,6 +69,7 @@ export const offerVersion = pgTable(
     totalPayableMinorUnits: bigint("total_payable_minor_units", {
       mode: "bigint",
     }).notNull(),
+    canonicalHash: text("canonical_hash"),
     terms: jsonb("terms").$type<Record<string, unknown>>().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()

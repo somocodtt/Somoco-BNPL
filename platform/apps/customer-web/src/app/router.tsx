@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AuthFlow } from "../features/auth/auth-flow.js";
 import { ApplicationForm } from "../features/application/application-form.js";
 import { GuarantorForm } from "../features/guarantor/guarantor-form.js";
+import { OfferPanel, type OfferApi } from "../features/offer/offer-panel.js";
 import type {
   ApplicantMutation,
   CustomerApi,
@@ -14,10 +15,12 @@ export function CustomerRouter({
   api,
   initialSession = null,
   initialPhoneE164 = null,
+  offerApi,
 }: {
   api: CustomerApi;
   initialSession?: CustomerSession | null;
   initialPhoneE164?: string | null;
+  offerApi?: OfferApi;
 }) {
   const [session, setSession] = useState(initialSession);
   const [phoneE164, setPhoneE164] = useState(initialPhoneE164);
@@ -141,6 +144,19 @@ export function CustomerRouter({
       </main>
     );
   const loadedState = state;
+
+  if (offerApi !== undefined && loadedState.draft?.status === "APPROVED") {
+    return (
+      <>
+        {sessionWarning ? (
+          <p role="alert" className="session-warning">
+            Your secure session expires soon. Save your draft now.
+          </p>
+        ) : null}
+        <OfferPanel api={offerApi} applicationId={loadedState.draft!.id} />
+      </>
+    );
+  }
 
   async function save(input: ApplicantMutation) {
     try {
