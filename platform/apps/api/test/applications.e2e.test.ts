@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { createDatabase, migrateDatabase, type Database } from "@somo/db";
 import { otpDerivationKeyId } from "@somo/integrations";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -29,6 +29,8 @@ if (databaseUrl === undefined) {
 
 const guarantorPhone = "+233241000002";
 const requiredDocuments = ["GHANA_CARD_FRONT"] as const;
+const invitationSecret =
+  "task-7-test-invitation-secret-at-least-32-chars";
 
 let database: Database;
 let closeDatabase: () => Promise<void>;
@@ -56,7 +58,7 @@ beforeEach(async () => {
   clock = mutableClock("2026-08-17T10:00:00.000Z");
   service = createApplicationService({
     database,
-    invitationHashSecret: "task-7-test-invitation-secret-at-least-32-chars",
+    invitationHashSecret: invitationSecret,
     invitationTtlMs: 30 * 60_000,
     requiredDocumentTypes: requiredDocuments,
     clock,
@@ -132,6 +134,11 @@ describe("application onboarding service", () => {
     await expect(service.resume(other)).resolves.toEqual({
       draft: null,
       guarantorStatus: "NOT_INVITED",
+      guarantorInvitation: {
+        status: "NOT_INVITED",
+        relationshipVersion: null,
+        expiresAt: null,
+      },
     });
   });
 
@@ -151,7 +158,7 @@ describe("application onboarding service", () => {
     ).rejects.toMatchObject({ code: "APPLICATION_NOT_FOUND" });
   });
 
-  it("expires a hashed invitation and allows only the invited customer to claim it", async () => {
+  it("stores only reconstructable invitation delivery metadata and never returns the bearer", async () => {
     const draft = await service.createDraft(applicant);
     const saved = await saveApplicant(draft);
     const invitation = await service.inviteGuarantor(draft.id, applicant, {
@@ -160,20 +167,95 @@ describe("application onboarding service", () => {
       guarantorPhoneE164: guarantorPhone,
     });
 
-    const persisted = await readApplicationRow<{ token_hash: string }>(
-      "select token_hash from guarantor_invitation where application_id = $1",
+    expect(invitation).not.toHaveProperty("token");
+    const persisted = await readApplicationRow<{
+      token_hash: string;
+      payload: Record<string, unknown>;
+    }>(
+      `select gi.token_hash, o.payload
+         from guarantor_invitation gi
+         join outbox_message o
+           on o.aggregate_id = gi.application_id
+          and o.topic = 'applications.guarantor_invited'
+        where gi.application_id = $1`,
       [draft.id],
     );
     expect(persisted.token_hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(persisted.token_hash).not.toContain(invitation.token);
+    expect(persisted.payload).toEqual({
+      invitationId: invitation.invitationId,
+      requestId: applicant.requestId,
+      tokenVersion: 1,
+      derivationKeyId: expect.stringMatching(
+        /^guarantor-invitation-v1:[0-9a-f]{32}$/,
+      ),
+    });
+    expect(JSON.stringify(persisted)).not.toContain(guarantorPhone);
+  });
+
+  it("expires a hashed invitation and allows only the invited customer to claim it", async () => {
+    const draft = await service.createDraft(applicant);
+    const saved = await saveApplicant(draft);
+    const invitation = await service.inviteGuarantor(draft.id, applicant, {
+      expectedVersion: saved.version,
+      mutationId: randomUUID(),
+      guarantorPhoneE164: guarantorPhone,
+    });
+    const token = deriveInvitationToken(invitation.invitationId);
     await expect(
-      service.saveGuarantor(invitation.token, other, guarantorSave(1)),
+      service.saveGuarantor(token, other, guarantorSave(1)),
     ).rejects.toMatchObject({ code: "INVITATION_NOT_FOUND" });
 
     clock.advance(30 * 60_000 + 1);
     await expect(
-      service.saveGuarantor(invitation.token, guarantor, guarantorSave(1)),
+      service.saveGuarantor(token, guarantor, guarantorSave(1)),
     ).rejects.toMatchObject({ code: "INVITATION_EXPIRED" });
+  });
+
+  it("returns live expiry and incremented relationship versions across reinvites", async () => {
+    const draft = await service.createDraft(applicant);
+    const saved = await saveApplicant(draft);
+    const first = await service.inviteGuarantor(draft.id, applicant, {
+      expectedVersion: saved.version,
+      mutationId: randomUUID(),
+      guarantorPhoneE164: guarantorPhone,
+    });
+    expect(first.relationshipVersion).toBe(1);
+    await expect(service.resume(applicant)).resolves.toMatchObject({
+      guarantorInvitation: {
+        status: "INVITED",
+        relationshipVersion: 1,
+        expiresAt: first.expiresAt,
+      },
+    });
+
+    clock.advance(30 * 60_000 + 1);
+    await expect(service.resume(applicant)).resolves.toMatchObject({
+      guarantorInvitation: {
+        status: "EXPIRED",
+        relationshipVersion: 1,
+        expiresAt: first.expiresAt,
+      },
+    });
+    const second = await service.inviteGuarantor(draft.id, applicant, {
+      expectedVersion: first.applicationVersion,
+      mutationId: randomUUID(),
+      guarantorPhoneE164: guarantorPhone,
+    });
+    expect(second.relationshipVersion).toBe(2);
+    const token = deriveInvitationToken(second.invitationId);
+    await expect(
+      service.resolveGuarantorInvitation(token, other),
+    ).rejects.toMatchObject({ code: "INVITATION_NOT_FOUND" });
+    await expect(
+      service.resolveGuarantorInvitation(token, guarantor),
+    ).resolves.toMatchObject({
+      status: "INVITED",
+      relationshipVersion: 2,
+      expiresAt: second.expiresAt,
+    });
+    await expect(
+      service.saveGuarantor(token, guarantor, guarantorSave(2)),
+    ).resolves.toMatchObject({ relationshipVersion: 3 });
   });
 
   it("requires the applicant's own successful NIA check and clean evidence", async () => {
@@ -213,7 +295,7 @@ describe("application onboarding service", () => {
   it("requires the guarantor's own NIA check and clean evidence", async () => {
     const { draft, invitation } = await prepareInvitation();
     const guarantorSaved = await service.saveGuarantor(
-      invitation.token,
+      deriveInvitationToken(invitation.invitationId),
       guarantor,
       guarantorSave(1),
     );
@@ -240,7 +322,7 @@ describe("application onboarding service", () => {
     await seedVerifiedIdentity(guarantor.personId);
     await seedCleanDocument(guarantor.personId, "GHANA_CARD_FRONT");
     const guarantorSaved = await service.saveGuarantor(
-      invitation.token,
+      deriveInvitationToken(invitation.invitationId),
       guarantor,
       guarantorSave(1),
     );
@@ -334,6 +416,42 @@ describe("customer application routes", () => {
     });
     expect(response.statusCode).toBe(401);
     expect(response.json()).toMatchObject({ code: "AUTHENTICATION_FAILED" });
+    await app.close();
+  });
+
+  it("resolves an invitation bearer only from an authenticated request body", async () => {
+    const { invitation } = await prepareInvitation();
+    const token = deriveInvitationToken(invitation.invitationId);
+    const app = fastify({ logger: false, genReqId: () => randomUUID() });
+    await registerProblemErrors(app);
+    await registerApplicationRoutes(
+      app,
+      {
+        async authenticateSessionToken(value: string) {
+          const actor = value === "g".repeat(43) ? guarantor : other;
+          return {
+            kind: "customer" as const,
+            customerAccountId: randomUUID(),
+            personId: actor.personId,
+            sessionId: actor.sessionId,
+          };
+        },
+      },
+      service,
+    );
+
+    const resolved = await app.inject({
+      method: "POST",
+      url: "/v1/customer/guarantor-invitations/resolutions",
+      headers: { authorization: `Bearer ${"g".repeat(43)}` },
+      payload: { invitationToken: token },
+    });
+
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json()).toMatchObject({
+      status: "INVITED",
+      relationshipVersion: invitation.relationshipVersion,
+    });
     await app.close();
   });
 
@@ -458,6 +576,12 @@ function guarantorSave(expectedVersion: number) {
 
 function submitInput(expectedVersion: number) {
   return { expectedVersion, mutationId: randomUUID() };
+}
+
+function deriveInvitationToken(invitationId: string): string {
+  return createHmac("sha256", invitationSecret)
+    .update(`somo:guarantor:invitation:v1\0${invitationId}`)
+    .digest("base64url");
 }
 
 function context(personId: string): ApplicationContext {

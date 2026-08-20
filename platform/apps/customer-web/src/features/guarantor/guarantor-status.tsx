@@ -1,11 +1,12 @@
 export function GuarantorStatus({
   status,
 }: {
-  status: "NOT_INVITED" | "INVITED" | "CONFIRMED";
+  status: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
 }) {
   const copy = {
     NOT_INVITED: "Guarantor not invited",
     INVITED: "Invitation sent. Waiting for the guarantor.",
+    EXPIRED: "Invitation expired",
     CONFIRMED: "Guarantor section complete",
   } as const;
   return (

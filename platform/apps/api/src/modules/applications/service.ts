@@ -1,16 +1,22 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   createApplicationDraft,
   createGuarantorInvitation,
   listActiveVehicleModels,
   readOwnedApplicationState,
   readResumableApplication,
+  resolveGuarantorInvitation,
   saveApplicantSection,
   saveGuarantorSection,
   submitApplication,
   type ApplicationActor,
   type Database,
 } from "@somo/db";
+import {
+  deriveGuarantorInvitationToken,
+  GUARANTOR_INVITATION_TOKEN_VERSION,
+  guarantorInvitationDerivationKeyId,
+} from "@somo/integrations";
 import { AppError } from "../../plugins/errors.js";
 import {
   assertApplicationComplete,
@@ -36,7 +42,12 @@ export interface ApplicationService {
           applicantProfile: Record<string, unknown>;
         })
       | null;
-    guarantorStatus: "NOT_INVITED" | "INVITED" | "CONFIRMED";
+    guarantorStatus: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
+    guarantorInvitation: {
+      status: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
+      relationshipVersion: number | null;
+      expiresAt: string | null;
+    };
   }>;
   saveApplicant(
     applicationId: string,
@@ -48,10 +59,10 @@ export interface ApplicationService {
     context: ApplicationContext,
     input: GuarantorInviteInput,
   ): Promise<{
-    token: string;
     invitationId: string;
     expiresAt: string;
     applicationVersion: number;
+    relationshipVersion: number;
   }>;
   saveGuarantor(
     invitationToken: string,
@@ -61,6 +72,15 @@ export interface ApplicationService {
     relationshipVersion: number;
     applicationVersion: number;
     status: string;
+  }>;
+  resolveGuarantorInvitation(
+    invitationToken: string,
+    context: ApplicationContext,
+  ): Promise<{
+    status: string;
+    relationshipVersion: number;
+    applicationVersion: number;
+    expiresAt: string;
   }>;
   getCompleteness(
     applicationId: string,
@@ -119,7 +139,11 @@ export function createApplicationService(options: {
     },
 
     async resume(context) {
-      return readResumableApplication(options.database, context.personId);
+      return readResumableApplication(
+        options.database,
+        context.personId,
+        clock.now(),
+      );
     },
 
     async saveApplicant(applicationId, context, input) {
@@ -156,11 +180,15 @@ export function createApplicationService(options: {
           "Enter a valid Ghana phone number.",
         );
       }
-      const token = invitationToken(
+      const invitationId = randomUUID();
+      const token = deriveGuarantorInvitationToken(
         policy.invitationHashSecret,
-        applicationId,
-        input.mutationId,
-        input.guarantorPhoneE164,
+        invitationId,
+        GUARANTOR_INVITATION_TOKEN_VERSION,
+      );
+      const derivationKeyId = guarantorInvitationDerivationKeyId(
+        policy.invitationHashSecret,
+        GUARANTOR_INVITATION_TOKEN_VERSION,
       );
       const now = clock.now();
       const command = mutationCommand(
@@ -176,13 +204,16 @@ export function createApplicationService(options: {
         createGuarantorInvitation(options.database, {
           ...command,
           expectedVersion: input.expectedVersion,
+          invitationId,
           guarantorPhoneE164: input.guarantorPhoneE164,
           tokenHash: hashToken(policy.invitationHashSecret, token),
+          tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+          derivationKeyId,
           expiresAt: new Date(now.getTime() + policy.invitationTtlMs),
           now,
         }),
       );
-      return { token, ...result };
+      return result;
     },
 
     async saveGuarantor(invitationTokenValue, context, input) {
@@ -210,6 +241,20 @@ export function createApplicationService(options: {
           ),
           expectedVersion: input.expectedVersion,
           profile: input.profile,
+          now: clock.now(),
+        }),
+      );
+    },
+
+    async resolveGuarantorInvitation(invitationTokenValue, context) {
+      assertInvitationToken(invitationTokenValue);
+      return mapErrors(() =>
+        resolveGuarantorInvitation(options.database, {
+          tokenHash: hashToken(
+            policy.invitationHashSecret,
+            invitationTokenValue,
+          ),
+          guarantorPersonId: context.personId,
           now: clock.now(),
         }),
       );
@@ -329,6 +374,12 @@ function assertProfile(profile: Record<string, unknown>): void {
   }
 }
 
+function assertInvitationToken(value: string): void {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) {
+    throw new AppError(404, "INVITATION_NOT_FOUND", "Invitation was not found.");
+  }
+}
+
 function assertUuid(value: string, code: string): void {
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -337,17 +388,6 @@ function assertUuid(value: string, code: string): void {
   ) {
     throw new AppError(400, code, "The request identifier is invalid.");
   }
-}
-
-function invitationToken(
-  secret: string,
-  applicationId: string,
-  mutationId: string,
-  phone: string,
-) {
-  return createHmac("sha256", secret)
-    .update(`guarantor-invitation\0${applicationId}\0${mutationId}\0${phone}`)
-    .digest("base64url");
 }
 
 function hashToken(secret: string, token: string): string {

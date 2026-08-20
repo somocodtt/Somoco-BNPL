@@ -1,10 +1,13 @@
 import {
+  findGuarantorInvitationDeliveryContext,
   findOtpDeliveryContext,
   type Database,
   type OutboxMessage,
 } from "@somo/db";
 import {
+  deriveGuarantorInvitationToken,
   deriveOtpCode,
+  validateGuarantorInvitationDeliveryPolicy,
   validateOtpDeliveryPolicy,
   type SmsPort,
 } from "@somo/integrations";
@@ -12,6 +15,82 @@ import {
   createOutboxHandler,
   PermanentWorkerError,
 } from "./dispatch-outbox.js";
+
+export interface GuarantorInvitationDeliveryLookup {
+  find(invitationId: string): Promise<{
+    phoneE164: string;
+    expiresAt: Date;
+    claimedAt: Date | null;
+    revokedAt: Date | null;
+  } | null>;
+}
+
+export function createDatabaseGuarantorInvitationDeliveryLookup(
+  database: Database,
+): GuarantorInvitationDeliveryLookup {
+  return Object.freeze({
+    find: (invitationId: string) =>
+      findGuarantorInvitationDeliveryContext(database, invitationId),
+  });
+}
+
+export function createSendGuarantorInvitationHandler(options: {
+  sms: SmsPort;
+  lookup: GuarantorInvitationDeliveryLookup;
+  derivationSecret: string;
+  derivationKeyId: string;
+  tokenVersion: number;
+  invitationBaseUrl: string;
+  now?: () => Date;
+}) {
+  const now = options.now ?? (() => new Date());
+  const policy = validateGuarantorInvitationDeliveryPolicy({
+    derivationSecret: options.derivationSecret,
+    derivationKeyId: options.derivationKeyId,
+    tokenVersion: options.tokenVersion,
+  });
+  const invitationBaseUrl = validateInvitationBaseUrl(
+    options.invitationBaseUrl,
+  );
+  return createOutboxHandler(
+    [options.sms],
+    async (message: OutboxMessage) => {
+      const payload = guarantorInvitationPayload(message.payload);
+      if (
+        payload.derivationKeyId !== policy.derivationKeyId ||
+        payload.tokenVersion !== policy.tokenVersion
+      ) {
+        throw new PermanentWorkerError(
+          "GUARANTOR_INVITATION_DELIVERY_POLICY_MISMATCH",
+        );
+      }
+      const delivery = await options.lookup.find(payload.invitationId);
+      if (
+        delivery === null ||
+        delivery.claimedAt !== null ||
+        delivery.revokedAt !== null ||
+        delivery.expiresAt.getTime() <= now().getTime()
+      ) {
+        return Object.freeze({ suppressed: true });
+      }
+      const token = deriveGuarantorInvitationToken(
+        options.derivationSecret,
+        payload.invitationId,
+        policy.tokenVersion,
+      );
+      const invitationUrl = new URL(invitationBaseUrl);
+      invitationUrl.hash = new URLSearchParams({ invitation: token }).toString();
+      return options.sms.send({
+        idempotencyKey: message.id,
+        phoneE164: delivery.phoneE164,
+        template: "GUARANTOR_INVITATION",
+        variables: { invitationLink: invitationUrl.toString() },
+      });
+    },
+    [[options.sms, "SMS"]],
+    { guarantorInvitationDeliveryPolicy: policy },
+  );
+}
 
 export function createSendNotificationHandler(sms: SmsPort) {
   return createOutboxHandler(
@@ -117,6 +196,36 @@ function otpPayload(payload: unknown): {
   return { challengeId, derivationKeyId, codeLength };
 }
 
+function guarantorInvitationPayload(payload: unknown): {
+  invitationId: string;
+  derivationKeyId: string;
+  tokenVersion: number;
+} {
+  if (typeof payload !== "object" || payload === null) {
+    invalidGuarantorInvitationPayload();
+  }
+  const candidate = payload as Record<string, unknown>;
+  const invitationId = candidate["invitationId"];
+  const derivationKeyId = candidate["derivationKeyId"];
+  const tokenVersion = candidate["tokenVersion"];
+  if (
+    typeof invitationId !== "string" ||
+    typeof derivationKeyId !== "string" ||
+    typeof tokenVersion !== "number"
+  ) {
+    invalidGuarantorInvitationPayload();
+  }
+  return { invitationId, derivationKeyId, tokenVersion };
+}
+
+function validateInvitationBaseUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.search !== "" || url.hash !== "") {
+    throw new Error("GUARANTOR_INVITATION_BASE_URL_INVALID");
+  }
+  return url.toString();
+}
+
 function notificationPayload(payload: unknown): {
   phoneE164: string;
   template: string;
@@ -154,4 +263,8 @@ function invalidPayload(): never {
 
 function invalidOtpPayload(): never {
   throw new PermanentWorkerError("OTP_DELIVERY_PAYLOAD_INVALID");
+}
+
+function invalidGuarantorInvitationPayload(): never {
+  throw new PermanentWorkerError("GUARANTOR_INVITATION_PAYLOAD_INVALID");
 }

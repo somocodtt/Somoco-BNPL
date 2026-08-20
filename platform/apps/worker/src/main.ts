@@ -175,6 +175,20 @@ export function validateWorkerHandlerRegistry(
   if (registration.otpDeliveryPolicy === undefined) {
     throw new Error("WORKER_OTP_POLICY_REQUIRED");
   }
+  const invitationHandler = handlers.get("applications.guarantor_invited");
+  if (invitationHandler === undefined) {
+    throw new Error("WORKER_GUARANTOR_INVITATION_HANDLER_REQUIRED");
+  }
+  const invitationRegistration =
+    inspectOutboxHandlerRegistration(invitationHandler);
+  if (!invitationRegistration?.capabilities.has("SMS")) {
+    throw new Error("WORKER_GUARANTOR_INVITATION_SMS_CAPABILITY_REQUIRED");
+  }
+  if (
+    invitationRegistration.guarantorInvitationDeliveryPolicy === undefined
+  ) {
+    throw new Error("WORKER_GUARANTOR_INVITATION_POLICY_REQUIRED");
+  }
 }
 
 export async function runWorkerProcess(

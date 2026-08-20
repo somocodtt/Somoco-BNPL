@@ -54,9 +54,11 @@ export {
 export {
   createApplicationDraft,
   createGuarantorInvitation,
+  findGuarantorInvitationDeliveryContext,
   listActiveVehicleModels,
   readOwnedApplicationState,
   readResumableApplication,
+  resolveGuarantorInvitation,
   saveApplicantSection,
   saveGuarantorSection,
   submitApplication,

@@ -870,6 +870,67 @@ describe("populated legacy schema migration", () => {
       pool.query(`select count(*)::int from guarantor_invitation`),
     ).resolves.toMatchObject({ rows: [{ count: 0 }] });
   });
+
+  it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const applicantId = randomUUID();
+    const firstGuarantorId = randomUUID();
+    const secondGuarantorId = randomUUID();
+    const applicationId = randomUUID();
+    await pool.query(
+      `insert into privacy.person (id, phone_e164)
+       values ($1, '+233200009905'), ($2, '+233200009906'), ($3, '+233200009907')`,
+      [applicantId, firstGuarantorId, secondGuarantorId],
+    );
+    await pool.query(
+      `insert into application (id, applicant_person_id) values ($1, $2)`,
+      [applicationId, applicantId],
+    );
+    await pool.query(
+      `insert into guarantor_relationship
+         (id, application_id, guarantor_person_id)
+       values ($1, $2, $3), ($4, $2, $5)`,
+      [
+        randomUUID(),
+        applicationId,
+        firstGuarantorId,
+        randomUUID(),
+        secondGuarantorId,
+      ],
+    );
+
+    await expect(
+      applyMigrationFile(pool, "0008_regular_juggernaut.sql"),
+    ).rejects.toMatchObject({
+      code: "P0001",
+      message: expect.stringContaining(
+        "MIGRATION_0008_DUPLICATE_GUARANTOR_RELATIONSHIPS",
+      ),
+      hint: expect.stringContaining(
+        "resolve each application to exactly one guarantor_relationship row",
+      ),
+    });
+    await expect(
+      pool.query(
+        `select count(*)::int count
+           from guarantor_relationship where application_id = $1`,
+        [applicationId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 2 }] });
+    await expect(
+      pool.query(`select to_regclass('public.guarantor_invitation') created`),
+    ).resolves.toMatchObject({ rows: [{ created: null }] });
+  });
 });
 
 function writeEffects(aggregateId: string, action = "APPLICATION_CREATED") {

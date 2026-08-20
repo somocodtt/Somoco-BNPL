@@ -1,4 +1,10 @@
-import { useState, type FormEvent, type MouseEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type MouseEvent,
+} from "react";
 import type {
   ApplicantMutation,
   CustomerApi,
@@ -6,17 +12,28 @@ import type {
 } from "../../lib/api.js";
 import { DocumentProgress } from "../documents/document-progress.js";
 import { GuarantorStatus } from "../guarantor/guarantor-status.js";
+import { IdentityVerification } from "../auth/identity-verification.js";
 
 export function ApplicationForm({
   api,
   state,
   onSave,
   onSubmit,
+  onInvite,
+  phoneE164,
+  onEvidenceChanged,
 }: {
   api: CustomerApi;
   state: OnboardingState;
-  onSave(input: ApplicantMutation): Promise<"saved" | "queued">;
+  onSave(input: ApplicantMutation): Promise<"saved" | "queued" | "conflict">;
   onSubmit(): Promise<void>;
+  onInvite(guarantorPhoneE164: string): Promise<{
+    applicationVersion: number;
+    relationshipVersion: number;
+    expiresAt: string;
+  }>;
+  phoneE164: string | null;
+  onEvidenceChanged(): Promise<void>;
 }) {
   const draft = state.draft!;
   const [vehicleModelId, setVehicleModelId] = useState(
@@ -29,10 +46,15 @@ export function ApplicationForm({
     String(draft.applicantProfile.residentialArea ?? ""),
   );
   const [guarantorPhone, setGuarantorPhone] = useState("");
-  const [guarantorStatus, setGuarantorStatus] = useState(state.guarantorStatus);
+  const guarantorStatus = state.guarantorInvitation.status;
   const [saveState, setSaveState] = useState<"idle" | "saving">("idle");
   const [notice, setNotice] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const errorSummary = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (Object.keys(errors).length > 0) errorSummary.current?.focus();
+  }, [errors]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -49,22 +71,21 @@ export function ApplicationForm({
       if (outcome === "saved") setNotice("Draft saved");
     } catch (error) {
       if (isFieldProblem(error)) setErrors(error.fieldErrors);
-      else throw error;
+      else setNotice("Draft could not be saved. Try again.");
     } finally {
       setSaveState("idle");
     }
   }
 
   async function invite() {
-    const result = await api.inviteGuarantor(draft.id, {
-      expectedVersion: draft.version,
-      mutationId: crypto.randomUUID(),
-      guarantorPhoneE164: guarantorPhone,
-    });
-    setGuarantorStatus("INVITED");
-    setNotice(
-      `Invitation sent. It expires ${new Date(result.expiresAt).toLocaleString()}.`,
-    );
+    try {
+      const result = await onInvite(guarantorPhone);
+      setNotice(
+        `Invitation sent. It expires ${new Date(result.expiresAt).toLocaleString()}.`,
+      );
+    } catch {
+      setNotice("Invitation could not be sent. Try again.");
+    }
   }
 
   async function submit() {
@@ -96,7 +117,12 @@ export function ApplicationForm({
       </header>
 
       {Object.keys(errors).length > 0 ? (
-        <section role="alert" tabIndex={-1} className="error-summary">
+        <section
+          ref={errorSummary}
+          role="alert"
+          tabIndex={-1}
+          className="error-summary"
+        >
           <h2>There is a problem</h2>
           <ul>
             {Object.entries(errors).map(([field, message]) => (
@@ -162,8 +188,17 @@ export function ApplicationForm({
                 required
               />
             </section>
+            <IdentityVerification
+              api={api}
+              phoneE164={phoneE164}
+              idPrefix="applicant"
+              onVerified={onEvidenceChanged}
+            />
             <DocumentProgress
               {...state.completeness.documentProgress.applicant}
+              api={api}
+              idPrefix="applicant"
+              onAccepted={onEvidenceChanged}
             />
             <button disabled={saveState === "saving" || !vehicleModelId}>
               {saveState === "saving" ? "Saving draft" : "Save and continue"}
@@ -172,7 +207,8 @@ export function ApplicationForm({
         </li>
         <li>
           <GuarantorStatus status={guarantorStatus} />
-          {guarantorStatus === "NOT_INVITED" ? (
+          {guarantorStatus === "NOT_INVITED" ||
+          guarantorStatus === "EXPIRED" ? (
             <div className="form-group">
               <label htmlFor="guarantorPhone">Guarantor mobile number</label>
               <input
@@ -186,7 +222,9 @@ export function ApplicationForm({
                 disabled={!/^\+233[1-9]\d{8}$/.test(guarantorPhone)}
                 onClick={() => void invite()}
               >
-                Send invitation
+                {guarantorStatus === "EXPIRED"
+                  ? "Send new invitation"
+                  : "Send invitation"}
               </button>
             </div>
           ) : null}

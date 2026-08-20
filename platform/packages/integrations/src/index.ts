@@ -5,6 +5,7 @@ export * from "./nia.js";
 export * from "./malware-scanner.js";
 export * from "./object-storage.js";
 export * from "./otp-delivery.js";
+export * from "./guarantor-invitation-delivery.js";
 export * from "./payments.js";
 export * from "./sms.js";
 export * from "./tracker.js";

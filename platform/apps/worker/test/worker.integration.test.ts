@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { ClaimedOutboxMessage, OutboxMessage } from "@somo/db";
 import {
   createProductionConnectorBoundary,
+  deriveGuarantorInvitationToken,
   deriveOtpCode,
+  GUARANTOR_INVITATION_TOKEN_VERSION,
+  guarantorInvitationDerivationKeyId,
   otpDerivationKeyId,
+  type SmsPort,
 } from "@somo/integrations";
 import {
   IntegrationTemporaryError,
@@ -27,6 +31,7 @@ import {
 } from "../src/jobs/dispatch-outbox.js";
 import { createRecomputeArrearsHandler } from "../src/jobs/recompute-arrears.js";
 import {
+  createSendGuarantorInvitationHandler,
   createSendNotificationHandler,
   createSendOtpHandler,
 } from "../src/jobs/send-notification.js";
@@ -277,6 +282,44 @@ describe("durable outbox worker", () => {
     ).toThrow("WORKER_OTP_SMS_CAPABILITY_REQUIRED");
   });
 
+  it("requires a policy-bound SMS invitation handler before a production loop starts", () => {
+    const boundary = createProductionConnectorBoundary();
+    const sms = boundary.register({
+      kind: "SMS",
+      provenance: {
+        packageName: "@somo-external/synthetic-sms",
+        packageVersion: "1.0.0",
+        connectorId: "synthetic-sms",
+      },
+      adapter: {
+        async send() {
+          return {
+            providerReference: "external-sms-1",
+            acceptedAt: "2026-08-14T12:00:00.000Z",
+          };
+        },
+      },
+    });
+    const otpSecret =
+      "production-otp-delivery-secret-at-least-32-characters";
+    const handlers = new Map<string, OutboxHandler>([
+      [
+        "identity.otp_sms_requested",
+        createSendOtpHandler({
+          sms,
+          lookup: { async find() { return null; } },
+          derivationSecret: otpSecret,
+          derivationKeyId: otpDerivationKeyId(otpSecret),
+          codeLength: 6,
+        }),
+      ],
+    ]);
+
+    expect(() =>
+      validateWorkerHandlerRegistry("production", handlers),
+    ).toThrow("WORKER_GUARANTOR_INVITATION_HANDLER_REQUIRED");
+  });
+
   it("accepts a complete production registry with an externally constructed SMS connector", () => {
     const productionPaymentVerifier = {
       async verify() {
@@ -301,6 +344,8 @@ describe("durable outbox worker", () => {
       },
     });
     const secret = "production-otp-delivery-secret-at-least-32-characters";
+    const invitationSecret =
+      "production-guarantor-invitation-secret-at-least-32-characters";
     const handlers = new Map<string, OutboxHandler>([
       [
         "payment.verify",
@@ -318,6 +363,22 @@ describe("durable outbox worker", () => {
           derivationSecret: secret,
           derivationKeyId: otpDerivationKeyId(secret),
           codeLength: 6,
+        }),
+      ],
+      [
+        "applications.guarantor_invited",
+        createSendGuarantorInvitationHandler({
+          sms,
+          lookup: {
+            async find() {
+              return null;
+            },
+          },
+          derivationSecret: invitationSecret,
+          derivationKeyId:
+            guarantorInvitationDerivationKeyId(invitationSecret),
+          tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+          invitationBaseUrl: "https://customer.somo.example/guarantor",
         }),
       ],
     ]);
@@ -895,6 +956,123 @@ describe("durable outbox worker", () => {
       providerReference: "sms-sim-otp-1001",
       acceptedAt: "2026-08-14T12:00:00.000Z",
     });
+  });
+
+  it("derives a fragment-only guarantor link at dispatch after resolving the target phone", async () => {
+    const invitationId = "00000000-0000-4000-8000-000000001101";
+    const secret =
+      "test-guarantor-invitation-secret-with-at-least-32-characters";
+    const derivationKeyId = guarantorInvitationDerivationKeyId(secret);
+    const token = deriveGuarantorInvitationToken(secret, invitationId);
+    const sends: Parameters<SmsPort["send"]>[0][] = [];
+    const sms: SmsPort = {
+      async send(input) {
+        sends.push(input);
+        return {
+          providerReference: "sms-guarantor-1101",
+          acceptedAt: "2026-08-14T12:00:00.000Z",
+        };
+      },
+    };
+    const handler = createSendGuarantorInvitationHandler({
+      sms,
+      lookup: {
+        async find(id) {
+          expect(id).toBe(invitationId);
+          return {
+            phoneE164: "+233241000002",
+            expiresAt: new Date("2026-08-14T12:30:00.000Z"),
+            claimedAt: null,
+            revokedAt: null,
+          };
+        },
+      },
+      derivationSecret: secret,
+      derivationKeyId,
+      tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+      invitationBaseUrl: "https://customer.somo.example/guarantor",
+      now: () => new Date("2026-08-14T12:00:00.000Z"),
+    });
+    const message = {
+      ...outboxMessage("00000000-0000-4000-8000-000000001102"),
+      topic: "applications.guarantor_invited",
+      payload: {
+        requestId: "request-1101",
+        invitationId,
+        derivationKeyId,
+        tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+      },
+    };
+
+    await handler(message);
+
+    expect(sends).toEqual([
+      {
+        idempotencyKey: message.id,
+        phoneE164: "+233241000002",
+        template: "GUARANTOR_INVITATION",
+        variables: {
+          invitationLink: `https://customer.somo.example/guarantor#invitation=${token}`,
+        },
+      },
+    ]);
+    expect(JSON.stringify(message.payload)).not.toContain(token);
+    expect(JSON.stringify(message.payload)).not.toContain("+233241000002");
+    expect(sends[0]!.variables.invitationLink).not.toContain("?");
+  });
+
+  it("rejects invitation delivery policy mismatch before lookup or provider", async () => {
+    const secret =
+      "test-guarantor-invitation-secret-with-at-least-32-characters";
+    const derivationKeyId = guarantorInvitationDerivationKeyId(secret);
+    const calls = { lookup: 0, provider: 0 };
+    const handler = createSendGuarantorInvitationHandler({
+      sms: {
+        async send() {
+          calls.provider += 1;
+          return {
+            providerReference: "must-not-send",
+            acceptedAt: "2026-08-14T12:00:00.000Z",
+          };
+        },
+      },
+      lookup: {
+        async find() {
+          calls.lookup += 1;
+          return null;
+        },
+      },
+      derivationSecret: secret,
+      derivationKeyId,
+      tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+      invitationBaseUrl: "https://customer.somo.example/guarantor",
+    });
+    const message = {
+      ...outboxMessage("00000000-0000-4000-8000-000000001103"),
+      topic: "applications.guarantor_invited",
+      payload: {
+        invitationId: "00000000-0000-4000-8000-000000001101",
+        derivationKeyId: "guarantor-invitation-v1:mismatch",
+        tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION,
+      },
+    };
+
+    await expect(handler(message)).rejects.toMatchObject({
+      code: "GUARANTOR_INVITATION_DELIVERY_POLICY_MISMATCH",
+    });
+    await expect(
+      handler({
+        ...message,
+        payload: {
+          ...message.payload,
+          derivationKeyId,
+          tokenVersion: GUARANTOR_INVITATION_TOKEN_VERSION + 1,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "GUARANTOR_INVITATION_DELIVERY_POLICY_MISMATCH",
+    });
+    expect(calls).toEqual({ lookup: 0, provider: 0 });
   });
 
   it("gives arrears recomputation a stable idempotency key", async () => {

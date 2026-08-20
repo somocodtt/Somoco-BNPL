@@ -3,6 +3,7 @@ import {
   hasProductionAdapterCapability,
   isSimulatorAdapter,
   type OtpDeliveryPolicyBinding,
+  type GuarantorInvitationDeliveryPolicyBinding,
   type ProductionAdapterCapability,
 } from "@somo/integrations";
 
@@ -56,6 +57,7 @@ interface HandlerRegistration {
   provenance: HandlerProvenance;
   capabilities: ReadonlySet<ProductionAdapterCapability>;
   otpDeliveryPolicy?: Readonly<OtpDeliveryPolicyBinding>;
+  guarantorInvitationDeliveryPolicy?: Readonly<GuarantorInvitationDeliveryPolicyBinding>;
 }
 const handlerRegistrations = new WeakMap<OutboxHandler, HandlerRegistration>();
 
@@ -66,7 +68,10 @@ export function createOutboxHandler(
     object,
     ProductionAdapterCapability,
   ])[] = [],
-  metadata?: { otpDeliveryPolicy?: Readonly<OtpDeliveryPolicyBinding> },
+  metadata?: {
+    otpDeliveryPolicy?: Readonly<OtpDeliveryPolicyBinding>;
+    guarantorInvitationDeliveryPolicy?: Readonly<GuarantorInvitationDeliveryPolicyBinding>;
+  },
 ): OutboxHandler {
   const registered: OutboxHandler = (message) => handler(message);
   const provenance: HandlerProvenance = adapters.some((adapter) =>
@@ -91,6 +96,12 @@ export function createOutboxHandler(
     ...(metadata?.otpDeliveryPolicy === undefined
       ? {}
       : { otpDeliveryPolicy: metadata.otpDeliveryPolicy }),
+    ...(metadata?.guarantorInvitationDeliveryPolicy === undefined
+      ? {}
+      : {
+          guarantorInvitationDeliveryPolicy:
+            metadata.guarantorInvitationDeliveryPolicy,
+        }),
   });
   return registered;
 }

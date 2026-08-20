@@ -6,7 +6,7 @@ export function AuthFlow({
   onAuthenticated,
 }: {
   api: CustomerApi;
-  onAuthenticated(session: CustomerSession): void;
+  onAuthenticated(session: CustomerSession, phoneE164: string): void;
 }) {
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
@@ -33,7 +33,7 @@ export function AuthFlow({
     setBusy(true);
     setError("");
     try {
-      onAuthenticated(await api.verifyOtp(phone, code));
+      onAuthenticated(await api.verifyOtp(phone, code), phone);
     } catch {
       setError("The code is invalid or has expired.");
     } finally {

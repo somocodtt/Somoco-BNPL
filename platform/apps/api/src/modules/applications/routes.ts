@@ -51,6 +51,14 @@ const guarantorBody = {
     profile,
   },
 } as const;
+const invitationResolutionBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["invitationToken"],
+  properties: {
+    invitationToken: { type: "string", pattern: "^[A-Za-z0-9_-]{43}$" },
+  },
+} as const;
 const submitBody = {
   type: "object",
   additionalProperties: false,
@@ -111,6 +119,23 @@ export async function registerApplicationRoutes(
           request.params.applicationId,
           context(principal, request.id),
           request.body,
+        ),
+      );
+    },
+  );
+
+  app.post<{ Body: { invitationToken: string } }>(
+    "/v1/customer/guarantor-invitations/resolutions",
+    {
+      schema: { body: invitationResolutionBody },
+      preHandler: authenticate,
+    },
+    async (request, reply) => {
+      const principal = requireCustomerPrincipal(request);
+      return reply.send(
+        await service.resolveGuarantorInvitation(
+          request.body.invitationToken,
+          context(principal, request.id),
         ),
       );
     },

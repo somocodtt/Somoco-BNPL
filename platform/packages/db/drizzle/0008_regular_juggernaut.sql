@@ -38,6 +38,21 @@ CREATE INDEX "application_mutation_application_idx" ON "application_mutation" US
 CREATE UNIQUE INDEX "guarantor_invitation_token_hash_unique" ON "guarantor_invitation" USING btree ("token_hash");--> statement-breakpoint
 CREATE UNIQUE INDEX "guarantor_invitation_application_active_unique" ON "guarantor_invitation" USING btree ("application_id") WHERE "guarantor_invitation"."claimed_at" is null and "guarantor_invitation"."revoked_at" is null;--> statement-breakpoint
 CREATE INDEX "guarantor_invitation_guarantor_idx" ON "guarantor_invitation" USING btree ("guarantor_person_id");--> statement-breakpoint
+DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1
+		  FROM "guarantor_relationship"
+		 GROUP BY "application_id"
+		HAVING count(*) > 1
+	) THEN
+		RAISE EXCEPTION 'MIGRATION_0008_DUPLICATE_GUARANTOR_RELATIONSHIPS'
+			USING ERRCODE = 'P0001',
+				DETAIL = 'Migration 0008 cannot choose or discard legacy guarantor relationships safely.',
+				HINT = 'Before retrying, resolve each application to exactly one guarantor_relationship row using an approved data-remediation process.';
+	END IF;
+END;
+$$;--> statement-breakpoint
 CREATE UNIQUE INDEX "guarantor_relationship_application_unique" ON "guarantor_relationship" USING btree ("application_id");--> statement-breakpoint
 CREATE OR REPLACE FUNCTION prevent_application_version_mutation()
 RETURNS trigger LANGUAGE plpgsql AS $$

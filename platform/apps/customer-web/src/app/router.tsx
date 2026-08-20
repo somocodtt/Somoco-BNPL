@@ -13,15 +13,20 @@ import { SafeMutationQueue } from "../lib/offline-queue.js";
 export function CustomerRouter({
   api,
   initialSession = null,
+  initialPhoneE164 = null,
 }: {
   api: CustomerApi;
   initialSession?: CustomerSession | null;
+  initialPhoneE164?: string | null;
 }) {
   const [session, setSession] = useState(initialSession);
+  const [phoneE164, setPhoneE164] = useState(initialPhoneE164);
   const [invitationToken] = useState(() => readInvitationToken());
   const [state, setState] = useState<OnboardingState | null>(null);
   const [loadError, setLoadError] = useState("");
   const [offlineNotice, setOfflineNotice] = useState("");
+  const [sessionWarning, setSessionWarning] = useState(false);
+  const [sessionMessage, setSessionMessage] = useState("");
   const queue = useRef<SafeMutationQueue | null>(null);
   if (queue.current === null)
     queue.current = new SafeMutationQueue(localStorage);
@@ -41,6 +46,32 @@ export function CustomerRouter({
       active = false;
     };
   }, [api, invitationToken, session]);
+
+  useEffect(() => {
+    setSessionWarning(false);
+    if (session === null) return;
+    const expiresAt = new Date(session.expiresAt).getTime();
+    const remaining = expiresAt - Date.now();
+    const warnAfter = remaining - 5 * 60_000;
+    function expire() {
+      setSessionMessage("Your secure session expired. Sign in again.");
+      setSession(null);
+      setPhoneE164(null);
+      setState(null);
+    }
+    if (!Number.isFinite(expiresAt) || remaining <= 0) {
+      expire();
+      return;
+    }
+    let warningTimer: number | undefined;
+    if (warnAfter <= 0) setSessionWarning(true);
+    else warningTimer = window.setTimeout(() => setSessionWarning(true), warnAfter);
+    const expiryTimer = window.setTimeout(expire, remaining);
+    return () => {
+      if (warningTimer !== undefined) window.clearTimeout(warningTimer);
+      window.clearTimeout(expiryTimer);
+    };
+  }, [session]);
 
   useEffect(() => {
     async function retry() {
@@ -69,9 +100,27 @@ export function CustomerRouter({
   }, [api]);
 
   if (session === null)
-    return <AuthFlow api={api} onAuthenticated={setSession} />;
+    return (
+      <>
+        {sessionMessage ? <p role="alert">{sessionMessage}</p> : null}
+        <AuthFlow
+          api={api}
+          onAuthenticated={(authenticatedSession, authenticatedPhone) => {
+            setSessionMessage("");
+            setSession(authenticatedSession);
+            setPhoneE164(authenticatedPhone);
+          }}
+        />
+      </>
+    );
   if (invitationToken !== null) {
-    return <GuarantorForm api={api} invitationToken={invitationToken} />;
+    return (
+      <GuarantorForm
+        api={api}
+        invitationToken={invitationToken}
+        phoneE164={phoneE164}
+      />
+    );
   }
   if (loadError)
     return (
@@ -93,8 +142,6 @@ export function CustomerRouter({
     );
   const loadedState = state;
 
-  const minutesRemaining =
-    (new Date(session.expiresAt).getTime() - Date.now()) / 60_000;
   async function save(input: ApplicantMutation) {
     try {
       const saved = await api.saveApplicant(loadedState.draft!.id, input);
@@ -111,6 +158,14 @@ export function CustomerRouter({
           "Saved on this device; will retry when you are online",
         );
         return "queued" as const;
+      }
+      if (problemCode(error) === "VERSION_CONFLICT") {
+        const refreshed = await api.loadOnboarding();
+        setState(refreshed);
+        setOfflineNotice(
+          "Draft changed elsewhere. We refreshed it; review and save again.",
+        );
+        return "conflict" as const;
       }
       throw error;
     }
@@ -132,9 +187,40 @@ export function CustomerRouter({
     );
   }
 
+  async function inviteGuarantor(guarantorPhoneE164: string) {
+    const invitation = await api.inviteGuarantor(loadedState.draft!.id, {
+      expectedVersion: loadedState.draft!.version,
+      mutationId: crypto.randomUUID(),
+      guarantorPhoneE164,
+    });
+    setState((current) =>
+      current === null || current.draft === null
+        ? current
+        : {
+            ...current,
+            draft: {
+              ...current.draft,
+              status: "AWAITING_GUARANTOR",
+              version: invitation.applicationVersion,
+            },
+            guarantorStatus: "INVITED",
+            guarantorInvitation: {
+              status: "INVITED",
+              relationshipVersion: invitation.relationshipVersion,
+              expiresAt: invitation.expiresAt,
+            },
+          },
+    );
+    return invitation;
+  }
+
+  async function refreshEvidence() {
+    setState(await api.loadOnboarding());
+  }
+
   return (
     <>
-      {minutesRemaining <= 5 ? (
+      {sessionWarning ? (
         <p role="alert" className="session-warning">
           Your secure session expires soon. Save your draft now.
         </p>
@@ -149,18 +235,29 @@ export function CustomerRouter({
         state={loadedState}
         onSave={save}
         onSubmit={submit}
+        onInvite={inviteGuarantor}
+        phoneE164={phoneE164}
+        onEvidenceChanged={refreshEvidence}
       />
     </>
   );
 }
 
+function problemCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const code = (error as Record<string, unknown>)["code"];
+  return typeof code === "string" ? code : null;
+}
+
 function readInvitationToken(): string | null {
-  const token = new URLSearchParams(window.location.search).get("invitation");
+  const token = new URLSearchParams(window.location.hash.slice(1)).get(
+    "invitation",
+  );
   if (token === null || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
   window.history.replaceState(
     {},
     "",
-    `${window.location.pathname}${window.location.hash}`,
+    `${window.location.pathname}${window.location.search}`,
   );
   return token;
 }

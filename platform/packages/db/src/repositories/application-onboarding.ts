@@ -139,8 +139,11 @@ export async function createGuarantorInvitation(
   database: Database,
   input: MutationInput & {
     expectedVersion: number;
+    invitationId: string;
     guarantorPhoneE164: string;
     tokenHash: string;
+    tokenVersion: number;
+    derivationKeyId: string;
     expiresAt: Date;
     now: Date;
   },
@@ -176,7 +179,7 @@ export async function createGuarantorInvitation(
        where application_id = ${input.applicationId}::uuid
          and claimed_at is null and revoked_at is null
     `);
-    await executor.execute(sql`
+    const savedRelationship = await executor.execute<RelationshipRow>(sql`
       insert into guarantor_relationship
         (application_id, guarantor_person_id, status, version, invited_at)
       values (${input.applicationId}::uuid, ${guarantorPersonId}::uuid, 'INVITED', 1, ${input.now})
@@ -184,12 +187,12 @@ export async function createGuarantorInvitation(
         set guarantor_person_id = excluded.guarantor_person_id,
             status = 'INVITED', version = guarantor_relationship.version + 1,
             invited_at = excluded.invited_at, confirmed_at = null
+      returning version
     `);
-    const invitationId = randomUUID();
     await executor.execute(sql`
       insert into guarantor_invitation
         (id, application_id, guarantor_person_id, token_hash, expires_at, created_at)
-      values (${invitationId}::uuid, ${input.applicationId}::uuid,
+      values (${input.invitationId}::uuid, ${input.applicationId}::uuid,
         ${guarantorPersonId}::uuid, ${input.tokenHash}, ${input.expiresAt}, ${input.now})
     `);
     const updatedRows = await executor.execute<CommandResult>(sql`
@@ -199,9 +202,14 @@ export async function createGuarantorInvitation(
        returning id, status, version
     `);
     const updated = requireRow(updatedRows.rows, "APPLICATION_UPDATE_FAILED");
+    const relationship = requireRow(
+      savedRelationship.rows,
+      "GUARANTOR_UPDATE_FAILED",
+    );
     const result: InvitationResult = {
-      invitationId,
+      invitationId: input.invitationId,
       applicationVersion: updated.version,
+      relationshipVersion: relationship.version,
       expiresAt: input.expiresAt.toISOString(),
     };
     await finishMutation(tx, input, result, input.now);
@@ -213,8 +221,9 @@ export async function createGuarantorInvitation(
       input.now,
       {
         topic: "applications.guarantor_invited",
-        invitationId,
-        guarantorPersonId,
+        invitationId: input.invitationId,
+        tokenVersion: input.tokenVersion,
+        derivationKeyId: input.derivationKeyId,
       },
     );
     return result;
@@ -310,22 +319,46 @@ export async function readOwnedApplicationState(
 export async function readResumableApplication(
   database: Database,
   applicantPersonId: string,
+  now: Date,
 ) {
   const result = await getInternalExecutor(database).execute<ResumableRow>(sql`
     select a.id, a.status, a.version, a.vehicle_model_id,
            coalesce(cp.profile_data, '{}'::jsonb) applicant_profile,
-           coalesce(gr.status::text, 'NOT_INVITED') guarantor_status
+           gr.version relationship_version,
+           gi.expires_at invitation_expires_at,
+           case
+             when gr.status = 'CONFIRMED' then 'CONFIRMED'
+             when gr.id is null then 'NOT_INVITED'
+             when gi.expires_at <= ${now} then 'EXPIRED'
+             else 'INVITED'
+           end guarantor_status
       from application a
       left join customer_profile cp on cp.person_id = a.applicant_person_id
       left join guarantor_relationship gr on gr.application_id = a.id
+      left join lateral (
+        select expires_at
+          from guarantor_invitation
+         where application_id = a.id and revoked_at is null
+         order by created_at desc, id desc
+         limit 1
+      ) gi on true
      where a.applicant_person_id = ${applicantPersonId}::uuid
        and a.status in ('DRAFT', 'AWAITING_GUARANTOR', 'READY_TO_SUBMIT')
      order by a.updated_at desc, a.id desc
      limit 1
   `);
   const row = result.rows[0];
-  if (row === undefined)
-    return { draft: null, guarantorStatus: "NOT_INVITED" as const };
+  if (row === undefined) {
+    return {
+      draft: null,
+      guarantorStatus: "NOT_INVITED" as const,
+      guarantorInvitation: {
+        status: "NOT_INVITED" as const,
+        relationshipVersion: null,
+        expiresAt: null,
+      },
+    };
+  }
   return {
     draft: {
       id: row.id,
@@ -335,6 +368,49 @@ export async function readResumableApplication(
       applicantProfile: row.applicant_profile,
     },
     guarantorStatus: row.guarantor_status,
+    guarantorInvitation: {
+      status: row.guarantor_status,
+      relationshipVersion: row.relationship_version,
+      expiresAt:
+        row.invitation_expires_at === null
+          ? null
+          : asDate(row.invitation_expires_at).toISOString(),
+    },
+  };
+}
+
+export async function resolveGuarantorInvitation(
+  database: Database,
+  input: { tokenHash: string; guarantorPersonId: string; now: Date },
+) {
+  const result = await getInternalExecutor(database).execute<
+    ResolvedInvitationRow
+  >(sql`
+    select gi.expires_at, gi.claimed_at, gi.revoked_at,
+           gr.status relationship_status, gr.version relationship_version,
+           a.version application_version
+      from guarantor_invitation gi
+      join guarantor_relationship gr
+        on gr.application_id = gi.application_id
+       and gr.guarantor_person_id = gi.guarantor_person_id
+      join application a on a.id = gi.application_id
+     where gi.token_hash = ${input.tokenHash}
+       and gi.guarantor_person_id = ${input.guarantorPersonId}::uuid
+  `);
+  const row = requireRow(result.rows, "INVITATION_NOT_FOUND");
+  if (row.revoked_at !== null) throw new Error("INVITATION_NOT_FOUND");
+  const expiresAt = asDate(row.expires_at);
+  const status =
+    row.claimed_at !== null || row.relationship_status === "CONFIRMED"
+      ? "CONFIRMED"
+      : expiresAt.getTime() <= input.now.getTime()
+        ? "EXPIRED"
+        : "INVITED";
+  return {
+    status,
+    relationshipVersion: row.relationship_version,
+    applicationVersion: row.application_version,
+    expiresAt: expiresAt.toISOString(),
   };
 }
 
@@ -351,6 +427,29 @@ export async function listActiveVehicleModels(database: Database) {
     modelName: row.model_name,
     modelYear: row.model_year,
   }));
+}
+
+export async function findGuarantorInvitationDeliveryContext(
+  database: Database,
+  invitationId: string,
+) {
+  const result = await getInternalExecutor(database).execute<
+    InvitationDeliveryRow
+  >(sql`
+    select p.phone_e164, gi.expires_at, gi.claimed_at, gi.revoked_at
+      from guarantor_invitation gi
+      join privacy.person p on p.id = gi.guarantor_person_id
+     where gi.id = ${invitationId}::uuid
+  `);
+  const row = result.rows[0];
+  return row === undefined
+    ? null
+    : {
+        phoneE164: row.phone_e164,
+        expiresAt: asDate(row.expires_at),
+        claimedAt: row.claimed_at === null ? null : asDate(row.claimed_at),
+        revokedAt: row.revoked_at === null ? null : asDate(row.revoked_at),
+      };
 }
 
 export async function submitApplication(
@@ -654,6 +753,7 @@ interface CommandResult extends SqlRow {
 interface InvitationResult {
   invitationId: string;
   applicationVersion: number;
+  relationshipVersion: number;
   expiresAt: string;
 }
 interface GuarantorSaveResult {
@@ -674,6 +774,12 @@ interface InvitationRow extends SqlRow {
   id: string;
   application_id: string;
   guarantor_person_id: string;
+  expires_at: Date | string;
+  claimed_at: Date | string | null;
+  revoked_at: Date | string | null;
+}
+interface InvitationDeliveryRow extends SqlRow {
+  phone_e164: string;
   expires_at: Date | string;
   claimed_at: Date | string | null;
   revoked_at: Date | string | null;
@@ -715,5 +821,15 @@ interface ResumableRow extends SqlRow {
   version: number;
   vehicle_model_id: string | null;
   applicant_profile: Record<string, unknown>;
-  guarantor_status: "NOT_INVITED" | "INVITED" | "CONFIRMED";
+  guarantor_status: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
+  relationship_version: number | null;
+  invitation_expires_at: Date | string | null;
+}
+interface ResolvedInvitationRow extends SqlRow {
+  expires_at: Date | string;
+  claimed_at: Date | string | null;
+  revoked_at: Date | string | null;
+  relationship_status: string;
+  relationship_version: number;
+  application_version: number;
 }

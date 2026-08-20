@@ -31,7 +31,19 @@ export interface OnboardingState {
   draft: DraftSummary | null;
   models: VehicleModel[];
   completeness: Completeness;
-  guarantorStatus: "NOT_INVITED" | "INVITED" | "CONFIRMED";
+  guarantorStatus: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
+  guarantorInvitation: {
+    status: "NOT_INVITED" | "INVITED" | "EXPIRED" | "CONFIRMED";
+    relationshipVersion: number | null;
+    expiresAt: string | null;
+  };
+}
+
+export interface UploadTicket {
+  documentId: string;
+  uploadUrl: string;
+  expiresAt: string;
+  requiredHeaders: Readonly<Record<string, string>>;
 }
 
 export interface ApplicantMutation {
@@ -46,6 +58,31 @@ export interface CustomerApi {
   verifyOtp(phoneE164: string, code: string): Promise<CustomerSession>;
   loadOnboarding(): Promise<OnboardingState>;
   createDraft(): Promise<DraftSummary>;
+  recordConsent(input: {
+    purpose: string;
+    documentVersion: string;
+    phoneE164: string;
+  }): Promise<{ consentId: string }>;
+  verifyGhanaCard(input: {
+    consentId: string;
+    ghanaCardNumber: string;
+    idempotencyKey: string;
+  }): Promise<{ status: "VERIFIED" | "FAILED" | "MANUAL_REVIEW" }>;
+  requestDocumentUpload(input: {
+    documentType: string;
+    mimeType: string;
+    sizeBytes: number;
+  }): Promise<UploadTicket>;
+  uploadDocument(
+    ticket: UploadTicket,
+    file: Blob,
+    onProgress: (loaded: number, total: number) => void,
+  ): Promise<void>;
+  completeDocumentUpload(documentId: string): Promise<{
+    documentId: string;
+    status: "ACCEPTED";
+    sha256: string;
+  }>;
   saveApplicant(
     applicationId: string,
     input: ApplicantMutation,
@@ -57,7 +94,18 @@ export interface CustomerApi {
       mutationId: string;
       guarantorPhoneE164: string;
     },
-  ): Promise<{ applicationVersion: number; expiresAt: string }>;
+  ): Promise<{
+    invitationId: string;
+    applicationVersion: number;
+    relationshipVersion: number;
+    expiresAt: string;
+  }>;
+  resolveGuarantorInvitation(invitationToken: string): Promise<{
+    status: "INVITED" | "EXPIRED" | "CONFIRMED";
+    relationshipVersion: number;
+    applicationVersion: number;
+    expiresAt: string;
+  }>;
   saveGuarantor(
     invitationToken: string,
     input: {
@@ -108,6 +156,7 @@ export class FetchCustomerApi implements CustomerApi {
       this.request<{
         draft: DraftSummary | null;
         guarantorStatus: OnboardingState["guarantorStatus"];
+        guarantorInvitation: OnboardingState["guarantorInvitation"];
       }>("/v1/customer/applications/resume"),
     ]);
     const draft = resume.draft ?? (await this.createDraft());
@@ -119,11 +168,78 @@ export class FetchCustomerApi implements CustomerApi {
       models,
       completeness,
       guarantorStatus: resume.guarantorStatus,
+      guarantorInvitation: resume.guarantorInvitation,
     };
   }
 
   createDraft(): Promise<DraftSummary> {
     return this.request("/v1/customer/applications", { method: "POST" });
+  }
+
+  recordConsent(input: {
+    purpose: string;
+    documentVersion: string;
+    phoneE164: string;
+  }): Promise<{ consentId: string }> {
+    return this.request("/v1/customer/consents", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  verifyGhanaCard(input: {
+    consentId: string;
+    ghanaCardNumber: string;
+    idempotencyKey: string;
+  }): Promise<{ status: "VERIFIED" | "FAILED" | "MANUAL_REVIEW" }> {
+    return this.request("/v1/customer/identity/ghana-card-verifications", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  requestDocumentUpload(input: {
+    documentType: string;
+    mimeType: string;
+    sizeBytes: number;
+  }): Promise<UploadTicket> {
+    return this.request("/v1/customer/documents/uploads", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  uploadDocument(
+    ticket: UploadTicket,
+    file: Blob,
+    onProgress: (loaded: number, total: number) => void,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open("PUT", ticket.uploadUrl);
+      for (const [name, value] of Object.entries(ticket.requiredHeaders)) {
+        if (name.toLowerCase() !== "content-length") {
+          request.setRequestHeader(name, value);
+        }
+      }
+      request.upload.addEventListener("progress", (event) => {
+        onProgress(event.loaded, event.lengthComputable ? event.total : file.size);
+      });
+      request.addEventListener("load", () => {
+        if (request.status >= 200 && request.status < 300) resolve();
+        else reject(new Error("DOCUMENT_UPLOAD_FAILED"));
+      });
+      request.addEventListener("error", () => reject(new TypeError("Failed to fetch")));
+      request.send(file);
+    });
+  }
+
+  completeDocumentUpload(documentId: string) {
+    return this.request<{
+      documentId: string;
+      status: "ACCEPTED";
+      sha256: string;
+    }>(`/v1/customer/documents/${documentId}/complete`, { method: "POST" });
   }
 
   saveApplicant(
@@ -147,10 +263,27 @@ export class FetchCustomerApi implements CustomerApi {
       guarantorPhoneE164: string;
     },
   ) {
-    return this.request<{ applicationVersion: number; expiresAt: string }>(
+    return this.request<{
+      invitationId: string;
+      applicationVersion: number;
+      relationshipVersion: number;
+      expiresAt: string;
+    }>(
       `/v1/customer/applications/${applicationId}/guarantor-invitations`,
       { method: "POST", body: JSON.stringify(input) },
     );
+  }
+
+  resolveGuarantorInvitation(invitationToken: string) {
+    return this.request<{
+      status: "INVITED" | "EXPIRED" | "CONFIRMED";
+      relationshipVersion: number;
+      applicationVersion: number;
+      expiresAt: string;
+    }>("/v1/customer/guarantor-invitations/resolutions", {
+      method: "POST",
+      body: JSON.stringify({ invitationToken }),
+    });
   }
 
   saveGuarantor(
