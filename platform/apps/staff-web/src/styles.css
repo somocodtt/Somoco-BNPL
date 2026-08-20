@@ -1,0 +1,85 @@
+:root {
+  color: #18211b;
+  background: #eef2ec;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.85rem;
+}
+
+button:disabled {
+  cursor: wait;
+}
+
+.staff-shell {
+  max-width: 70rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.panel {
+  background: #fff;
+  border: 1px solid #c9d2c9;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+}
+
+form,
+label {
+  display: grid;
+  gap: 0.5rem;
+}
+
+form {
+  max-width: 32rem;
+  gap: 1rem;
+}
+
+input,
+textarea {
+  border: 1px solid #7a877c;
+  border-radius: 0.35rem;
+  padding: 0.65rem;
+}
+
+.queue-list {
+  display: grid;
+  gap: 0.75rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue-list article {
+  border: 1px solid #d2dbd2;
+  border-radius: 0.5rem;
+  padding: 0.9rem;
+}
+
+.decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+[role="alert"] {
+  color: #9b1c1c;
+}
+
+[role="status"] {
+  color: #295238;
+}

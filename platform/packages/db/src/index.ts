@@ -51,6 +51,7 @@ export {
   applicationRepo,
   type NewApplication,
 } from "./repositories/applications.js";
+export { approvalRepo } from "./repositories/approvals.js";
 export {
   createApplicationDraft,
   createGuarantorInvitation,

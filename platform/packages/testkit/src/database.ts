@@ -31,6 +31,31 @@ export async function resetTestDatabase(
   }
 }
 
+export async function executeTestSql(
+  connectionString: string,
+  text: string,
+  values: unknown[] = [],
+): Promise<void> {
+  assertExactTestDatabaseUrl(connectionString, "Execute");
+  await withPool(async (pool) => {
+    await pool.query(text, values);
+  });
+}
+
+export async function queryTestSql<T>(
+  connectionString: string,
+  text: string,
+  values: unknown[] = [],
+): Promise<T> {
+  assertExactTestDatabaseUrl(connectionString, "Query");
+  return withPool(async (pool) => {
+    const result = await pool.query<Record<string, unknown>>(text, values);
+    const row = result.rows[0];
+    if (row === undefined) throw new Error("TEST_ROW_NOT_FOUND");
+    return row as T;
+  });
+}
+
 export async function seedSyntheticPerson(
   connectionString: string,
   input: { phoneE164: string },
@@ -400,5 +425,14 @@ function assertDisposableTestDatabaseUrl(connectionString: string): void {
     throw new Error(
       "TEST_DATABASE_URL must name a disposable test database ending in _test",
     );
+  }
+}
+
+async function withPool<T>(operation: (pool: Pool) => Promise<T>): Promise<T> {
+  const pool = new Pool({ connectionString: requireTestDatabaseUrl(), max: 1 });
+  try {
+    return await operation(pool);
+  } finally {
+    await pool.end();
   }
 }

@@ -35,6 +35,10 @@ import {
 } from "./modules/identity/otp-service.js";
 import { createApplicationService } from "./modules/applications/service.js";
 import { registerApplicationRoutes } from "./modules/applications/routes.js";
+import { registerApprovalRoutes } from "./modules/approvals/routes.js";
+import { createApprovalService } from "./modules/approvals/service.js";
+import { createUnderwritingService } from "./modules/approvals/underwriting-service.js";
+import type { OtpService } from "./modules/identity/otp-service.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -130,12 +134,16 @@ export async function buildApp(
       : { mfaVerifier: options.mfaVerifier }),
   });
   await registerAccessRoutes(app, config, accessService);
+  const approvalService = createApprovalService({ database });
+  const underwritingService = createUnderwritingService({ database });
+  let customerOtp: Pick<OtpService, "authenticateSessionToken"> | undefined;
   if (options.identity !== undefined) {
     const otp = createOtpService({
       database,
       sms: options.identity.sms,
       policy: options.identity.otpPolicy,
     });
+    customerOtp = otp;
     const consent = createConsentService({
       database,
       catalog: options.identity.consentCatalog,
@@ -173,6 +181,14 @@ export async function buildApp(
   } else if (options.applications !== undefined) {
     throw new Error("APPLICATION_IDENTITY_COMPOSITION_REQUIRED");
   }
+  await registerApprovalRoutes(
+    app,
+    config,
+    accessService,
+    approvalService,
+    underwritingService,
+    customerOtp,
+  );
   return app;
 }
 
