@@ -3,11 +3,17 @@ import { StaffLogin } from "../features/auth/session.js";
 import { canReview } from "../features/access/role-access.js";
 import { ReviewPanel } from "../features/application-review/review-panel.js";
 import { QueueList, queueTitle } from "../features/queues/queue-list.js";
-import { ProductWorkspace, type ProductApi } from "../features/products/product-workspace.js";
+import {
+  ProductWorkspace,
+  type ProductApi,
+} from "../features/products/product-workspace.js";
+import { AssetWorkspace } from "../features/assets/asset-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
   StaffApi,
+  StaffAssetApi,
+  StaffContractApi,
   StaffSession,
 } from "../lib/api.js";
 
@@ -15,10 +21,14 @@ export function StaffRouter({
   api,
   initialSession = null,
   productsApi,
+  assetsApi,
+  contractsApi,
 }: {
   api: StaffApi;
   initialSession?: StaffSession | null;
   productsApi?: ProductApi;
+  assetsApi?: StaffAssetApi;
+  contractsApi?: StaffContractApi;
 }) {
   const [session, setSession] = useState<StaffSession | null>(initialSession);
   const [queue, setQueue] = useState<QueueApplication[] | null>(null);
@@ -27,7 +37,12 @@ export function StaffRouter({
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
-    if (session === null) return;
+    if (
+      session === null ||
+      (assetsApi !== undefined && session.roles.includes("INVENTORY_OFFICER"))
+    ) {
+      return;
+    }
     let active = true;
     setQueue(null);
     setLoadError("");
@@ -42,16 +57,32 @@ export function StaffRouter({
     return () => {
       active = false;
     };
-  }, [api, session]);
+  }, [api, assetsApi, session]);
 
   if (session === null) {
     return <StaffLogin api={api} onAuthenticated={setSession} />;
   }
   const canOperateFinancing = session.roles.some((role) =>
-    ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"].includes(role),
+    ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"].includes(
+      role,
+    ),
   );
   if (productsApi !== undefined && canOperateFinancing) {
-    return <ProductWorkspace api={productsApi} actorId={session.staffUserId} roles={session.roles} />;
+    return (
+      <ProductWorkspace
+        api={productsApi}
+        actorId={session.staffUserId}
+        roles={session.roles}
+      />
+    );
+  }
+  if (assetsApi !== undefined && session.roles.includes("INVENTORY_OFFICER")) {
+    return (
+      <AssetWorkspace
+        api={assetsApi}
+        {...(contractsApi === undefined ? {} : { contractsApi })}
+      />
+    );
   }
   if (!canReview(session.roles)) {
     return (

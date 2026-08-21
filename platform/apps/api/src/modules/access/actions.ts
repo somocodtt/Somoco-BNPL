@@ -7,6 +7,7 @@ export type StaffAction =
   | "application.approve.md"
   | "product.manage"
   | "inventory.manage"
+  | "tracker.view"
   | "payment.post"
   | "recovery.authorize"
   | "compliance.audit"

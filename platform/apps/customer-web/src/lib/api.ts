@@ -1,3 +1,9 @@
+import type {
+  ContractApi,
+  CustomerContractStatus,
+  CustomerContractView,
+} from "../features/contract/contract-panel.js";
+
 export interface CustomerSession {
   sessionToken: string;
   expiresAt: string;
@@ -122,7 +128,7 @@ export interface CustomerApi {
 
 import type { CustomerOffer, OfferApi } from "../features/offer/offer-panel.js";
 
-export class FetchCustomerApi implements CustomerApi, OfferApi {
+export class FetchCustomerApi implements CustomerApi, OfferApi, ContractApi {
   #sessionToken: string | null = null;
   #offerVersions = new Map<string, number>();
 
@@ -226,13 +232,18 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
         }
       }
       request.upload.addEventListener("progress", (event) => {
-        onProgress(event.loaded, event.lengthComputable ? event.total : file.size);
+        onProgress(
+          event.loaded,
+          event.lengthComputable ? event.total : file.size,
+        );
       });
       request.addEventListener("load", () => {
         if (request.status >= 200 && request.status < 300) resolve();
         else reject(new Error("DOCUMENT_UPLOAD_FAILED"));
       });
-      request.addEventListener("error", () => reject(new TypeError("Failed to fetch")));
+      request.addEventListener("error", () =>
+        reject(new TypeError("Failed to fetch")),
+      );
       request.send(file);
     });
   }
@@ -271,10 +282,10 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
       applicationVersion: number;
       relationshipVersion: number;
       expiresAt: string;
-    }>(
-      `/v1/customer/applications/${applicationId}/guarantor-invitations`,
-      { method: "POST", body: JSON.stringify(input) },
-    );
+    }>(`/v1/customer/applications/${applicationId}/guarantor-invitations`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   resolveGuarantorInvitation(invitationToken: string) {
@@ -319,6 +330,15 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
     );
   }
 
+  async getContract(
+    applicationId: string,
+  ): Promise<CustomerContractView | null> {
+    const result = await this.request<unknown>(
+      `/v1/customer/applications/${encodeURIComponent(applicationId)}/contract`,
+    );
+    return result === null ? null : mapContractView(result);
+  }
+
   async get(applicationId: string): Promise<CustomerOffer | null> {
     const result = await this.request<Record<string, unknown> | null>(
       `/v1/customer/applications/${encodeURIComponent(applicationId)}/offer`,
@@ -328,14 +348,32 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
 
   async accept(
     offerId: string,
-    input: { consent: boolean; consentAt: string; expectedVersion?: number; disclosedVersion: string; disclosedHash: string },
+    input: {
+      consent: boolean;
+      consentAt: string;
+      expectedVersion?: number;
+      disclosedVersion: string;
+      disclosedHash: string;
+    },
   ): Promise<CustomerOffer> {
     if (!input.consent) throw new Error("CONSENT_REQUIRED");
-    const expectedVersion = input.expectedVersion ?? this.#offerVersions.get(offerId);
-    if (expectedVersion === undefined) throw new Error("OFFER_VERSION_REQUIRED");
+    const expectedVersion =
+      input.expectedVersion ?? this.#offerVersions.get(offerId);
+    if (expectedVersion === undefined)
+      throw new Error("OFFER_VERSION_REQUIRED");
     const result = await this.request<Record<string, unknown>>(
       `/v1/customer/offers/${encodeURIComponent(offerId)}/accept`,
-      { method: "POST", body: JSON.stringify({ consent: true, expectedVersion, consentAt: input.consentAt, disclosedVersion: input.disclosedVersion, disclosedHash: input.disclosedHash, idempotencyKey: crypto.randomUUID() }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          consent: true,
+          expectedVersion,
+          consentAt: input.consentAt,
+          disclosedVersion: input.disclosedVersion,
+          disclosedHash: input.disclosedHash,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      },
     );
     return this.mapOffer(result);
   }
@@ -348,15 +386,30 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
     const expiresAt = requiredDate(value.expiresAt, "expiresAt");
     const priceMinor = requiredMoney(value.priceMinor, "priceMinor");
     const depositMinor = requiredMoney(value.depositMinor, "depositMinor");
-    const totalPayableMinor = requiredMoney(value.totalPayableMinor, "totalPayableMinor");
-    const financeChargeMinor = requiredMoney(value.financeChargeMinor, "financeChargeMinor");
-    const frequency = value.frequency === "WEEKLY" || value.frequency === "MONTHLY" ? value.frequency : malformedOffer();
+    const totalPayableMinor = requiredMoney(
+      value.totalPayableMinor,
+      "totalPayableMinor",
+    );
+    const financeChargeMinor = requiredMoney(
+      value.financeChargeMinor,
+      "financeChargeMinor",
+    );
+    const frequency =
+      value.frequency === "WEEKLY" || value.frequency === "MONTHLY"
+        ? value.frequency
+        : malformedOffer();
     const tenureMonths = requiredTenure(value.tenureMonths);
-    const disclosureVersion = requiredString(value.disclosureVersion, "disclosureVersion");
+    const disclosureVersion = requiredString(
+      value.disclosureVersion,
+      "disclosureVersion",
+    );
     const disclosedHash = requiredHash(value.disclosedHash, "disclosedHash");
-    const disclosureContent = isRecord(value.disclosureContent) ? value.disclosureContent : malformedOffer();
+    const disclosureContent = isRecord(value.disclosureContent)
+      ? value.disclosureContent
+      : malformedOffer();
     const fees = isRecord(value.fees) ? value.fees : malformedOffer();
-    if (!Array.isArray(value.installments) || value.installments.length === 0) throw malformedOffer();
+    if (!Array.isArray(value.installments) || value.installments.length === 0)
+      throw malformedOffer();
     const installments = value.installments.map((item) => {
       if (!isRecord(item)) throw malformedOffer();
       return {
@@ -410,32 +463,114 @@ export class FetchCustomerApi implements CustomerApi, OfferApi {
 }
 
 export class CustomerApiError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
     super(message);
   }
 }
 
+function mapContractView(value: unknown): CustomerContractView {
+  if (!isRecord(value)) throw malformedContract();
+  const statuses: CustomerContractStatus[] = [
+    "DRAFT",
+    "AWAITING_EXECUTION",
+    "EXECUTED",
+    "ACTIVE",
+    "SETTLED",
+    "RECOVERY",
+    "TERMINATED",
+  ];
+  if (!statuses.includes(value.status as CustomerContractStatus))
+    throw malformedContract();
+  if (
+    typeof value.previewAvailable !== "boolean" ||
+    typeof value.executed !== "boolean" ||
+    typeof value.assignedVehicleAvailable !== "boolean"
+  ) {
+    throw malformedContract();
+  }
+  if (!Array.isArray(value.schedule)) throw malformedContract();
+  return {
+    status: value.status as CustomerContractStatus,
+    previewAvailable: value.previewAvailable,
+    executed: value.executed,
+    assignedVehicleAvailable: value.assignedVehicleAvailable,
+    registrationNumber: nullableContractString(value.registrationNumber),
+    registrationValidTo: nullableContractString(value.registrationValidTo),
+    insuranceValidTo: nullableContractString(value.insuranceValidTo),
+    schedule: value.schedule.map((item) => {
+      if (
+        !isRecord(item) ||
+        typeof item.sequence !== "number" ||
+        !Number.isSafeInteger(item.sequence) ||
+        item.sequence < 1 ||
+        typeof item.dueDate !== "string" ||
+        !/^\d+$/.test(String(item.totalMinor))
+      ) {
+        throw malformedContract();
+      }
+      const sequence = item.sequence;
+      return {
+        sequence,
+        dueDate: item.dueDate,
+        totalMinor: String(item.totalMinor),
+      };
+    }),
+  };
+}
+
+function malformedContract(): never {
+  throw new CustomerApiError(
+    "MALFORMED_CONTRACT_DTO",
+    "The customer contract response is invalid.",
+  );
+}
+
+function nullableContractString(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.trim().length === 0)
+    throw malformedContract();
+  return value;
+}
+
 function malformedOffer(field = "offer"): never {
-  throw new CustomerApiError("MALFORMED_OFFER_DTO", `The financing offer ${field} is invalid.`);
+  throw new CustomerApiError(
+    "MALFORMED_OFFER_DTO",
+    `The financing offer ${field} is invalid.`,
+  );
 }
 
 function requiredString(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) return malformedOffer(field);
+  if (typeof value !== "string" || value.trim().length === 0)
+    return malformedOffer(field);
   return value;
 }
 
 function requiredMoney(value: unknown, field: string): string {
-  if (typeof value !== "string" || !/^\d+$/.test(value)) return malformedOffer(field);
+  if (typeof value !== "string" || !/^\d+$/.test(value))
+    return malformedOffer(field);
   return value;
 }
 
 function requiredHash(value: unknown, field: string): string {
-  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) return malformedOffer(field);
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value))
+    return malformedOffer(field);
   return value;
 }
 
-function requiredInteger(value: unknown, field: string, minimum: number): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) return malformedOffer(field);
+function requiredInteger(
+  value: unknown,
+  field: string,
+  minimum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < minimum
+  )
+    return malformedOffer(field);
   return value;
 }
 
@@ -447,17 +582,35 @@ function requiredDate(value: unknown, field: string): string {
 
 function requiredDateOnly(value: unknown, field: string): string {
   const result = requiredString(value, field);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(result) || !Number.isFinite(Date.parse(`${result}T00:00:00Z`))) return malformedOffer(field);
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(result) ||
+    !Number.isFinite(Date.parse(`${result}T00:00:00Z`))
+  )
+    return malformedOffer(field);
   return result;
 }
 
 function requiredTenure(value: unknown): CustomerOffer["tenureMonths"] {
-  if (value === 6 || value === 8 || value === 12 || value === 24 || value === 36 || value === 48) return value;
+  if (
+    value === 6 ||
+    value === 8 ||
+    value === 12 ||
+    value === 24 ||
+    value === 36 ||
+    value === 48
+  )
+    return value;
   return malformedOffer();
 }
 
 function requiredStatus(value: unknown): CustomerOffer["status"] {
-  if (value === "PENDING" || value === "EXPIRED" || value === "ACCEPTED" || value === "CANCELLED") return value;
+  if (
+    value === "PENDING" ||
+    value === "EXPIRED" ||
+    value === "ACCEPTED" ||
+    value === "CANCELLED"
+  )
+    return value;
   return malformedOffer();
 }
 

@@ -43,7 +43,19 @@ import { registerProductRoutes } from "./modules/products/routes.js";
 import { createProductService } from "./modules/products/service.js";
 import { createExceptionService } from "./modules/products/exception-service.js";
 import { createOfferService } from "./modules/products/offer-service.js";
-import { isProductionFinanceApprovalGate, isTrustedFinanceApprovalGate, type FinanceApprovalGate } from "@somo/domain/src/index.js";
+import {
+  isProductionFinanceApprovalGate,
+  isTrustedFinanceApprovalGate,
+  type FinanceApprovalGate,
+} from "@somo/domain/src/index.js";
+import { createAssetService } from "./modules/assets/service.js";
+import { registerAssetRoutes } from "./modules/assets/routes.js";
+import {
+  createContractService,
+  type ContractTemplateAttestation,
+} from "./modules/contracts/service.js";
+import { createHandoverService } from "./modules/contracts/handover-service.js";
+import { registerContractRoutes } from "./modules/contracts/routes.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -79,6 +91,7 @@ export interface BuildAppOptions {
     requiredDocumentTypes: readonly string[];
   };
   financing?: { fixtureGate?: FinanceApprovalGate };
+  contracts?: { template?: ContractTemplateAttestation };
 }
 
 export async function buildApp(
@@ -165,6 +178,19 @@ export async function buildApp(
       ? {}
       : { fixtureGate: options.financing.fixtureGate }),
   });
+  const assetService = createAssetService({ database });
+  const contractService = createContractService({
+    database,
+    ...(options.contracts?.template === undefined
+      ? {}
+      : { template: options.contracts.template }),
+    environment: config.environment === "production" ? "production" : "test",
+  });
+  const handoverService = createHandoverService({
+    database,
+    assets: assetService,
+    contracts: contractService,
+  });
   let customerOtp: Pick<OtpService, "authenticateSessionToken"> | undefined;
   if (options.identity !== undefined) {
     const otp = createOtpService({
@@ -225,6 +251,15 @@ export async function buildApp(
     productService,
     exceptionService,
     offerService,
+    customerOtp,
+  );
+  await registerAssetRoutes(app, config, accessService, assetService);
+  await registerContractRoutes(
+    app,
+    config,
+    accessService,
+    contractService,
+    handoverService,
     customerOtp,
   );
   return app;

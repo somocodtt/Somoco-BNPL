@@ -15,7 +15,9 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { staffUser } from "./access.js";
+import { application } from "./applications.js";
 import { contract, installment } from "./contracts.js";
+import { offer } from "./offers.js";
 
 export const paymentStatus = pgEnum("payment_status", [
   "RECEIVED",
@@ -42,6 +44,60 @@ export const ledgerEntryType = pgEnum("ledger_entry_type", [
   "REFUND",
   "ADJUSTMENT",
 ]);
+
+export const depositReconciliation = pgTable(
+  "deposit_reconciliation",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    offerId: uuid("offer_id")
+      .notNull()
+      .references(() => offer.id, { onDelete: "restrict" }),
+    paymentTransactionId: uuid("payment_transaction_id").references(
+      () => paymentTransaction.id,
+      { onDelete: "restrict" },
+    ),
+    amountMinorUnits: bigint("amount_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    currency: text("currency").notNull().default("GHS"),
+    status: text("status").notNull(),
+    reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
+    reconciledBy: uuid("reconciled_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    evidenceHash: text("evidence_hash").notNull(),
+    version: integer("version").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("deposit_reconciliation_application_offer_unique").on(
+      table.applicationId,
+      table.offerId,
+    ),
+    check(
+      "deposit_reconciliation_amount_positive",
+      sql`${table.amountMinorUnits} > 0`,
+    ),
+    check(
+      "deposit_reconciliation_currency_ghs",
+      sql`${table.currency} = 'GHS'`,
+    ),
+    check(
+      "deposit_reconciliation_status_allowed",
+      sql`${table.status} in ('PENDING', 'RECONCILED', 'REJECTED')`,
+    ),
+    check(
+      "deposit_reconciliation_reconciled_evidence",
+      sql`${table.status} <> 'RECONCILED' or (${table.reconciledAt} is not null and ${table.evidenceHash} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check("deposit_reconciliation_version_positive", sql`${table.version} > 0`),
+  ],
+);
 
 export const paymentTransaction = pgTable(
   "payment_transaction",

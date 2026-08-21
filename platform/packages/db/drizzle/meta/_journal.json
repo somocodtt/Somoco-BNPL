@@ -92,6 +92,13 @@
       "when": 1787230830907,
       "tag": "0012_financing_disclosures",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1787230830908,
+      "tag": "0013_asset_contract_handover",
+      "breakpoints": true
     }
   ]
 }

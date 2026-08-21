@@ -89,6 +89,19 @@ export {
   type CompleteOwnershipTransferCommand,
 } from "./repositories/contracts.js";
 export {
+  assetContractRepo,
+  type AssetContractCommandRecord,
+  type AssignmentRow,
+  type ApplicationRow as AssetApplicationRow,
+  type ContractRow as AssetContractRow,
+  type DepositRow,
+  type ExecutionRow,
+  type HandoverRow,
+  type OfferRow as AssetOfferRow,
+  type TemplateRow,
+  type VehicleRow,
+} from "./repositories/asset-contracts.js";
+export {
   createPendingDocument,
   findOwnedDocument,
   transitionDocumentStatus,

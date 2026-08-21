@@ -3,6 +3,10 @@ import { AuthFlow } from "../features/auth/auth-flow.js";
 import { ApplicationForm } from "../features/application/application-form.js";
 import { GuarantorForm } from "../features/guarantor/guarantor-form.js";
 import { OfferPanel, type OfferApi } from "../features/offer/offer-panel.js";
+import {
+  ContractPanel,
+  type ContractApi,
+} from "../features/contract/contract-panel.js";
 import type {
   ApplicantMutation,
   CustomerApi,
@@ -16,11 +20,13 @@ export function CustomerRouter({
   initialSession = null,
   initialPhoneE164 = null,
   offerApi,
+  contractApi,
 }: {
   api: CustomerApi;
   initialSession?: CustomerSession | null;
   initialPhoneE164?: string | null;
   offerApi?: OfferApi;
+  contractApi?: ContractApi;
 }) {
   const [session, setSession] = useState(initialSession);
   const [phoneE164, setPhoneE164] = useState(initialPhoneE164);
@@ -68,7 +74,11 @@ export function CustomerRouter({
     }
     let warningTimer: number | undefined;
     if (warnAfter <= 0) setSessionWarning(true);
-    else warningTimer = window.setTimeout(() => setSessionWarning(true), warnAfter);
+    else
+      warningTimer = window.setTimeout(
+        () => setSessionWarning(true),
+        warnAfter,
+      );
     const expiryTimer = window.setTimeout(expire, remaining);
     return () => {
       if (warningTimer !== undefined) window.clearTimeout(warningTimer);
@@ -145,7 +155,10 @@ export function CustomerRouter({
     );
   const loadedState = state;
 
-  if (offerApi !== undefined && loadedState.draft?.status === "APPROVED") {
+  if (
+    loadedState.draft?.status === "APPROVED" &&
+    (offerApi !== undefined || contractApi !== undefined)
+  ) {
     return (
       <>
         {sessionWarning ? (
@@ -153,7 +166,15 @@ export function CustomerRouter({
             Your secure session expires soon. Save your draft now.
           </p>
         ) : null}
-        <OfferPanel api={offerApi} applicationId={loadedState.draft!.id} />
+        {offerApi !== undefined ? (
+          <OfferPanel api={offerApi} applicationId={loadedState.draft!.id} />
+        ) : null}
+        {contractApi !== undefined ? (
+          <ContractPanel
+            api={contractApi}
+            applicationId={loadedState.draft!.id}
+          />
+        ) : null}
       </>
     );
   }

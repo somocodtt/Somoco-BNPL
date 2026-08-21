@@ -7,6 +7,11 @@ import "./styles.css";
 const api = new FetchStaffApi();
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <StaffRouter api={api} productsApi={api} />
+    <StaffRouter
+      api={api}
+      productsApi={api}
+      assetsApi={api}
+      contractsApi={api}
+    />
   </StrictMode>,
 );

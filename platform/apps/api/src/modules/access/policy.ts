@@ -37,6 +37,7 @@ const actionRoles = {
   "application.approve.md": ["MD"],
   "product.manage": ["PRODUCT_ADMIN"],
   "inventory.manage": ["INVENTORY_OFFICER"],
+  "tracker.view": ["RECOVERY_OFFICER"],
   "payment.post": ["FINANCE_OFFICER"],
   "recovery.authorize": ["RECOVERY_OFFICER"],
   "compliance.audit": ["COMPLIANCE_AUDITOR"],
