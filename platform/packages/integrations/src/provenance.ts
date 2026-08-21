@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { AllocationPolicyEvidenceVerifier } from "./allocation-policy.js";
 import type { NiaPort } from "./nia.js";
 import type { PaymentWebhookVerifier } from "./payments.js";
 import type { SmsPort } from "./sms.js";
@@ -11,7 +12,13 @@ const productionCapabilities = new WeakMap<
 >();
 
 export type ProductionAdapterCapability =
-  "SMS" | "NIA" | "OBJECT_STORAGE" | "MALWARE_SCANNER" | "TRACKER" | "PAYMENTS";
+  | "SMS"
+  | "NIA"
+  | "OBJECT_STORAGE"
+  | "MALWARE_SCANNER"
+  | "TRACKER"
+  | "PAYMENTS"
+  | "ALLOCATION_POLICY_EVIDENCE";
 
 export interface ExternalConnectorProvenance {
   packageName: string;
@@ -40,9 +47,14 @@ export interface ProductionConnectorBoundary {
     provenance: ExternalConnectorProvenance;
     adapter: PaymentWebhookVerifier;
   }): PaymentWebhookVerifier;
+  register(input: {
+    kind: "ALLOCATION_POLICY_EVIDENCE";
+    provenance: ExternalConnectorProvenance;
+    adapter: AllocationPolicyEvidenceVerifier;
+  }): AllocationPolicyEvidenceVerifier;
   require<T extends object>(
     adapter: T,
-    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS",
+    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS" | "ALLOCATION_POLICY_EVIDENCE",
   ): T;
 }
 
@@ -107,13 +119,23 @@ export function requireProductionConnector<T extends object>(
 export function createProductionConnectorBoundary(): ProductionConnectorBoundary {
   const registered = new WeakMap<
     object,
-    "SMS" | "NIA" | "TRACKER" | "PAYMENTS"
+    "SMS" | "NIA" | "TRACKER" | "PAYMENTS" | "ALLOCATION_POLICY_EVIDENCE"
   >();
   function register(input: {
-    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS";
+    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS" | "ALLOCATION_POLICY_EVIDENCE";
     provenance: ExternalConnectorProvenance;
-    adapter: SmsPort | NiaPort | TrackerPort | PaymentWebhookVerifier;
-  }): SmsPort | NiaPort | TrackerPort | PaymentWebhookVerifier {
+    adapter:
+      | SmsPort
+      | NiaPort
+      | TrackerPort
+      | PaymentWebhookVerifier
+      | AllocationPolicyEvidenceVerifier;
+  }):
+    | SmsPort
+    | NiaPort
+    | TrackerPort
+    | PaymentWebhookVerifier
+    | AllocationPolicyEvidenceVerifier {
     validateExternalConnectorProvenance(input.provenance);
     if (isSimulatorAdapter(input.adapter)) {
       throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
@@ -125,9 +147,13 @@ export function createProductionConnectorBoundary(): ProductionConnectorBoundary
           ? createExternalNiaConnector(input.adapter as NiaPort)
           : input.kind === "TRACKER"
             ? createExternalTrackerConnector(input.adapter as TrackerPort)
-            : createExternalPaymentConnector(
-                input.adapter as PaymentWebhookVerifier,
-              );
+            : input.kind === "PAYMENTS"
+              ? createExternalPaymentConnector(
+                  input.adapter as PaymentWebhookVerifier,
+                )
+              : createExternalAllocationPolicyEvidenceVerifier(
+                  input.adapter as AllocationPolicyEvidenceVerifier,
+                );
     markProductionAdapter(connector, input.kind);
     registered.set(connector, input.kind);
     return connector;
@@ -136,7 +162,8 @@ export function createProductionConnectorBoundary(): ProductionConnectorBoundary
     register: register as ProductionConnectorBoundary["register"],
     require<T extends object>(
       adapter: T,
-      kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS",
+      kind:
+        "SMS" | "NIA" | "TRACKER" | "PAYMENTS" | "ALLOCATION_POLICY_EVIDENCE",
     ): T {
       if (registered.get(adapter) !== kind) {
         throw new Error("PRODUCTION_CONNECTOR_REGISTRATION_REQUIRED");
@@ -156,6 +183,20 @@ function createExternalPaymentConnector(
   return Object.freeze({
     verify: (input: Parameters<PaymentWebhookVerifier["verify"]>[0]) =>
       runExternalConnectorOperation(() => verify(input)),
+  });
+}
+
+function createExternalAllocationPolicyEvidenceVerifier(
+  adapter: AllocationPolicyEvidenceVerifier,
+): AllocationPolicyEvidenceVerifier {
+  if (typeof adapter.verify !== "function") {
+    throw new Error("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  }
+  const verify = adapter.verify.bind(adapter);
+  return Object.freeze({
+    verify: (
+      input: Parameters<AllocationPolicyEvidenceVerifier["verify"]>[0],
+    ) => runExternalConnectorOperation(() => verify(input)),
   });
 }
 

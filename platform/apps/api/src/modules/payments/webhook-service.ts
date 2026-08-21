@@ -6,11 +6,13 @@ import {
   type DatabaseTransaction,
 } from "@somo/db";
 import type {
+  AllocationPolicyEvidenceVerifier,
   CanonicalPaymentEvent,
   PaymentWebhookVerifier,
 } from "@somo/integrations";
 import { AppError } from "../../plugins/errors.js";
 import {
+  createAllocationPolicyEvidenceVerificationInput,
   createLedgerService,
   validateAllocationPolicy,
   type AllocationPolicy,
@@ -46,8 +48,15 @@ export function createPaymentWebhookService(options: {
   verifier: PaymentWebhookVerifier;
   policy: AllocationPolicy;
   receipts?: ReceiptService;
+  /** Canonical production composition dependency. */
+  allocationPolicyEvidenceVerifier?: AllocationPolicyEvidenceVerifier;
+  /** Direct-service alias retained for focused non-production fixtures. */
+  evidenceVerifier?: AllocationPolicyEvidenceVerifier;
 }): PaymentWebhookService {
   validateAllocationPolicy(options.policy);
+  const evidenceVerifier =
+    options.allocationPolicyEvidenceVerifier ?? options.evidenceVerifier;
+  let cachedEvidenceVerification: Promise<string> | undefined;
   const ledger = createLedgerService({
     database: options.database,
     ...(options.receipts === undefined ? {} : { receipts: options.receipts }),
@@ -98,11 +107,18 @@ export function createPaymentWebhookService(options: {
           }
           return inbox.result as PaymentWebhookAcknowledgement;
         }
+        const policyAttestationReference =
+          event.eventType === "PAYMENT_SUCCEEDED"
+            ? await verifyAllocationPolicyEvidence()
+            : undefined;
         const result = await processEvent({
           tx,
           ledger,
           policy: options.policy,
           event,
+          ...(policyAttestationReference === undefined
+            ? {}
+            : { policyAttestationReference }),
         });
         const acknowledgement: PaymentWebhookAcknowledgement = {
           accepted: true,
@@ -125,6 +141,37 @@ export function createPaymentWebhookService(options: {
       });
     },
   };
+
+  async function verifyAllocationPolicyEvidence(): Promise<string | undefined> {
+    if (evidenceVerifier === undefined) return undefined;
+    if (cachedEvidenceVerification === undefined) {
+      const verificationInput = createAllocationPolicyEvidenceVerificationInput(
+        options.policy,
+      );
+      cachedEvidenceVerification = Promise.resolve()
+        .then(() => evidenceVerifier.verify(verificationInput))
+        .then((verification) => {
+          if (
+            verification === null ||
+            typeof verification !== "object" ||
+            typeof verification.attestationReference !== "string" ||
+            verification.attestationReference.trim() === ""
+          )
+            throw new Error("ATTESTATION_REFERENCE_INVALID");
+          return verification.attestationReference;
+        });
+    }
+    try {
+      return await cachedEvidenceVerification;
+    } catch {
+      cachedEvidenceVerification = undefined;
+      throw new AppError(
+        409,
+        "ALLOCATION_POLICY_EVIDENCE_NOT_VERIFIED",
+        "The allocation policy evidence could not be verified.",
+      );
+    }
+  }
 }
 
 async function processEvent(input: {
@@ -132,6 +179,7 @@ async function processEvent(input: {
   ledger: ReturnType<typeof createLedgerService>;
   policy: AllocationPolicy;
   event: CanonicalPaymentEvent;
+  policyAttestationReference?: string;
 }): Promise<LedgerPostResult> {
   const { event } = input;
   if (event.eventType === "PAYMENT_SUCCEEDED") {
@@ -149,6 +197,9 @@ async function processEvent(input: {
         ? {}
         : { settlementReference: event.settlementReference }),
       policy: input.policy,
+      ...(input.policyAttestationReference === undefined
+        ? {}
+        : { policyAttestationReference: input.policyAttestationReference }),
       providerPayload: {
         channel: event.channel,
         settlementReference: event.settlementReference,

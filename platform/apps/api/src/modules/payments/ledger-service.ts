@@ -8,6 +8,7 @@ import {
   type PaymentAllocationPolicy,
   type PaymentTransaction,
 } from "@somo/db";
+import type { AllocationPolicyEvidenceVerificationInput } from "@somo/integrations";
 import type { StaffPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 import type { ReceiptService } from "./receipt-service.js";
@@ -43,6 +44,8 @@ export interface AllocationPolicy {
 export const ALLOCATION_POLICY_VERSION = "finance-policy-v1" as const;
 export const ALLOCATION_POLICY_EXECUTION_KEY =
   "SOMOCO_DEPOSIT_OR_INSTALLMENT_V1" as const;
+export const ALLOCATION_POLICY_EVIDENCE_SCHEMA =
+  "SOMOCO_ALLOCATION_POLICY_EVIDENCE_V1" as const;
 
 const allocationPolicyImplementation = Object.freeze({
   version: ALLOCATION_POLICY_VERSION,
@@ -54,7 +57,10 @@ const allocationPolicyImplementation = Object.freeze({
 
 /** Immutable package behavior identity used to bind persisted approvals. */
 export const ALLOCATION_POLICY_BEHAVIOR_DIGEST = sha256(
-  canonicalJson(allocationPolicyImplementation),
+  canonicalJson({
+    ...allocationPolicyImplementation,
+    runtimeSource: decideAllocationPolicy.toString(),
+  }),
 );
 
 /** Hashes the canonical artifact supplied by Finance and Compliance. */
@@ -62,6 +68,43 @@ export function hashAllocationEvidenceArtifact(
   artifact: Readonly<Record<string, unknown>>,
 ): string {
   return sha256(canonicalJson(artifact));
+}
+
+/**
+ * Builds the detached-signature document for the trusted external verifier.
+ * Signed bytes are derived from the exact policy identity and evidence that
+ * will be persisted; callers cannot provide an alternate byte representation.
+ */
+export function createAllocationPolicyEvidenceVerificationInput(
+  policy: AllocationPolicy,
+): AllocationPolicyEvidenceVerificationInput {
+  const evidence = policy.evidence;
+  const signedDocument = canonicalJson({
+    schema: ALLOCATION_POLICY_EVIDENCE_SCHEMA,
+    artifactHash: evidence.evidenceHash,
+    financeApprovedBy: evidence.financeApprovedBy,
+    complianceApprovedBy: evidence.complianceApprovedBy,
+    financeApprovedAt: evidence.financeApprovedAt,
+    complianceApprovedAt: evidence.complianceApprovedAt,
+    policyVersion: policy.version,
+    executionKey: policy.executionKey,
+    allocationEngineDigest: policy.behaviorDigest,
+  });
+  return {
+    signedBytes: new TextEncoder().encode(signedDocument),
+    evidence: {
+      artifactHash: evidence.evidenceHash,
+      financeApprovedBy: evidence.financeApprovedBy,
+      complianceApprovedBy: evidence.complianceApprovedBy,
+      financeSignature: evidence.financeSignature,
+      complianceSignature: evidence.complianceSignature,
+      financeApprovedAt: evidence.financeApprovedAt,
+      complianceApprovedAt: evidence.complianceApprovedAt,
+      policyVersion: policy.version,
+      executionKey: policy.executionKey,
+      allocationEngineDigest: policy.behaviorDigest,
+    },
+  };
 }
 
 export interface LedgerPostInput {
@@ -76,6 +119,8 @@ export interface LedgerPostInput {
   settlementReference?: string;
   policy?: AllocationPolicy;
   providerPayload?: Record<string, unknown>;
+  /** Evidence attestation returned by the trusted external verifier. */
+  policyAttestationReference?: string;
   /** Internal transaction capability used by the webhook inbox transaction. */
   transaction?: DatabaseTransaction;
 }
@@ -294,6 +339,12 @@ export function createLedgerService(options: {
               policyFinanceApprovedAt: input.policy!.evidence.financeApprovedAt,
               policyComplianceApprovedAt:
                 input.policy!.evidence.complianceApprovedAt,
+              ...(input.policyAttestationReference === undefined
+                ? {}
+                : {
+                    policyAttestationReference:
+                      input.policyAttestationReference,
+                  }),
             },
             occurredAt: input.occurredAt,
           });

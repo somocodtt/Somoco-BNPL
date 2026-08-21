@@ -112,3 +112,27 @@ The repository supplies the provider-neutral Somoco payment verifier and product
 ### Fix-round review note
 
 - The exact base-to-head review covers immutable allocation behavior/evidence provenance, SELECT-only policy storage, conflict-safe reversal/refund replay, route/UI authorization parity, migration repeatability, and populated-row safety. No real signatures, provider credentials, simulator behavior, cash path, or automatic immobilization was added.
+
+## Fix round 4 — verified signed allocation-policy evidence (base `ed05042ab2bf8b97c3b15b2070b1ed9a3db03853`)
+
+### TDD evidence
+
+- RED accepted: the preserved API payment matrix remained green at 32/32, while five new focused assertions failed: three because no canonical evidence verifier was called or bound to the posting, and two because production composition did not yet require or reject simulator policy verifiers.
+- GREEN: the focused real-PostgreSQL API payment suite passes 35/35. It covers canonical signed-byte construction, artifact/signer/timestamp/version/execution-key/engine-digest binding, untrusted and swapped evidence rejection, attestation persistence, and replay after policy revocation without a second verification call.
+- Production payment composition passes 2/2: an attested verifier is mandatory, direct simulators are rejected, and wrappers without the package-issued production capability are rejected. The integrations boundary suite passes 23/23, including the new provider-neutral allocation-policy verifier connector.
+
+### Implementation and boundary evidence
+
+- `AllocationPolicyEvidenceVerifier` is a provider-neutral integration port. Trusted key custody, signature format, and signer roots remain external; the application derives canonical signed bytes and never accepts caller-supplied bytes or executable allocation behavior.
+- The signed document covers the worked-example artifact hash, distinct Finance/Compliance signer IDs, separate approval timestamps, policy version, package execution key, and the runtime source digest of the exact allocation function. Changing that function changes the required policy digest.
+- Production `buildApp` requires a verifier registered through the constrained production connector boundary. Direct or wrapped simulators and unregistered adapters fail closed. Only the verifier's returned attestation reference is persisted in matched ledger-entry metadata; no production evidence, signature, key, or default fixture is fabricated.
+- Verification is cached for the service lifetime and performed only for a new successful event after inbox insertion; duplicate inbox replays return their durable acknowledgement without reapproval or re-verification. Failed verification rolls back the inbox/posting transaction.
+
+### Fix-round verification gates
+
+- API and integrations TypeScript checks and production builds pass; targeted ESLint and Prettier checks pass for every changed source/test file; `git diff --check` passes.
+- No schema or migration change was required. The existing 20-migration chain and populated/repeat migration evidence from fix round 3 remain applicable; attestation provenance is stored in existing ledger metadata.
+
+### Fix-round review note
+
+- The exact base-to-head review covers canonical attestation construction, runtime allocation-engine digest binding, trusted production connector capability, simulator fail-closed behavior, verifier error sanitization, duplicate replay ordering, and provenance persistence. No provider keys, credentials, signature algorithm, payment endpoint, simulator default, cash path, or automatic immobilization was added.

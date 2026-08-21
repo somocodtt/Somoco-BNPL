@@ -15,6 +15,7 @@ import {
 import { redactedLogPaths, registerSecurity } from "./plugins/security.js";
 import {
   requireProductionConnector,
+  type AllocationPolicyEvidenceVerifier,
   type MalwareScannerPort,
   type NiaPort,
   type ObjectStoragePort,
@@ -110,6 +111,7 @@ export interface BuildAppOptions {
   };
   payments?: {
     verifier: PaymentWebhookVerifier;
+    allocationPolicyEvidenceVerifier?: AllocationPolicyEvidenceVerifier;
     allocationPolicy: import("./modules/payments/ledger-service.js").AllocationPolicy;
     sms: SmsPort;
     accountLinkBaseUrl: string;
@@ -133,7 +135,7 @@ export async function buildApp(
     throw new Error("PRODUCTION_FIXTURE_GATE_REQUIRED");
   }
   assertProductionIdentityDependencies(config, options.identity);
-  assertProductionPaymentDependencies(config, options.payments);
+  validateProductionPaymentDependencies(config, options.payments);
   const connection =
     options.database === undefined
       ? createDatabase(config.databaseUrl)
@@ -324,6 +326,12 @@ export async function buildApp(
       database,
       verifier: options.payments.verifier,
       policy: options.payments.allocationPolicy,
+      ...(options.payments.allocationPolicyEvidenceVerifier === undefined
+        ? {}
+        : {
+            allocationPolicyEvidenceVerifier:
+              options.payments.allocationPolicyEvidenceVerifier,
+          }),
       receipts,
     });
     const composition: PaymentRouteComposition = {
@@ -359,7 +367,7 @@ function assertProductionIdentityDependencies(
   validateProductionIdentityComposition(identity);
 }
 
-function assertProductionPaymentDependencies(
+export function validateProductionPaymentDependencies(
   config: AppConfig,
   payments: BuildAppOptions["payments"],
 ): void {
@@ -369,6 +377,12 @@ function assertProductionPaymentDependencies(
   if (!production) return;
   if (payments === undefined)
     throw new Error("PRODUCTION_PAYMENT_COMPOSITION_REQUIRED");
+  if (payments.allocationPolicyEvidenceVerifier === undefined)
+    throw new Error("PRODUCTION_ALLOCATION_POLICY_EVIDENCE_VERIFIER_REQUIRED");
   requireProductionConnector(payments.verifier, "PAYMENTS");
   requireProductionConnector(payments.sms, "SMS");
+  requireProductionConnector(
+    payments.allocationPolicyEvidenceVerifier,
+    "ALLOCATION_POLICY_EVIDENCE",
+  );
 }

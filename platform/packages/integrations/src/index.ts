@@ -1,4 +1,5 @@
 export * from "./credit-bureau.js";
+export * from "./allocation-policy.js";
 export * from "./erp.js";
 export * from "./file-inspection.js";
 export * from "./nia.js";

@@ -339,6 +339,48 @@ describe("production document adapters", () => {
     ).toThrow("PRODUCTION_CONNECTOR_METHOD_INVALID");
   });
 
+  it("constructs the attested allocation-policy verifier only through the external boundary", async () => {
+    const boundary = (
+      await import("./index.js")
+    ).createProductionConnectorBoundary();
+    let observed = false;
+    const verifier = boundary.register({
+      kind: "ALLOCATION_POLICY_EVIDENCE",
+      provenance: externalProvenance("allocation-policy-verifier"),
+      adapter: {
+        async verify(input) {
+          observed = input.signedBytes instanceof Uint8Array;
+          return { attestationReference: "external-attestation-1001" };
+        },
+      },
+    });
+
+    expect(boundary.require(verifier, "ALLOCATION_POLICY_EVIDENCE")).toBe(
+      verifier,
+    );
+    await expect(
+      verifier.verify({
+        signedBytes: new Uint8Array([1, 2, 3]),
+        evidence: {
+          artifactHash: "a".repeat(64),
+          financeApprovedBy: "finance-1001",
+          complianceApprovedBy: "compliance-1001",
+          financeSignature: "finance-signature-1001",
+          complianceSignature: "compliance-signature-1001",
+          financeApprovedAt: checkedAt,
+          complianceApprovedAt: checkedAt,
+          policyVersion: "finance-policy-v1",
+          executionKey: "SOMOCO_DEPOSIT_OR_INSTALLMENT_V1",
+          allocationEngineDigest: "b".repeat(64),
+        },
+      }),
+    ).resolves.toEqual({
+      attestationReference: "external-attestation-1001",
+    });
+    expect(observed).toBe(true);
+    expect(Object.isFrozen(verifier)).toBe(true);
+  });
+
   it("constructs only the provider-neutral read-only tracker connector", async () => {
     const api = (await import("./index.js")) as Record<string, unknown>;
     const createBoundary = api[

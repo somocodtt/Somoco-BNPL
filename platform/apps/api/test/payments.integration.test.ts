@@ -391,6 +391,176 @@ describe("Somoco payment boundary", () => {
     ).toThrow("ALLOCATION_POLICY_INVALID");
   });
 
+  it("requires a trusted verifier for canonical signed allocation evidence", async () => {
+    const graph = await insertContractGraph(database);
+    const approved = policy();
+    let calls = 0;
+    let verifiedInput: unknown;
+    const evidenceVerifier = {
+      verify: async (input: unknown) => {
+        calls += 1;
+        verifiedInput = input;
+        return { attestationReference: "test-attestation-1" };
+      },
+    };
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        customerReference: graph.reference,
+      })),
+      policy: approved,
+      evidenceVerifier,
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    const result = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("attested-policy")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    expect(result.outcome).toBe("POSTED");
+    expect(calls).toBe(1);
+    expect(verifiedInput).toMatchObject({
+      signedBytes: expect.any(Uint8Array),
+      evidence: {
+        artifactHash: approved.evidence.evidenceHash,
+        financeApprovedBy: approved.evidence.financeApprovedBy,
+        complianceApprovedBy: approved.evidence.complianceApprovedBy,
+        financeApprovedAt: approved.evidence.financeApprovedAt,
+        complianceApprovedAt: approved.evidence.complianceApprovedAt,
+        policyVersion: approved.version,
+        executionKey: approved.executionKey,
+        allocationEngineDigest: approved.behaviorDigest,
+      },
+    });
+    const signedDocument = JSON.parse(
+      new TextDecoder().decode(
+        (verifiedInput as { signedBytes: Uint8Array }).signedBytes,
+      ),
+    ) as Record<string, string>;
+    expect(signedDocument).toEqual({
+      allocationEngineDigest: approved.behaviorDigest,
+      artifactHash: approved.evidence.evidenceHash,
+      complianceApprovedAt: approved.evidence.complianceApprovedAt,
+      complianceApprovedBy: approved.evidence.complianceApprovedBy,
+      executionKey: approved.executionKey,
+      financeApprovedAt: approved.evidence.financeApprovedAt,
+      financeApprovedBy: approved.evidence.financeApprovedBy,
+      policyVersion: approved.version,
+      schema: "SOMOCO_ALLOCATION_POLICY_EVIDENCE_V1",
+    });
+    const metadataRows = await getInternalDatabase(database).execute<{
+      metadata: Record<string, unknown>;
+    }>(sql`
+      select metadata
+        from ledger_entry
+       where posting_key like ${`${event.providerTransactionId}:%`}
+    `);
+    expect(metadataRows.rows[0]?.metadata.policyAttestationReference).toBe(
+      "test-attestation-1",
+    );
+  });
+
+  it("fails closed on untrusted or swapped allocation evidence", async () => {
+    const graph = await insertContractGraph(database);
+    const rejected = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        customerReference: graph.reference,
+      })),
+      policy: policy(),
+      evidenceVerifier: {
+        verify: async () => {
+          throw new Error("UNTRUSTED_SIGNATURE");
+        },
+      },
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    await expect(
+      rejected.receive({
+        rawBody: new Uint8Array(Buffer.from("untrusted-policy")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("ALLOCATION_POLICY_EVIDENCE_NOT_VERIFIED");
+
+    const swapped = policy();
+    const swappedService = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-swapped-policy",
+        providerTransactionId: "txn-swapped-policy",
+        customerReference: graph.reference,
+      })),
+      policy: swapped,
+      evidenceVerifier: {
+        verify: async (input: { evidence: { financeApprovedBy: string } }) => {
+          if (input.evidence.financeApprovedBy !== "expected-finance")
+            throw new Error("EVIDENCE_BINDING_INVALID");
+          return { attestationReference: "wrong-signers" };
+        },
+      },
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    await expect(
+      swappedService.receive({
+        rawBody: new Uint8Array(Buffer.from("swapped-policy")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("ALLOCATION_POLICY_EVIDENCE_NOT_VERIFIED");
+  });
+
+  it("binds the attestation to the exact allocation engine digest and reuses it for replay", async () => {
+    const graph = await insertContractGraph(database);
+    const approved = policy();
+    let calls = 0;
+    const evidenceVerifier = {
+      verify: async (input: {
+        evidence: { allocationEngineDigest: string };
+        signedBytes: Uint8Array;
+      }) => {
+        calls += 1;
+        expect(input.evidence.allocationEngineDigest).toBe(
+          approved.behaviorDigest,
+        );
+        expect(new TextDecoder().decode(input.signedBytes)).toContain(
+          approved.behaviorDigest,
+        );
+        return { attestationReference: "test-attestation-replay" };
+      },
+    };
+    let replay = false;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: replay ? "evt-attested-replay" : "evt-attested-original",
+        providerTransactionId: "txn-attested-replay",
+        customerReference: graph.reference,
+      })),
+      policy: approved,
+      evidenceVerifier,
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    await service.receive({
+      rawBody: new Uint8Array(Buffer.from("attested-original")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set status = 'REVOKED'
+       where version = 'finance-policy-v1'
+    `);
+    replay = true;
+    const duplicate = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("attested-replay")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    expect(duplicate.duplicate).toBe(true);
+    expect(calls).toBe(1);
+  });
+
   it("returns one stable result for concurrent events sharing a provider transaction id", async () => {
     const graph = await insertContractGraph(database);
     let sequence = 0;
