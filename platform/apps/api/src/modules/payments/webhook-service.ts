@@ -12,6 +12,7 @@ import type {
 import { AppError } from "../../plugins/errors.js";
 import {
   createLedgerService,
+  validateAllocationPolicy,
   type AllocationPolicy,
   type LedgerPostResult,
 } from "./ledger-service.js";
@@ -46,6 +47,7 @@ export function createPaymentWebhookService(options: {
   policy: AllocationPolicy;
   receipts?: ReceiptService;
 }): PaymentWebhookService {
+  validateAllocationPolicy(options.policy);
   const ledger = createLedgerService({
     database: options.database,
     ...(options.receipts === undefined ? {} : { receipts: options.receipts }),

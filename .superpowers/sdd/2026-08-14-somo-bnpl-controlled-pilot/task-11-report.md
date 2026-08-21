@@ -87,3 +87,28 @@ The repository supplies the provider-neutral Somoco payment verifier and product
 ### Fix-round review note
 
 - The exact base-to-head review covers canonical policy provenance and grants, transaction conflict handling, revoked replay ordering, receipt persistence/outbox idempotency, settlement actor authorization/audit attribution, and migration repeatability. No provider credentials, simulator behavior, cash path, or automatic immobilization was introduced.
+
+## Fix round 3 — external evidence binding and settlement replay hardening (base `42dd005b160cc93fffbafc35cc01b77ba60afbd6`)
+
+### TDD evidence
+
+- RED accepted: the focused API suite passed 28/32 and failed four tests for behavior-digest binding, missing/mismatched external evidence, caller behavior injection, and concurrent reversal compensation. The staff payment workspace passed 4/5 and failed because MD still saw settlement comparison.
+- GREEN: the focused real-PostgreSQL API suite passes 32/32; the database/migration suite passes 34/34; and the staff payment workspace passes 5/5.
+- Allocation execution is now an immutable package-owned implementation with an explicit behavior digest. Production composition validates externally supplied Finance/Compliance evidence containing a canonical artifact hash, distinct approver identities, separate approval timestamps, and non-empty signatures; no package-owned worked-example prose, default approvers, or caller decision function is accepted. Persisted rows must match the evidence artifact/hash and executable behavior digest.
+- Reversal/refund compensation uses the same conflict-safe provider-transaction insertion path as normal postings. Concurrent events with different IDs now return one persisted compensation result and one duplicate result without a raw unique-constraint error or second balance/ledger mutation. Duplicate reversal replay does not consult a newly revoked posting policy.
+- Settlement comparison route authorization now matches the service role set (Finance Officer, CFO, or Compliance Auditor), and the staff UI no longer exposes the control to MD.
+
+### Database and migration evidence
+
+- Migration `0019_external_payment_policy_evidence.sql` adds behavior-digest, external artifact/hash, signatures, and separate Finance/Compliance approval timestamps. Legacy APPROVED policy rows without this evidence are revoked before the approval constraint is installed; no evidence or signature defaults are fabricated.
+- Fresh migration and repeat migration tests pass at 20 migrations. The populated migration suite applies 0019 after 0018, preserves legacy payment/ledger values, and verifies legacy approved policy rows are revoked safely.
+
+### Fix-round verification gates
+
+- API, staff-web, and database focused gates pass with the counts above; API and database TypeScript checks pass, including the public DB API typecheck.
+- API, database, and staff-web TypeScript checks pass; the database public-API typecheck also passes. Targeted ESLint passes for every changed source/test file, Prettier passes for the exact changed TypeScript/JSON/report files, and `git diff --check` passes.
+- Production API and database TypeScript builds pass; the staff-web Vite production build passes with a 232.92 kB JavaScript bundle.
+
+### Fix-round review note
+
+- The exact base-to-head review covers immutable allocation behavior/evidence provenance, SELECT-only policy storage, conflict-safe reversal/refund replay, route/UI authorization parity, migration repeatability, and populated-row safety. No real signatures, provider credentials, simulator behavior, cash path, or automatic immobilization was added.

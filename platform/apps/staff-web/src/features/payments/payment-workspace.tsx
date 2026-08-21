@@ -26,7 +26,7 @@ export function PaymentWorkspace({
     roles.includes("FINANCE_OFFICER") ||
     roles.includes("CFO") ||
     roles.includes("COMPLIANCE_AUDITOR");
-  const canCompareSettlement = canResolveReconciliation || roles.includes("MD");
+  const canCompareSettlement = canResolveReconciliation;
 
   useEffect(() => {
     let active = true;

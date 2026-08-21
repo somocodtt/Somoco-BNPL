@@ -33,8 +33,10 @@ import type { AppConfig } from "../src/config.js";
 import { resetTestDatabase } from "../../../packages/testkit/src/index.js";
 import { createPaymentWebhookService } from "../src/modules/payments/webhook-service.js";
 import {
-  allocationPolicyWorkedExample,
-  createAllocationPolicyApproval,
+  ALLOCATION_POLICY_BEHAVIOR_DIGEST,
+  ALLOCATION_POLICY_EXECUTION_KEY,
+  ALLOCATION_POLICY_VERSION,
+  hashAllocationEvidenceArtifact,
   createLedgerService,
   type AllocationPolicy,
 } from "../src/modules/payments/ledger-service.js";
@@ -92,10 +94,25 @@ function verifierFor(
 }
 
 function policy(): AllocationPolicy {
-  return createAllocationPolicyApproval({
-    financeApprovedBy: "finance-approver-1",
-    complianceApprovedBy: "compliance-approver-1",
-    approvedAt: "2026-08-01T00:00:00.000Z",
+  const artifact = Object.freeze({
+    externalArtifactId: "test-finance-compliance-evidence-v1",
+    artifactRevision: 1,
+    effectiveFrom: "2026-08-01T00:00:00.000Z",
+  });
+  return Object.freeze({
+    version: ALLOCATION_POLICY_VERSION,
+    executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
+    behaviorDigest: ALLOCATION_POLICY_BEHAVIOR_DIGEST,
+    evidence: Object.freeze({
+      artifact,
+      evidenceHash: hashAllocationEvidenceArtifact(artifact),
+      financeApprovedBy: "test-finance-approver",
+      complianceApprovedBy: "test-compliance-approver",
+      financeSignature: "test-finance-signature",
+      complianceSignature: "test-compliance-signature",
+      financeApprovedAt: "2026-08-01T00:00:00.000Z",
+      complianceApprovedAt: "2026-08-01T01:00:00.000Z",
+    }),
   });
 }
 
@@ -287,27 +304,91 @@ describe("Somoco payment boundary", () => {
     ).rejects.toThrow("ALLOCATION_POLICY_NOT_APPROVED");
   });
 
-  it("rejects caller-supplied executable allocation behavior", async () => {
+  it("rejects a persisted allocation policy when its executable behavior digest differs", async () => {
     const graph = await insertContractGraph(database);
-    const injected = {
-      ...policy(),
-      decide: () => ({ outcome: "MATCHED", allocations: [] }),
-    } as unknown as AllocationPolicy;
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set behavior_digest = ${"0".repeat(64)}
+       where version = 'finance-policy-v1'
+    `);
     const service = createPaymentWebhookService({
       database,
       verifier: verifierFor(async () => ({
         ...event,
         customerReference: graph.reference,
       })),
-      policy: injected,
+      policy: policy(),
     });
     await expect(
       service.receive({
-        rawBody: new Uint8Array(Buffer.from("injected-policy")),
+        rawBody: new Uint8Array(Buffer.from("behavior-digest-mismatch")),
         signature: "sig",
         requestTimestamp: event.occurredAt,
       }),
-    ).rejects.toThrow("ALLOCATION_POLICY_INVALID");
+    ).rejects.toThrow("ALLOCATION_POLICY_NOT_APPROVED");
+  });
+
+  it("fails closed when the external signed worked-example evidence is missing or mismatched", async () => {
+    const graph = await insertContractGraph(database);
+    const missingEvidence = {
+      ...policy(),
+      evidence: undefined,
+    } as unknown as AllocationPolicy;
+    expect(() =>
+      createPaymentWebhookService({
+        database,
+        verifier: verifierFor(async () => ({
+          ...event,
+          customerReference: graph.reference,
+        })),
+        policy: missingEvidence,
+      }),
+    ).toThrow("ALLOCATION_POLICY_INVALID");
+    const mismatchedEvidence = {
+      ...policy(),
+      evidence: {
+        ...policy().evidence,
+        artifact: { externalArtifactId: "wrong" },
+      },
+    } as unknown as AllocationPolicy;
+    expect(() =>
+      createPaymentWebhookService({
+        database,
+        verifier: verifierFor(async () => ({
+          ...event,
+          customerReference: graph.reference,
+        })),
+        policy: mismatchedEvidence,
+      }),
+    ).toThrow("ALLOCATION_POLICY_INVALID");
+  });
+
+  it("rejects caller-supplied allocation behavior at production composition", async () => {
+    const injected = {
+      ...policy(),
+      decide: () => ({ outcome: "MATCHED", allocations: [] }),
+    } as unknown as AllocationPolicy;
+    expect(() =>
+      createPaymentWebhookService({
+        database,
+        verifier: verifierFor(async () => event),
+        policy: injected,
+      }),
+    ).toThrow("ALLOCATION_POLICY_INVALID");
+  });
+
+  it("rejects caller-supplied executable allocation behavior", async () => {
+    const injected = {
+      ...policy(),
+      decide: () => ({ outcome: "MATCHED", allocations: [] }),
+    } as unknown as AllocationPolicy;
+    expect(() =>
+      createPaymentWebhookService({
+        database,
+        verifier: verifierFor(async () => event),
+        policy: injected,
+      }),
+    ).toThrow("ALLOCATION_POLICY_INVALID");
   });
 
   it("returns one stable result for concurrent events sharing a provider transaction id", async () => {
@@ -551,6 +632,83 @@ describe("Somoco payment boundary", () => {
     ).toEqual({ status: "REJECTED" });
   });
 
+  it("replays concurrent reversal events by provider transaction without a second compensation", async () => {
+    const graph = await insertContractGraph(database);
+    let reversal = false;
+    let reversalSequence = 0;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => {
+        if (!reversal)
+          return {
+            ...event,
+            eventId: "evt-reversal-race-original",
+            providerTransactionId: "txn-reversal-race",
+            customerReference: graph.reference,
+          };
+        reversalSequence += 1;
+        return {
+          ...event,
+          eventId: `evt-reversal-race-${reversalSequence}`,
+          eventType: "PAYMENT_REVERSED" as const,
+          providerTransactionId: "txn-reversal-race",
+          customerReference: graph.reference,
+        };
+      }),
+      policy: policy(),
+    });
+    const original = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("reversal-race-original")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set status = 'REVOKED'
+       where version = 'finance-policy-v1'
+    `);
+    reversal = true;
+    const results = await Promise.all([
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("reversal-race-1")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("reversal-race-2")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ]);
+    expect(original.outcome).toBe("POSTED");
+    expect(results.map((result) => result.outcome)).toEqual([
+      "REVERSED",
+      "REVERSED",
+    ]);
+    expect(results[0]?.paymentTransactionId).toBe(
+      results[1]?.paymentTransactionId,
+    );
+    expect(results.map((result) => result.duplicate).sort()).toEqual([
+      false,
+      true,
+    ]);
+    const internal = getInternalDatabase(database);
+    expect(
+      (
+        await internal.execute<{ count: number }>(
+          sql`select count(*)::int as count from payment_transaction`,
+        )
+      ).rows[0]?.count,
+    ).toBe(2);
+    expect(
+      (
+        await internal.execute<{ count: number }>(
+          sql`select count(*)::int as count from ledger_entry`,
+        )
+      ).rows[0]?.count,
+    ).toBe(2);
+  });
+
   it("requires separate maker and checker for adjustment decisions", async () => {
     const graph = await insertContractGraph(database);
     const makerId = await insertStaff(database, "FINANCE_OFFICER");
@@ -682,9 +840,13 @@ describe("Somoco payment boundary", () => {
 
   it("rejects an allocation policy without persisted Finance and Compliance approval evidence", async () => {
     const graph = await insertContractGraph(database);
+    const approved = policy();
     const unpersisted = {
-      ...policy(),
-      approvedAt: "2026-08-02T00:00:00.000Z",
+      ...approved,
+      evidence: {
+        ...approved.evidence,
+        financeApprovedAt: "2026-08-02T00:00:00.000Z",
+      },
     } as AllocationPolicy;
     const service = createPaymentWebhookService({
       database,
@@ -940,6 +1102,17 @@ describe("Somoco payment boundary", () => {
         },
       }),
     ).rejects.toThrow("FORBIDDEN");
+    await expect(
+      reconciliation.compareSettlement({
+        settlementReference: "settle-md",
+        provider: "SOMOCO_PAYMENTS",
+        providerTotalMinorUnits: 0n,
+        actor: {
+          ...actor,
+          roles: ["MD"],
+        },
+      }),
+    ).rejects.toThrow("FORBIDDEN");
   });
 
   it("requires database reversal linkage and rejects unlinked reversal entries", async () => {
@@ -968,14 +1141,21 @@ async function seedAllocationPolicy(
   database: Database,
   approval: AllocationPolicy,
 ): Promise<void> {
+  const evidence = approval.evidence;
   await getInternalDatabase(database).execute(sql`
     insert into payment_allocation_policy
       (version, policy_hash, worked_example_hash, worked_example,
-       finance_approved_by, compliance_approved_by, approved_at, status)
+       behavior_digest, evidence_hash, evidence_artifact,
+       finance_approved_by, compliance_approved_by,
+       finance_signature, compliance_signature,
+       finance_approved_at, compliance_approved_at,
+       approved_at, status)
     values
-      (${approval.version}, ${approval.policyHash}, ${approval.workedExampleHash}, ${JSON.stringify(
-        allocationPolicyWorkedExample,
-      )}::jsonb, ${approval.financeApprovedBy}, ${approval.complianceApprovedBy}, ${approval.approvedAt}, 'APPROVED')
+      (${approval.version}, ${evidence.evidenceHash}, ${evidence.evidenceHash}, ${JSON.stringify(
+        evidence.artifact,
+      )}::jsonb, ${approval.behaviorDigest}, ${evidence.evidenceHash}, ${JSON.stringify(
+        evidence.artifact,
+      )}::jsonb, ${evidence.financeApprovedBy}, ${evidence.complianceApprovedBy}, ${evidence.financeSignature}, ${evidence.complianceSignature}, ${evidence.financeApprovedAt}, ${evidence.complianceApprovedAt}, ${evidence.financeApprovedAt}, 'APPROVED')
   `);
 }
 

@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(19);
+    expect(before.rows[0]?.count).toBe(20);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -680,6 +680,7 @@ describe("populated legacy schema migration", () => {
       "0016_payment_ledger_reconciliation.sql",
       "0017_wooden_selene.sql",
       "0018_sealed_payment_policy.sql",
+      "0019_external_payment_policy_evidence.sql",
     ]) {
       await applyMigrationFile(pool, migration);
     }
@@ -719,6 +720,48 @@ describe("populated legacy schema migration", () => {
         { trigger_name: "payment_settlement_batch_append_only" },
       ],
     });
+  });
+
+  it("revokes legacy approved allocation policy rows without inventing external evidence", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+      "0009_whole_nightmare.sql",
+      "0010_controlled_financing.sql",
+      "0011_financing_binding.sql",
+      "0012_financing_disclosures.sql",
+      "0013_asset_contract_handover.sql",
+      "0014_asset_hardening.sql",
+      "0015_asset_privacy_controls.sql",
+      "0016_payment_ledger_reconciliation.sql",
+      "0017_wooden_selene.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    await pool.query(
+      `insert into payment_allocation_policy
+        (version, policy_hash, worked_example_hash, worked_example,
+         finance_approved_by, compliance_approved_by, approved_at, status)
+       values ($1, $2, $2, $3::jsonb, 'legacy-finance', 'legacy-compliance', now(), 'APPROVED')`,
+      [
+        "legacy-finance-policy-v1",
+        "a".repeat(64),
+        JSON.stringify({ externalArtifactId: "legacy-policy" }),
+      ],
+    );
+    await applyMigrationFile(pool, "0018_sealed_payment_policy.sql");
+    await applyMigrationFile(pool, "0019_external_payment_policy_evidence.sql");
+    const result = await pool.query<{ status: string }>(
+      `select status from payment_allocation_policy where version = $1`,
+      ["legacy-finance-policy-v1"],
+    );
+    expect(result.rows[0]?.status).toBe("REVOKED");
   });
 
   it("backfills active 0003 claims as started attempts that can be abandoned and reclaimed", async () => {

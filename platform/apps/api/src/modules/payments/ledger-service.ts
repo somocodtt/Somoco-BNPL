@@ -21,60 +21,47 @@ export interface AllocationDecision {
   reason?: string;
 }
 
-export interface AllocationPolicy {
-  readonly version: string;
-  /** Package-owned executable policy representation; callers cannot inject behavior. */
-  readonly executionKey: typeof ALLOCATION_POLICY_EXECUTION_KEY;
-  readonly policyHash: string;
-  readonly workedExampleHash: string;
+export interface AllocationPolicyEvidence {
+  readonly artifact: Readonly<Record<string, unknown>>;
+  readonly evidenceHash: string;
   readonly financeApprovedBy: string;
   readonly complianceApprovedBy: string;
-  readonly approvedBy: string;
-  readonly approvedAt: string;
+  readonly financeSignature: string;
+  readonly complianceSignature: string;
+  readonly financeApprovedAt: string;
+  readonly complianceApprovedAt: string;
+}
+
+export interface AllocationPolicy {
+  readonly version: string;
+  /** Package-owned executable policy identity; callers cannot inject behavior. */
+  readonly executionKey: typeof ALLOCATION_POLICY_EXECUTION_KEY;
+  readonly behaviorDigest: string;
+  readonly evidence: AllocationPolicyEvidence;
 }
 
 export const ALLOCATION_POLICY_VERSION = "finance-policy-v1" as const;
 export const ALLOCATION_POLICY_EXECUTION_KEY =
   "SOMOCO_DEPOSIT_OR_INSTALLMENT_V1" as const;
 
-export const allocationPolicyWorkedExample = Object.freeze({
+const allocationPolicyImplementation = Object.freeze({
   version: ALLOCATION_POLICY_VERSION,
   executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
-  rules: Object.freeze([
-    "match an exact contract deposit",
-    "match one exact remaining installment",
-    "quarantine all other amounts for Finance reconciliation",
-  ]),
+  algorithm: "EXACT_DEPOSIT_OR_REMAINING_INSTALLMENT",
+  revision: 1,
+  unmatchedOutcome: "QUARANTINED",
 });
 
-const allocationPolicyRepresentation = Object.freeze({
-  version: ALLOCATION_POLICY_VERSION,
-  executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
-  behavior: "package-owned",
-});
-
-export const ALLOCATION_POLICY_WORKED_EXAMPLE_HASH = sha256(
-  canonicalJson(allocationPolicyWorkedExample),
-);
-export const ALLOCATION_POLICY_HASH = sha256(
-  canonicalJson(allocationPolicyRepresentation),
+/** Immutable package behavior identity used to bind persisted approvals. */
+export const ALLOCATION_POLICY_BEHAVIOR_DIGEST = sha256(
+  canonicalJson(allocationPolicyImplementation),
 );
 
-export function createAllocationPolicyApproval(input: {
-  financeApprovedBy: string;
-  complianceApprovedBy: string;
-  approvedAt: string;
-}): AllocationPolicy {
-  return Object.freeze({
-    version: ALLOCATION_POLICY_VERSION,
-    executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
-    policyHash: ALLOCATION_POLICY_HASH,
-    workedExampleHash: ALLOCATION_POLICY_WORKED_EXAMPLE_HASH,
-    financeApprovedBy: input.financeApprovedBy,
-    complianceApprovedBy: input.complianceApprovedBy,
-    approvedBy: input.financeApprovedBy,
-    approvedAt: input.approvedAt,
-  });
+/** Hashes the canonical artifact supplied by Finance and Compliance. */
+export function hashAllocationEvidenceArtifact(
+  artifact: Readonly<Record<string, unknown>>,
+): string {
+  return sha256(canonicalJson(artifact));
 }
 
 export interface LedgerPostInput {
@@ -134,7 +121,7 @@ export function createLedgerService(options: {
 }): LedgerService {
   return {
     async post(input) {
-      if (input.policy !== undefined) validatePolicy(input.policy);
+      if (input.policy !== undefined) validateAllocationPolicy(input.policy);
       if (input.amountMinorUnits <= 0n) {
         throw new AppError(
           400,
@@ -299,8 +286,14 @@ export function createLedgerService(options: {
             allocationPolicyVersion: input.policy!.version,
             metadata: {
               policyVersion: input.policy!.version,
-              policyApprovedBy: input.policy!.approvedBy,
-              policyApprovedAt: input.policy!.approvedAt,
+              policyBehaviorDigest: input.policy!.behaviorDigest,
+              policyEvidenceHash: input.policy!.evidence.evidenceHash,
+              policyFinanceApprovedBy: input.policy!.evidence.financeApprovedBy,
+              policyComplianceApprovedBy:
+                input.policy!.evidence.complianceApprovedBy,
+              policyFinanceApprovedAt: input.policy!.evidence.financeApprovedAt,
+              policyComplianceApprovedAt:
+                input.policy!.evidence.complianceApprovedAt,
             },
             occurredAt: input.occurredAt,
           });
@@ -380,12 +373,13 @@ export function createLedgerService(options: {
             ),
             depositReconciled: false,
           };
-        const payment = await repo.insert(
+        const derivedProviderTransactionId = `${original.providerTransactionId}:${input.eventType}`;
+        const insertedPayment = await repo.insertIfAbsent(
           {
             id: randomUUID(),
             provider: "SOMOCO_PAYMENTS",
             channel: original.channel,
-            providerTransactionId: `${original.providerTransactionId}:${input.eventType}`,
+            providerTransactionId: derivedProviderTransactionId,
             eventId: input.eventId,
             eventType: input.eventType,
             ...(original.contractId === null
@@ -427,6 +421,9 @@ export function createLedgerService(options: {
             },
           },
         );
+        if (!insertedPayment.inserted)
+          return duplicateResult(repo, insertedPayment.payment);
+        const payment = insertedPayment.payment;
         const originals = await repo.findLedgerForPayment(original.id);
         const entryIds: string[] = [];
         for (const entry of originals) {
@@ -625,19 +622,32 @@ export function createLedgerService(options: {
   };
 }
 
-function validatePolicy(policy: AllocationPolicy): void {
-  const legacyBehavior = (policy as unknown as { decide?: unknown }).decide;
+export function validateAllocationPolicy(policy: AllocationPolicy): void {
+  const candidate = isRecord(policy)
+    ? (policy as unknown as Record<string, unknown>)
+    : {};
+  const evidence = candidate.evidence;
+  const evidenceRecord = isRecord(evidence) ? evidence : null;
+  const artifact = evidenceRecord?.artifact;
+  const artifactRecord = isRecord(artifact) ? artifact : null;
+  const hasCallerBehavior = isRecord(policy) && "decide" in candidate;
   if (
+    !isRecord(policy) ||
     policy.version !== ALLOCATION_POLICY_VERSION ||
     policy.executionKey !== ALLOCATION_POLICY_EXECUTION_KEY ||
-    policy.policyHash !== ALLOCATION_POLICY_HASH ||
-    policy.workedExampleHash !== ALLOCATION_POLICY_WORKED_EXAMPLE_HASH ||
-    policy.financeApprovedBy.trim().length === 0 ||
-    policy.complianceApprovedBy.trim().length === 0 ||
-    policy.financeApprovedBy === policy.complianceApprovedBy ||
-    policy.approvedBy !== policy.financeApprovedBy ||
-    !Number.isFinite(Date.parse(policy.approvedAt)) ||
-    typeof legacyBehavior === "function"
+    policy.behaviorDigest !== ALLOCATION_POLICY_BEHAVIOR_DIGEST ||
+    !isSha256(evidenceRecord?.evidenceHash) ||
+    artifactRecord === null ||
+    evidenceRecord?.evidenceHash !==
+      hashAllocationEvidenceArtifact(artifactRecord) ||
+    !isNonEmptyString(evidenceRecord?.financeApprovedBy) ||
+    !isNonEmptyString(evidenceRecord?.complianceApprovedBy) ||
+    evidenceRecord.financeApprovedBy === evidenceRecord.complianceApprovedBy ||
+    !isNonEmptyString(evidenceRecord?.financeSignature) ||
+    !isNonEmptyString(evidenceRecord?.complianceSignature) ||
+    !isIsoTimestamp(evidenceRecord?.financeApprovedAt) ||
+    !isIsoTimestamp(evidenceRecord?.complianceApprovedAt) ||
+    hasCallerBehavior
   )
     throw new AppError(
       409,
@@ -651,21 +661,36 @@ function isPersistedPolicyApproved(
   input: AllocationPolicy,
 ): approved is PaymentAllocationPolicy {
   if (approved === null) return false;
+  const evidence = input.evidence;
+  const artifact = evidence.artifact;
   if (
     approved.version !== input.version ||
-    approved.policyHash !== input.policyHash ||
-    approved.policyHash !== ALLOCATION_POLICY_HASH ||
-    approved.workedExampleHash !== input.workedExampleHash ||
-    approved.workedExampleHash !== ALLOCATION_POLICY_WORKED_EXAMPLE_HASH ||
-    approved.financeApprovedBy !== input.financeApprovedBy ||
-    approved.complianceApprovedBy !== input.complianceApprovedBy ||
-    approved.approvedAt.toISOString() !== input.approvedAt
+    approved.behaviorDigest !== input.behaviorDigest ||
+    approved.behaviorDigest !== ALLOCATION_POLICY_BEHAVIOR_DIGEST ||
+    approved.evidenceHash !== evidence.evidenceHash ||
+    approved.evidenceHash !== hashAllocationEvidenceArtifact(artifact) ||
+    approved.policyHash !== evidence.evidenceHash ||
+    approved.workedExampleHash !== evidence.evidenceHash ||
+    approved.financeApprovedBy !== evidence.financeApprovedBy ||
+    approved.complianceApprovedBy !== evidence.complianceApprovedBy ||
+    approved.financeSignature !== evidence.financeSignature ||
+    approved.complianceSignature !== evidence.complianceSignature ||
+    approved.financeApprovedAt?.toISOString() !== evidence.financeApprovedAt ||
+    approved.complianceApprovedAt?.toISOString() !==
+      evidence.complianceApprovedAt ||
+    approved.approvedAt.toISOString() !== evidence.financeApprovedAt
   )
     return false;
-  const canonicalWorkedExample = canonicalJson(approved.workedExample);
+  if (
+    approved.evidenceArtifact === null ||
+    approved.evidenceArtifact === undefined
+  )
+    return false;
+  const canonicalEvidence = canonicalJson(approved.evidenceArtifact);
   return (
-    sha256(canonicalWorkedExample) === approved.workedExampleHash &&
-    canonicalWorkedExample === canonicalJson(allocationPolicyWorkedExample)
+    sha256(canonicalEvidence) === approved.evidenceHash &&
+    canonicalEvidence === canonicalJson(artifact) &&
+    canonicalJson(approved.workedExample) === canonicalEvidence
   );
 }
 
@@ -751,6 +776,22 @@ function inferChannel(
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function canonicalJson(value: unknown): string {

@@ -126,6 +126,18 @@ describe("staff payment workspace", () => {
       providerTotalMinorUnits: "1000",
     });
   });
+
+  it("does not expose settlement comparison to the managing director", async () => {
+    const api = fakeApi();
+    render(<PaymentWorkspace api={api} actorId="md-1" roles={["MD"]} />);
+    await screen.findByRole("heading", { name: "Payments reconciliation" });
+    expect(
+      screen.queryByRole("heading", { name: "Compare settlement" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Compare settlement" }),
+    ).toBeNull();
+  });
 });
 
 function fakeApi(): StaffPaymentsApi & {

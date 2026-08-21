@@ -213,7 +213,7 @@ export async function registerPaymentRoutes(
     { preHandler: staffMutation, schema: settlementComparisonSchema },
     async (request, reply) => {
       const actor = requireStaffPrincipal(request);
-      assertFinanceRead(actor);
+      assertSettlementComparisonAccess(actor);
       return reply.send(
         await composition.reconciliation.compareSettlement({
           settlementReference: request.body.settlementReference,
@@ -301,6 +301,21 @@ function assertFinanceRead(
     )
   )
     throw new AppError(403, "FORBIDDEN", "Finance access is required.");
+}
+
+function assertSettlementComparisonAccess(
+  actor: ReturnType<typeof requireStaffPrincipal>,
+): void {
+  if (
+    !actor.roles.some((role) =>
+      ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR"].includes(role),
+    )
+  )
+    throw new AppError(
+      403,
+      "FORBIDDEN",
+      "Settlement comparison authority is required.",
+    );
 }
 
 const uuidPattern =

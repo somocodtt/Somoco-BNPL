@@ -55,8 +55,20 @@ export const paymentAllocationPolicy = pgTable(
     workedExample: jsonb("worked_example")
       .$type<Record<string, unknown>>()
       .notNull(),
+    behaviorDigest: text("behavior_digest"),
+    evidenceHash: text("evidence_hash"),
+    evidenceArtifact:
+      jsonb("evidence_artifact").$type<Record<string, unknown>>(),
     financeApprovedBy: text("finance_approved_by").notNull(),
     complianceApprovedBy: text("compliance_approved_by").notNull(),
+    financeSignature: text("finance_signature"),
+    complianceSignature: text("compliance_signature"),
+    financeApprovedAt: timestamp("finance_approved_at", {
+      withTimezone: true,
+    }),
+    complianceApprovedAt: timestamp("compliance_approved_at", {
+      withTimezone: true,
+    }),
     approvedAt: timestamp("approved_at", { withTimezone: true }).notNull(),
     status: text("status").notNull().default("APPROVED"),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -78,12 +90,24 @@ export const paymentAllocationPolicy = pgTable(
       sql`${table.workedExampleHash} ~ '^[0-9a-f]{64}$'`,
     ),
     check(
+      "payment_allocation_policy_behavior_digest_sha256",
+      sql`${table.behaviorDigest} is null or ${table.behaviorDigest} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "payment_allocation_policy_evidence_hash_sha256",
+      sql`${table.evidenceHash} is null or ${table.evidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
       "payment_allocation_policy_approvers_distinct",
       sql`length(btrim(${table.financeApprovedBy})) > 0 and length(btrim(${table.complianceApprovedBy})) > 0 and ${table.financeApprovedBy} <> ${table.complianceApprovedBy}`,
     ),
     check(
       "payment_allocation_policy_status_allowed",
       sql`${table.status} in ('APPROVED', 'REVOKED')`,
+    ),
+    check(
+      "payment_allocation_policy_approved_external_evidence",
+      sql`${table.status} <> 'APPROVED' or (${table.behaviorDigest} is not null and ${table.evidenceHash} is not null and ${table.evidenceArtifact} is not null and ${table.financeSignature} is not null and length(btrim(${table.financeSignature})) > 0 and ${table.complianceSignature} is not null and length(btrim(${table.complianceSignature})) > 0 and ${table.financeApprovedAt} is not null and ${table.complianceApprovedAt} is not null)`,
     ),
   ],
 );
