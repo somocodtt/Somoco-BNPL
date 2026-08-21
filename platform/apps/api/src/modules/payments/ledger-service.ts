@@ -135,6 +135,10 @@ export interface LedgerPostResult {
 }
 
 export interface LedgerService {
+  findDuplicateProviderTransaction(input: {
+    providerTransactionId: string;
+    transaction?: DatabaseTransaction;
+  }): Promise<LedgerPostResult | null>;
   post(input: LedgerPostInput): Promise<LedgerPostResult>;
   reverse(input: {
     originalProviderTransactionId: string;
@@ -165,6 +169,21 @@ export function createLedgerService(options: {
   receipts?: ReceiptService;
 }): LedgerService {
   return {
+    async findDuplicateProviderTransaction(input) {
+      const operation = async (
+        tx: DatabaseTransaction,
+      ): Promise<LedgerPostResult | null> => {
+        const repo = paymentRepo(tx);
+        const duplicate = await repo.findByProviderTransaction(
+          "SOMOCO_PAYMENTS",
+          input.providerTransactionId,
+        );
+        return duplicate === null ? null : duplicateResult(repo, duplicate);
+      };
+      return input.transaction === undefined
+        ? withTransaction(options.database, operation)
+        : operation(input.transaction);
+    },
     async post(input) {
       if (input.policy !== undefined) validateAllocationPolicy(input.policy);
       if (input.amountMinorUnits <= 0n) {

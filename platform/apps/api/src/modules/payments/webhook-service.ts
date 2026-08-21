@@ -107,6 +107,26 @@ export function createPaymentWebhookService(options: {
           }
           return inbox.result as PaymentWebhookAcknowledgement;
         }
+        const duplicateProviderPayment =
+          event.eventType === "PAYMENT_SUCCEEDED"
+            ? await ledger.findDuplicateProviderTransaction({
+                providerTransactionId: event.providerTransactionId,
+                transaction: tx,
+              })
+            : null;
+        if (duplicateProviderPayment !== null) {
+          const acknowledgement = acknowledgementForResult(
+            event,
+            duplicateProviderPayment,
+          );
+          await completeInboxMessage(
+            tx,
+            inbox.id,
+            inbox.processingToken!,
+            acknowledgement,
+          );
+          return acknowledgement;
+        }
         const policyAttestationReference =
           event.eventType === "PAYMENT_SUCCEEDED"
             ? await verifyAllocationPolicyEvidence()
@@ -120,17 +140,7 @@ export function createPaymentWebhookService(options: {
             ? {}
             : { policyAttestationReference }),
         });
-        const acknowledgement: PaymentWebhookAcknowledgement = {
-          accepted: true,
-          duplicate: result.reason === "DUPLICATE_PROVIDER_TRANSACTION",
-          eventId: event.eventId,
-          outcome: result.outcome,
-          paymentTransactionId: result.paymentTransaction.id,
-          ...(result.receiptId === undefined
-            ? {}
-            : { receiptId: result.receiptId }),
-          ...(result.reason === undefined ? {} : { reason: result.reason }),
-        };
+        const acknowledgement = acknowledgementForResult(event, result);
         await completeInboxMessage(
           tx,
           inbox.id,
@@ -216,6 +226,21 @@ async function processEvent(input: {
       ? {}
       : { settlementReference: event.settlementReference }),
   });
+}
+
+function acknowledgementForResult(
+  event: CanonicalPaymentEvent,
+  result: LedgerPostResult,
+): PaymentWebhookAcknowledgement {
+  return {
+    accepted: true,
+    duplicate: result.reason === "DUPLICATE_PROVIDER_TRANSACTION",
+    eventId: event.eventId,
+    outcome: result.outcome,
+    paymentTransactionId: result.paymentTransaction.id,
+    ...(result.receiptId === undefined ? {} : { receiptId: result.receiptId }),
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+  };
 }
 
 function validateCanonicalEvent(event: CanonicalPaymentEvent): void {

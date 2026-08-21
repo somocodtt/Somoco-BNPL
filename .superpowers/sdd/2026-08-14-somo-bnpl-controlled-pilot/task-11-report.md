@@ -136,3 +136,20 @@ The repository supplies the provider-neutral Somoco payment verifier and product
 ### Fix-round review note
 
 - The exact base-to-head review covers canonical attestation construction, runtime allocation-engine digest binding, trusted production connector capability, simulator fail-closed behavior, verifier error sanitization, duplicate replay ordering, and provenance persistence. No provider keys, credentials, signature algorithm, payment endpoint, simulator default, cash path, or automatic immobilization was added.
+
+## Fix round 5 — verifier-independent payment replay (base `21f63042d946a2ddf5a26066b4ee34cbd34f2db5`)
+
+### TDD evidence
+
+- RED accepted: a fresh webhook service replaying a committed provider transaction with a revoked policy failed with `ALLOCATION_POLICY_EVIDENCE_NOT_VERIFIED` because the unavailable external verifier ran before the durable duplicate lookup.
+- GREEN: the focused real-PostgreSQL API payment suite passes 36/36. The new case proves a new event ID with the same provider transaction returns the original posted payment ID/outcome and `duplicate: true`, invokes the fresh service's unavailable verifier zero times, and does not require active policy approval.
+
+### Implementation and verification gates
+
+- The ledger service now exposes a transaction-aware durable duplicate-provider lookup. The webhook inserts the new inbox event, checks the committed provider transaction before external allocation-policy verification, completes the new inbox acknowledgement from the persisted ledger/receipt result, and only verifies evidence for a new posting. No process cache is used for correctness; raw-byte provider verification and event-inbox idempotency remain unchanged.
+- API production-composition tests pass 2/2; integrations boundary tests pass 23/23. API/integrations typechecks and production builds, targeted ESLint, Prettier, and `git diff --check` all pass.
+- No migration was required; this round uses the existing payment transaction/provider uniqueness and inbox persistence controls.
+
+### Fix-round review note
+
+- The exact base-to-head review covers durable duplicate lookup ordering, stable acknowledgement construction, policy-revocation replay, transaction reuse, and preservation of reversal/refund handling. No provider credentials, simulator behavior, signature algorithm, migration, cash path, or automatic immobilization was added.

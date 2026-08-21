@@ -561,6 +561,68 @@ describe("Somoco payment boundary", () => {
     expect(calls).toBe(1);
   });
 
+  it("replays a committed provider payment without a fresh policy verifier", async () => {
+    const graph = await insertContractGraph(database);
+    const approved = policy();
+    const firstService = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-fresh-replay-original",
+        providerTransactionId: "txn-fresh-replay",
+        customerReference: graph.reference,
+      })),
+      policy: approved,
+      evidenceVerifier: {
+        verify: async () => ({
+          attestationReference: "fresh-replay-attestation",
+        }),
+      },
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    const first = await firstService.receive({
+      rawBody: new Uint8Array(Buffer.from("fresh-replay-original")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    expect(first.outcome).toBe("POSTED");
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set status = 'REVOKED'
+       where version = 'finance-policy-v1'
+    `);
+
+    let verifierCalls = 0;
+    const freshService = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-fresh-replay-new",
+        providerTransactionId: "txn-fresh-replay",
+        customerReference: graph.reference,
+      })),
+      policy: approved,
+      evidenceVerifier: {
+        verify: async () => {
+          verifierCalls += 1;
+          throw new Error("EVIDENCE_PROVIDER_UNAVAILABLE");
+        },
+      },
+    } as unknown as Parameters<typeof createPaymentWebhookService>[0]);
+    const replay = await freshService.receive({
+      rawBody: new Uint8Array(Buffer.from("fresh-replay-new")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+
+    expect(replay).toMatchObject({
+      accepted: true,
+      duplicate: true,
+      outcome: first.outcome,
+      paymentTransactionId: first.paymentTransactionId,
+    });
+    expect(verifierCalls).toBe(0);
+  });
+
   it("returns one stable result for concurrent events sharing a provider transaction id", async () => {
     const graph = await insertContractGraph(database);
     let sequence = 0;
