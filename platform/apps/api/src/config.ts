@@ -18,6 +18,8 @@ export interface AppConfig {
   argon2TimeCost: number;
   argon2Parallelism: number;
   requireVerifiedMfa: boolean;
+  mainHeadOfficeId?: string;
+  mainHeadOfficeLocation?: string;
 }
 
 export function loadConfig(
@@ -67,6 +69,19 @@ export function loadConfig(
       env.REQUIRE_VERIFIED_MFA,
       "REQUIRE_VERIFIED_MFA",
     ),
+    ...(env.SOMOCO_MAIN_HEAD_OFFICE_ID === undefined &&
+    env.SOMOCO_MAIN_HEAD_OFFICE_LOCATION === undefined
+      ? {}
+      : {
+          mainHeadOfficeId: required(
+            env.SOMOCO_MAIN_HEAD_OFFICE_ID,
+            "SOMOCO_MAIN_HEAD_OFFICE_ID",
+          ),
+          mainHeadOfficeLocation: required(
+            env.SOMOCO_MAIN_HEAD_OFFICE_LOCATION,
+            "SOMOCO_MAIN_HEAD_OFFICE_LOCATION",
+          ),
+        }),
   });
 }
 
@@ -124,6 +139,14 @@ export function validateConfig(config: AppConfig): AppConfig {
     if (!config.requireVerifiedMfa) {
       throw new Error("production staff sessions must require verified MFA");
     }
+  }
+  if (
+    (config.mainHeadOfficeId === undefined) !==
+    (config.mainHeadOfficeLocation === undefined)
+  ) {
+    throw new Error(
+      "mainHeadOfficeId and mainHeadOfficeLocation must be configured together",
+    );
   }
   return Object.freeze({
     ...config,

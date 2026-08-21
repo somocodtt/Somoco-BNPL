@@ -116,12 +116,44 @@ export interface HandoverRow extends Record<string, unknown> {
   checklist_version: string;
   customer_acknowledged_at: Date | string | null;
   customer_acknowledged_by_person_id: string | null;
+  head_office_id: string | null;
   condition: Record<string, unknown>;
   accessories: string[];
   head_office_location: string;
   handed_over_by: string;
   handed_over_at: Date | string;
   version: number;
+}
+
+export interface HandoverAcknowledgementRow extends Record<string, unknown> {
+  id: string;
+  contract_id: string;
+  application_id: string;
+  person_id: string;
+  customer_account_id: string;
+  customer_session_id: string;
+  checklist_version: string;
+  checklist_hash: string;
+  acknowledged_at: Date | string;
+  idempotency_key: string;
+}
+
+export interface ReassignmentApprovalRow extends Record<string, unknown> {
+  id: string;
+  application_id: string;
+  previous_assignment_id: string;
+  requested_vehicle_unit_id: string;
+  contract_id: string | null;
+  requested_by: string;
+  requested_by_role: string;
+  approved_by: string | null;
+  approved_by_role: string | null;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED";
+  reason: string;
+  effective_from: Date | string;
+  effective_until: Date | string | null;
+  approved_at: Date | string | null;
+  created_at: Date | string;
 }
 
 export interface TemplateRow extends Record<string, unknown> {
@@ -282,6 +314,27 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       return result.rows[0] ?? null;
     },
 
+    async validCustomerSessionBinding(input: {
+      customerAccountId: string;
+      customerSessionId: string;
+      personId: string;
+      now: Date;
+    }): Promise<boolean> {
+      const result = await executor.execute<{ ok: boolean }>(sql`
+        select true as ok
+          from customer_session session
+          join customer_account account on account.id = session.customer_account_id
+         where session.id = ${input.customerSessionId}::uuid
+           and session.customer_account_id = ${input.customerAccountId}::uuid
+           and account.person_id = ${input.personId}::uuid
+           and account.status = 'ACTIVE'
+           and session.revoked_at is null
+           and session.expires_at > ${input.now}
+         limit 1
+      `);
+      return result.rows[0]?.ok === true;
+    },
+
     async lockOfferByApplication(
       applicationId: string,
     ): Promise<OfferRow | null> {
@@ -362,6 +415,110 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       return result.rows[0] ?? null;
     },
 
+    async insertReassignmentApproval(input: {
+      id: string;
+      applicationId: string;
+      previousAssignmentId: string;
+      requestedVehicleUnitId: string;
+      requestedBy: string;
+      requestedByRole: string;
+      reason: string;
+      effectiveFrom: Date;
+      effectiveUntil?: Date;
+      contractId?: string;
+      status?: "PENDING" | "APPROVED";
+      approvedBy?: string;
+      approvedByRole?: string;
+      approvedAt?: Date;
+    }): Promise<ReassignmentApprovalRow> {
+      const result = await executor.execute<ReassignmentApprovalRow>(sql`
+        insert into vehicle_reassignment_approval
+          (id, application_id, previous_assignment_id, requested_vehicle_unit_id,
+           contract_id, requested_by, requested_by_role, approved_by,
+           approved_by_role, status, reason, effective_from, effective_until,
+           approved_at)
+        values (${input.id}::uuid, ${input.applicationId}::uuid,
+                ${input.previousAssignmentId}::uuid, ${input.requestedVehicleUnitId}::uuid,
+                ${input.contractId ?? null}::uuid, ${input.requestedBy}::uuid,
+                ${input.requestedByRole}, ${input.approvedBy ?? null}::uuid,
+                ${input.approvedByRole ?? null}, ${input.status ?? "PENDING"},
+                ${input.reason}, ${input.effectiveFrom},
+                ${input.effectiveUntil ?? null}, ${input.approvedAt ?? null})
+        returning id, application_id, previous_assignment_id, requested_vehicle_unit_id,
+                  contract_id, requested_by, requested_by_role, approved_by,
+                  approved_by_role, status, reason, effective_from, effective_until,
+                  approved_at, created_at
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("REASSIGNMENT_APPROVAL_INSERT_FAILED");
+      return row;
+    },
+
+    async findReassignmentApproval(
+      id: string,
+      lock = false,
+    ): Promise<ReassignmentApprovalRow | null> {
+      const lockClause = lock ? sql` for update` : sql``;
+      const result = await executor.execute<ReassignmentApprovalRow>(sql`
+        select id, application_id, previous_assignment_id, requested_vehicle_unit_id,
+               contract_id, requested_by, requested_by_role, approved_by,
+               approved_by_role, status, reason, effective_from, effective_until,
+               approved_at, created_at
+          from vehicle_reassignment_approval
+         where id = ${id}::uuid
+         limit 1${lockClause}
+      `);
+      return result.rows[0] ?? null;
+    },
+
+    async approveReassignmentApproval(input: {
+      id: string;
+      approvedBy: string;
+      approvedByRole: string;
+      approvedAt: Date;
+      now: Date;
+    }): Promise<ReassignmentApprovalRow | null> {
+      const result = await executor.execute<ReassignmentApprovalRow>(sql`
+        update vehicle_reassignment_approval
+           set status = 'APPROVED', approved_by = ${input.approvedBy}::uuid,
+               approved_by_role = ${input.approvedByRole}, approved_at = ${input.approvedAt}
+         where id = ${input.id}::uuid
+           and status = 'PENDING'
+           and effective_from <= ${input.now}
+           and (effective_until is null or effective_until > ${input.now})
+        returning id, application_id, previous_assignment_id, requested_vehicle_unit_id,
+                  contract_id, requested_by, requested_by_role, approved_by,
+                  approved_by_role, status, reason, effective_from, effective_until,
+                  approved_at, created_at
+      `);
+      return result.rows[0] ?? null;
+    },
+
+    async findEffectiveReassignmentApproval(input: {
+      id: string;
+      applicationId: string;
+      previousAssignmentId: string;
+      requestedVehicleUnitId: string;
+      now: Date;
+    }): Promise<ReassignmentApprovalRow | null> {
+      const result = await executor.execute<ReassignmentApprovalRow>(sql`
+        select id, application_id, previous_assignment_id, requested_vehicle_unit_id,
+               contract_id, requested_by, requested_by_role, approved_by,
+               approved_by_role, status, reason, effective_from, effective_until,
+               approved_at, created_at
+          from vehicle_reassignment_approval
+         where id = ${input.id}::uuid
+           and application_id = ${input.applicationId}::uuid
+           and previous_assignment_id = ${input.previousAssignmentId}::uuid
+           and requested_vehicle_unit_id = ${input.requestedVehicleUnitId}::uuid
+           and status = 'APPROVED'
+           and effective_from <= ${input.now}
+           and (effective_until is null or effective_until > ${input.now})
+         limit 1
+      `);
+      return result.rows[0] ?? null;
+    },
+
     async insertAssignment(input: {
       id: string;
       applicationId: string;
@@ -430,19 +587,61 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       return row;
     },
 
+    async updateVehicleRegistrationSummary(
+      id: string,
+      expectedVersion: number,
+      registrationNumber: string,
+      now: Date,
+    ): Promise<VehicleRow> {
+      const result = await executor.execute<VehicleRow>(sql`
+        update vehicle_unit
+           set registration_number = ${registrationNumber}, version = version + 1,
+               updated_at = ${now}
+         where id = ${id}::uuid and version = ${expectedVersion}
+        returning id, vehicle_model_id, vin, chassis_number, engine_motor_identifier,
+                  condition, accessories, tracker_identifier, registration_number, status, version
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("VEHICLE_VERSION_CONFLICT");
+      return row;
+    },
+
+    async bumpVehicleVersion(
+      id: string,
+      expectedVersion: number,
+      now: Date,
+    ): Promise<VehicleRow> {
+      const result = await executor.execute<VehicleRow>(sql`
+        update vehicle_unit
+           set version = version + 1, updated_at = ${now}
+         where id = ${id}::uuid and version = ${expectedVersion}
+        returning id, vehicle_model_id, vin, chassis_number, engine_motor_identifier,
+                  condition, accessories, tracker_identifier, registration_number, status, version
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("VEHICLE_VERSION_CONFLICT");
+      return row;
+    },
+
     async findCurrentInsuranceRegistration(vehicleUnitId: string): Promise<{
+      registration_valid_from: string | null;
       registration_valid_to: string | null;
+      insurance_valid_from: string | null;
       insurance_valid_to: string | null;
       registration_number: string | null;
       insurance_policy_number: string | null;
     } | null> {
       const result = await executor.execute<{
+        registration_valid_from: string | null;
         registration_valid_to: string | null;
+        insurance_valid_from: string | null;
         insurance_valid_to: string | null;
         registration_number: string | null;
         insurance_policy_number: string | null;
       }>(sql`
-        select registration.valid_to as registration_valid_to,
+        select registration.valid_from as registration_valid_from,
+               registration.valid_to as registration_valid_to,
+               insurance.valid_from as insurance_valid_from,
                insurance.valid_to as insurance_valid_to,
                registration.registration_number,
                insurance.policy_number as insurance_policy_number
@@ -575,7 +774,10 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       }
     },
 
-    async customerVehicleSummary(applicationId: string): Promise<{
+    async customerVehicleSummary(
+      applicationId: string,
+      vehicleUnitId?: string,
+    ): Promise<{
       vehicle_model_id: string;
       registration_number: string | null;
       registration_valid_to: string | null;
@@ -604,7 +806,9 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
             select valid_to from insurance_record
              where vehicle_unit_id = vehicle.id order by valid_to desc, created_at desc limit 1
           ) insurance on true
-         where assignment.application_id = ${applicationId}::uuid and assignment.released_at is null
+         where assignment.application_id = ${applicationId}::uuid
+           and assignment.released_at is null
+           and (${vehicleUnitId ?? null}::uuid is null or assignment.vehicle_unit_id = ${vehicleUnitId ?? null}::uuid)
          limit 1
       `);
       return result.rows[0] ?? null;
@@ -733,6 +937,7 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       guarantorSignature: string;
       staffWitnessId: string;
       executionDate: Date;
+      headOfficeId: string;
       headOfficeLocation: string;
       executedDocumentId: string;
       executedDocumentHash: string;
@@ -741,14 +946,14 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       const result = await executor.execute<ExecutionRow>(sql`
         insert into contract_execution
           (id, contract_id, version_number, applicant_signature, guarantor_signature,
-           staff_witness_id, execution_date, head_office_location, executed_document_id,
+           staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
            executed_document_hash, authorization_reason)
         values (${input.id}::uuid, ${input.contractId}::uuid, ${input.versionNumber},
                 ${input.applicantSignature}, ${input.guarantorSignature}, ${input.staffWitnessId}::uuid,
-                ${input.executionDate}, ${input.headOfficeLocation}, ${input.executedDocumentId}::uuid,
+                ${input.executionDate}, ${input.headOfficeId}, ${input.headOfficeLocation}, ${input.executedDocumentId}::uuid,
                 ${input.executedDocumentHash}, ${input.authorizationReason ?? null})
         returning id, contract_id, version_number, applicant_signature, guarantor_signature,
-                  staff_witness_id, execution_date, head_office_location, executed_document_id,
+                  staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
                   executed_document_hash, authorization_reason
       `);
       const row = result.rows[0];
@@ -760,7 +965,7 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
     async latestExecution(contractId: string): Promise<ExecutionRow | null> {
       const result = await executor.execute<ExecutionRow>(sql`
         select id, contract_id, version_number, applicant_signature, guarantor_signature,
-               staff_witness_id, execution_date, head_office_location, executed_document_id,
+               staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
                executed_document_hash, authorization_reason
           from contract_execution where contract_id = ${contractId}::uuid
          order by version_number desc limit 1
@@ -775,6 +980,7 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       checklistVersion: string;
       customerAcknowledgedAt: Date;
       customerAcknowledgedByPersonId: string;
+      headOfficeId: string;
       condition: Record<string, unknown>;
       accessories: readonly string[];
       headOfficeLocation: string;
@@ -784,15 +990,15 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       const result = await executor.execute<HandoverRow>(sql`
         insert into handover_record
           (id, contract_id, checklist, checklist_version, customer_acknowledged_at,
-           customer_acknowledged_by_person_id, condition, accessories, head_office_location,
+           customer_acknowledged_by_person_id, head_office_id, condition, accessories, head_office_location,
            handed_over_by, handed_over_at, version)
         values (${input.id}::uuid, ${input.contractId}::uuid, ${JSON.stringify(input.checklist)}::jsonb,
                 ${input.checklistVersion}, ${input.customerAcknowledgedAt},
-                ${input.customerAcknowledgedByPersonId}::uuid, ${JSON.stringify(input.condition)}::jsonb,
+                ${input.customerAcknowledgedByPersonId}::uuid, ${input.headOfficeId}, ${JSON.stringify(input.condition)}::jsonb,
                 ${JSON.stringify(input.accessories)}::jsonb, ${input.headOfficeLocation},
                 ${input.handedOverBy}::uuid, ${input.handedOverAt}, 1)
         returning id, contract_id, checklist, checklist_version, customer_acknowledged_at,
-                  customer_acknowledged_by_person_id, condition, accessories, head_office_location,
+                  customer_acknowledged_by_person_id, head_office_id, condition, accessories, head_office_location,
                   handed_over_by, handed_over_at, version
       `);
       const row = result.rows[0];
@@ -803,9 +1009,71 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
     async findHandover(contractId: string): Promise<HandoverRow | null> {
       const result = await executor.execute<HandoverRow>(sql`
         select id, contract_id, checklist, checklist_version, customer_acknowledged_at,
-               customer_acknowledged_by_person_id, condition, accessories, head_office_location,
+               customer_acknowledged_by_person_id, head_office_id, condition, accessories, head_office_location,
                handed_over_by, handed_over_at, version
           from handover_record where contract_id = ${contractId}::uuid limit 1
+      `);
+      return result.rows[0] ?? null;
+    },
+
+    async insertHandoverAcknowledgement(input: {
+      id: string;
+      contractId: string;
+      applicationId: string;
+      personId: string;
+      customerAccountId: string;
+      customerSessionId: string;
+      checklistVersion: string;
+      checklistHash: string;
+      acknowledgedAt: Date;
+      idempotencyKey: string;
+    }): Promise<HandoverAcknowledgementRow> {
+      const result = await executor.execute<HandoverAcknowledgementRow>(sql`
+        insert into handover_customer_acknowledgement
+          (id, contract_id, application_id, person_id, customer_account_id,
+           customer_session_id, checklist_version, checklist_hash,
+           acknowledged_at, idempotency_key)
+        values (${input.id}::uuid, ${input.contractId}::uuid,
+                ${input.applicationId}::uuid, ${input.personId}::uuid,
+                ${input.customerAccountId}::uuid, ${input.customerSessionId}::uuid,
+                ${input.checklistVersion}, ${input.checklistHash},
+                ${input.acknowledgedAt}, ${input.idempotencyKey})
+        returning id, contract_id, application_id, person_id, customer_account_id,
+                  customer_session_id, checklist_version, checklist_hash,
+                  acknowledged_at, idempotency_key
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("HANDOVER_ACK_INSERT_FAILED");
+      return row;
+    },
+
+    async findHandoverAcknowledgement(
+      id: string,
+      lock = false,
+    ): Promise<HandoverAcknowledgementRow | null> {
+      const lockClause = lock ? sql` for update` : sql``;
+      const result = await executor.execute<HandoverAcknowledgementRow>(sql`
+        select id, contract_id, application_id, person_id, customer_account_id,
+               customer_session_id, checklist_version, checklist_hash,
+               acknowledged_at, idempotency_key
+          from handover_customer_acknowledgement
+         where id = ${id}::uuid
+         limit 1${lockClause}
+      `);
+      return result.rows[0] ?? null;
+    },
+
+    async findLatestHandoverAcknowledgement(
+      contractId: string,
+    ): Promise<HandoverAcknowledgementRow | null> {
+      const result = await executor.execute<HandoverAcknowledgementRow>(sql`
+        select id, contract_id, application_id, person_id, customer_account_id,
+               customer_session_id, checklist_version, checklist_hash,
+               acknowledged_at, idempotency_key
+          from handover_customer_acknowledgement
+         where contract_id = ${contractId}::uuid
+         order by acknowledged_at desc, id desc
+         limit 1
       `);
       return result.rows[0] ?? null;
     },
@@ -817,13 +1085,27 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       const result = await executor.execute<{
         person_id: string;
         sha256: string;
+        document_type: string;
+        declared_mime_type: string;
+        accepted_object_key: string;
+        accepted_object_version_id: string;
+        accepted_object_etag: string;
+        version: number;
       }>(sql`
-        select person_id, sha256
+        select person_id, sha256, document_type, declared_mime_type,
+               accepted_object_key, accepted_object_version_id,
+               accepted_object_etag, version
           from privacy.document
          where id = ${documentId}::uuid
            and status = 'ACCEPTED'
            and malware_scanned = true
            and sha256 = ${expectedHash}
+           and document_type = 'EXECUTED_CONTRACT'
+           and declared_mime_type = 'application/pdf'
+           and length(btrim(coalesce(accepted_object_key, ''))) > 0
+           and length(btrim(coalesce(accepted_object_version_id, ''))) > 0
+           and length(btrim(coalesce(accepted_object_etag, ''))) > 0
+           and version > 0
          limit 1
       `);
       return result.rows[0] ?? null;

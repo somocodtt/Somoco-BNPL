@@ -155,8 +155,19 @@ export function CustomerRouter({
     );
   const loadedState = state;
 
+  const contractVisibleStatuses = new Set([
+    "APPROVED",
+    "AWAITING_ASSET_ASSIGNMENT",
+    "AWAITING_EXECUTION",
+    "EXECUTED",
+    "ACTIVE",
+    "SETTLED",
+    "RECOVERY",
+    "TERMINATED",
+  ]);
   if (
-    loadedState.draft?.status === "APPROVED" &&
+    loadedState.draft !== null &&
+    contractVisibleStatuses.has(loadedState.draft.status) &&
     (offerApi !== undefined || contractApi !== undefined)
   ) {
     return (

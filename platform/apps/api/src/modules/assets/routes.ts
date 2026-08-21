@@ -107,7 +107,7 @@ export async function registerAssetRoutes(
       vehicleUnitId: string;
       expectedVehicleVersion: number;
       previousAssignmentId?: string;
-      reassignmentApproval?: { approvedBy: string; reason: string };
+      reassignmentApproval?: { approvalId: string };
       idempotencyKey: string;
     };
   }>(
@@ -130,10 +130,9 @@ export async function registerAssetRoutes(
             reassignmentApproval: {
               type: "object",
               additionalProperties: false,
-              required: ["approvedBy", "reason"],
+              required: ["approvalId"],
               properties: {
-                approvedBy: uuid,
-                reason: { type: "string", minLength: 1, maxLength: 4000 },
+                approvalId: uuid,
               },
             },
             idempotencyKey: idempotency,
@@ -156,12 +155,95 @@ export async function registerAssetRoutes(
   );
 
   app.post<{
+    Params: { applicationId: string };
+    Body: {
+      previousAssignmentId: string;
+      requestedVehicleUnitId: string;
+      reason: string;
+      effectiveUntil?: string;
+      idempotencyKey: string;
+    };
+  }>(
+    "/v1/staff/applications/:applicationId/reassignment-requests",
+    {
+      schema: {
+        params: applicationParams,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "previousAssignmentId",
+            "requestedVehicleUnitId",
+            "reason",
+            "idempotencyKey",
+          ],
+          properties: {
+            previousAssignmentId: uuid,
+            requestedVehicleUnitId: uuid,
+            reason: { type: "string", minLength: 1, maxLength: 4000 },
+            effectiveUntil: {
+              type: "string",
+              pattern: "^\\d{4}-\\d{2}-\\d{2}$",
+            },
+            idempotencyKey: idempotency,
+          },
+        },
+      },
+      preHandler: mutation,
+    },
+    async (request, reply) =>
+      reply.code(201).send(
+        await assets.requestReassignment({
+          applicationId: request.params.applicationId,
+          ...request.body,
+          actor: requireStaffPrincipal(request),
+          requestId: request.id,
+        }),
+      ),
+  );
+
+  app.post<{
+    Params: { approvalId: string };
+    Body: { idempotencyKey: string };
+  }>(
+    "/v1/staff/reassignment-approvals/:approvalId/approve",
+    {
+      schema: {
+        params: {
+          type: "object",
+          additionalProperties: false,
+          required: ["approvalId"],
+          properties: { approvalId: uuid },
+        },
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["idempotencyKey"],
+          properties: { idempotencyKey: idempotency },
+        },
+      },
+      preHandler: mutation,
+    },
+    async (request, reply) =>
+      reply.send(
+        await assets.approveReassignment({
+          approvalId: request.params.approvalId,
+          ...request.body,
+          actor: requireStaffPrincipal(request),
+          requestId: request.id,
+        }),
+      ),
+  );
+
+  app.post<{
     Params: { vehicleUnitId: string };
     Body: {
       registrationNumber: string;
       validFrom: string;
       validTo: string;
       evidenceDocumentId?: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
     };
   }>(
     "/v1/staff/assets/:vehicleUnitId/registration",
@@ -171,7 +253,13 @@ export async function registerAssetRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["registrationNumber", "validFrom", "validTo"],
+          required: [
+            "registrationNumber",
+            "validFrom",
+            "validTo",
+            "expectedVehicleVersion",
+            "idempotencyKey",
+          ],
           properties: {
             registrationNumber: {
               type: "string",
@@ -181,6 +269,8 @@ export async function registerAssetRoutes(
             validFrom: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
             validTo: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
             evidenceDocumentId: uuid,
+            expectedVehicleVersion: { type: "integer", minimum: 1 },
+            idempotencyKey: idempotency,
           },
         },
       },
@@ -205,6 +295,8 @@ export async function registerAssetRoutes(
       validFrom: string;
       validTo: string;
       evidenceDocumentId?: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
     };
   }>(
     "/v1/staff/assets/:vehicleUnitId/insurance",
@@ -214,13 +306,22 @@ export async function registerAssetRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["policyNumber", "provider", "validFrom", "validTo"],
+          required: [
+            "policyNumber",
+            "provider",
+            "validFrom",
+            "validTo",
+            "expectedVehicleVersion",
+            "idempotencyKey",
+          ],
           properties: {
             policyNumber: { type: "string", minLength: 1, maxLength: 128 },
             provider: { type: "string", minLength: 1, maxLength: 256 },
             validFrom: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
             validTo: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
             evidenceDocumentId: uuid,
+            expectedVehicleVersion: { type: "integer", minimum: 1 },
+            idempotencyKey: idempotency,
           },
         },
       },
@@ -239,7 +340,13 @@ export async function registerAssetRoutes(
 
   app.post<{
     Params: { vehicleUnitId: string };
-    Body: { provider: string; providerDeviceId: string; deepLink: string };
+    Body: {
+      provider: string;
+      providerDeviceId: string;
+      deepLink: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    };
   }>(
     "/v1/staff/assets/:vehicleUnitId/tracker",
     {
@@ -248,24 +355,32 @@ export async function registerAssetRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["provider", "providerDeviceId", "deepLink"],
+          required: [
+            "provider",
+            "providerDeviceId",
+            "deepLink",
+            "expectedVehicleVersion",
+            "idempotencyKey",
+          ],
           properties: {
             provider: { type: "string", minLength: 1 },
             providerDeviceId: { type: "string", minLength: 1 },
             deepLink: { type: "string", format: "uri" },
+            expectedVehicleVersion: { type: "integer", minimum: 1 },
+            idempotencyKey: idempotency,
           },
         },
       },
       preHandler: mutation,
     },
     async (request, reply) => {
-      await assets.associateTracker({
+      const response = await assets.associateTracker({
         vehicleUnitId: request.params.vehicleUnitId,
         ...request.body,
         actor: requireStaffPrincipal(request),
         requestId: request.id,
       });
-      return reply.code(204).send();
+      return reply.send(response);
     },
   );
 

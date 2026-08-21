@@ -32,3 +32,24 @@ No dependency was installed, added, or relinked. All checks used direct linked b
 
 - Final intended commit: `feat: add asset contract and handover controls`.
 - Parent/controller should run the final complete sequential database check, verify the clean commit SHA, and cherry-pick this commit if the worktree is not shared directly.
+
+## Fix round 1 — hardening evidence
+
+- Baseline RED was the focused real-PG forgery case: `1 failed / 5 passed`; a branded production attestation could reference a TEST template row. Production generation now requires the module-private attestation brand and exact persisted approved template ID, version, hashes, content, approver, and effective window. No production legal template is fabricated or defaulted.
+- Customer acknowledgement is applicant-session/person bound, append-only, replay-bound to actor and payload, and requires the exact versioned checklist item IDs/results. Staff completion requires that acknowledgement, a separate staff witness, an exact configured head-office ID/location, and a clean accepted PDF executed-contract document FK-bound to `privacy.document`.
+- Generated contracts bind the vehicle unit permanently; reassignment is denied after generation. Assignment and activation compare the contract-bound vehicle, strict locked schedules are validated without filtering or invented due dates, and assignment transitions `AWAITING_ASSET_ASSIGNMENT` to `AWAITING_EXECUTION` atomically.
+- Registration, insurance, and tracker writes now reserve durable actor/payload idempotency commands before mutation, use optimistic vehicle versions, and atomically write audit/outbox effects. Inventory DTOs and recovery access expose no tracker identifiers or device controls; recovery returns only location deep-link/last-known access.
+
+### Fix-round verification
+
+| Boundary | Result |
+| --- | --- |
+| API real-PG contracts/assets | 9/9 passed |
+| HTTP route boundary | 3/3 passed |
+| Customer UI focused | 7/7 passed |
+| Staff UI focused | 4/4 passed in the final focused file; prior focused adapter/UI set was 7/7 |
+| TypeScript no-emit | DB, API, customer web, and staff web passed |
+| Migration fresh/repeat and populated upgrade through 0014 | 12/12 selected DB integration tests passed, including journal repeat and populated migration |
+| Diff hygiene | `git diff --check` passed |
+
+The unfiltered DB integration file still contains eight pre-existing financing fixture failures because its legacy fixture inserts `DECLINING_BALANCE`, which the current `financing_rule_method_allowed` constraint rejects; the migration and Task 10 DB checks above pass sequentially against PostgreSQL.

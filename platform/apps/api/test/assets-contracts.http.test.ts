@@ -121,4 +121,39 @@ describe("asset and contract HTTP boundary", () => {
     expect(listed.json()).toEqual([]);
     expect(() => JSON.stringify(listed.json())).not.toThrow();
   });
+
+  it("requires optimistic version and durable idempotency fields on asset mutations", async () => {
+    const vehicleUnitId = randomUUID();
+    const registration = await app.inject({
+      method: "POST",
+      url: `/v1/staff/assets/${vehicleUnitId}/registration`,
+      payload: {
+        registrationNumber: "GT-1",
+        validFrom: "2026-01-01",
+        validTo: "2027-01-01",
+      },
+    });
+    expect(registration.statusCode).toBe(400);
+    const insurance = await app.inject({
+      method: "POST",
+      url: `/v1/staff/assets/${vehicleUnitId}/insurance`,
+      payload: {
+        policyNumber: "POLICY-1",
+        provider: "Synthetic Insurer",
+        validFrom: "2026-01-01",
+        validTo: "2027-01-01",
+      },
+    });
+    expect(insurance.statusCode).toBe(400);
+    const tracker = await app.inject({
+      method: "POST",
+      url: `/v1/staff/assets/${vehicleUnitId}/tracker`,
+      payload: {
+        provider: "Synthetic Tracker",
+        providerDeviceId: "device-1",
+        deepLink: "https://tracker.example.test/device-1",
+      },
+    });
+    expect(tracker.statusCode).toBe(400);
+  });
 });

@@ -96,8 +96,10 @@ export {
   type ContractRow as AssetContractRow,
   type DepositRow,
   type ExecutionRow,
+  type HandoverAcknowledgementRow,
   type HandoverRow,
   type OfferRow as AssetOfferRow,
+  type ReassignmentApprovalRow,
   type TemplateRow,
   type VehicleRow,
 } from "./repositories/asset-contracts.js";

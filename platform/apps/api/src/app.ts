@@ -91,7 +91,10 @@ export interface BuildAppOptions {
     requiredDocumentTypes: readonly string[];
   };
   financing?: { fixtureGate?: FinanceApprovalGate };
-  contracts?: { template?: ContractTemplateAttestation };
+  contracts?: {
+    template?: ContractTemplateAttestation;
+    headOffice?: { id: string; location: string };
+  };
 }
 
 export async function buildApp(
@@ -179,17 +182,32 @@ export async function buildApp(
       : { fixtureGate: options.financing.fixtureGate }),
   });
   const assetService = createAssetService({ database });
+  const configuredHeadOffice =
+    options.contracts?.headOffice ??
+    (config.mainHeadOfficeId === undefined ||
+    config.mainHeadOfficeLocation === undefined
+      ? undefined
+      : {
+          id: config.mainHeadOfficeId,
+          location: config.mainHeadOfficeLocation,
+        });
   const contractService = createContractService({
     database,
     ...(options.contracts?.template === undefined
       ? {}
       : { template: options.contracts.template }),
+    ...(configuredHeadOffice === undefined
+      ? {}
+      : { headOffice: configuredHeadOffice }),
     environment: config.environment === "production" ? "production" : "test",
   });
   const handoverService = createHandoverService({
     database,
     assets: assetService,
     contracts: contractService,
+    ...(configuredHeadOffice === undefined
+      ? {}
+      : { headOffice: configuredHeadOffice }),
   });
   let customerOtp: Pick<OtpService, "authenticateSessionToken"> | undefined;
   if (options.identity !== undefined) {

@@ -119,6 +119,60 @@ export const vehicleAssignment = pgTable(
   ],
 );
 
+export const vehicleReassignmentApproval = pgTable(
+  "vehicle_reassignment_approval",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    previousAssignmentId: uuid("previous_assignment_id")
+      .notNull()
+      .references(() => vehicleAssignment.id, { onDelete: "restrict" }),
+    requestedVehicleUnitId: uuid("requested_vehicle_unit_id")
+      .notNull()
+      .references(() => vehicleUnit.id, { onDelete: "restrict" }),
+    contractId: uuid("contract_id"),
+    requestedBy: uuid("requested_by")
+      .notNull()
+      .references(() => staffUser.id, { onDelete: "restrict" }),
+    requestedByRole: text("requested_by_role").notNull(),
+    approvedBy: uuid("approved_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    approvedByRole: text("approved_by_role"),
+    status: text("status").notNull().default("PENDING"),
+    reason: text("reason").notNull(),
+    effectiveFrom: timestamp("effective_from", { withTimezone: true }).notNull(),
+    effectiveUntil: timestamp("effective_until", { withTimezone: true }),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("vehicle_reassignment_approval_pending_unique")
+      .on(table.applicationId, table.previousAssignmentId, table.requestedVehicleUnitId)
+      .where(sql`${table.status} in ('PENDING', 'APPROVED')`),
+    check(
+      "vehicle_reassignment_approval_status_allowed",
+      sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED', 'EXPIRED')`,
+    ),
+    check(
+      "vehicle_reassignment_approval_reason_nonempty",
+      sql`length(btrim(${table.reason})) > 0`,
+    ),
+    check(
+      "vehicle_reassignment_approval_window_ordered",
+      sql`${table.effectiveUntil} is null or ${table.effectiveUntil} > ${table.effectiveFrom}`,
+    ),
+    check(
+      "vehicle_reassignment_approval_approved_consistent",
+      sql`(${table.status} <> 'APPROVED' and ${table.approvedBy} is null and ${table.approvedAt} is null) or (${table.status} = 'APPROVED' and ${table.approvedBy} is not null and ${table.approvedByRole} is not null and ${table.approvedAt} is not null)`,
+    ),
+  ],
+);
+
 export const insuranceRecord = pgTable(
   "insurance_record",
   {

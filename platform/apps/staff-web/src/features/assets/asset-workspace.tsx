@@ -178,6 +178,21 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
   >(undefined);
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const [applicantSignature, setApplicantSignature] = useState("");
+  const [guarantorSignature, setGuarantorSignature] = useState("");
+  const [staffWitnessId, setStaffWitnessId] = useState("");
+  const [executedDocumentId, setExecutedDocumentId] = useState("");
+  const [executedDocumentHash, setExecutedDocumentHash] = useState("");
+  const [headOfficeId, setHeadOfficeId] = useState("");
+  const [headOfficeLocation, setHeadOfficeLocation] = useState("");
+  const [customerAcknowledgementId, setCustomerAcknowledgementId] =
+    useState("");
+  const [checklist, setChecklist] = useState<Record<string, boolean>>({
+    identity_verified: false,
+    keys_received: false,
+    condition_recorded: false,
+    accessories_recorded: false,
+  });
 
   async function loadContract() {
     setContract(undefined);
@@ -217,6 +232,61 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
         }),
       );
       setNotice("Activation recorded");
+    } catch (error) {
+      setActionError(contractActionMessage(error));
+    }
+  }
+
+  async function recordExecution() {
+    if (contract === null || contract === undefined) return;
+    setActionError("");
+    setNotice("");
+    try {
+      setContract(
+        await api.recordExecution(contract.id, {
+          expectedVersion: contract.version,
+          applicantSignature,
+          guarantorSignature,
+          staffWitnessId,
+          executionDate: new Date().toISOString(),
+          headOfficeId,
+          headOfficeLocation,
+          executedDocumentId,
+          executedDocumentHash,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      );
+      setNotice("Physical execution evidence recorded");
+    } catch (error) {
+      setActionError(contractActionMessage(error));
+    }
+  }
+
+  async function completeHandover() {
+    if (contract === null || contract === undefined) return;
+    setActionError("");
+    setNotice("");
+    const items = Object.entries(checklist).map(([itemId, complete]) => ({
+      itemId,
+      result: complete ? "PASS" : "INCOMPLETE",
+    }));
+    try {
+      setContract(
+        await api.completeHandover(contract.id, {
+          expectedVersion: contract.version,
+          checklistVersion: "handover-v1",
+          checklist: { items },
+          customerAcknowledged: true,
+          customerAcknowledgementId,
+          condition: {},
+          accessories: [],
+          headOfficeId,
+          headOfficeLocation,
+          handedOverAt: new Date().toISOString(),
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      );
+      setNotice("Physical handover recorded");
     } catch (error) {
       setActionError(contractActionMessage(error));
     }
@@ -277,10 +347,112 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
           <p>Template-derived preview: {contract.previewReference}</p>
           <p>Ownership holder: {contract.ownershipHolder}</p>
           {contract.status === "AWAITING_EXECUTION" ? (
-            <p>
-              Physical applicant and guarantor signatures plus a clean executed
-              PDF are required at head office.
-            </p>
+            <form
+              aria-label="Physical contract execution"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void recordExecution();
+              }}
+            >
+              <p>
+                Physical applicant and guarantor signatures, a staff witness,
+                and a clean executed PDF are required at the configured head
+                office.
+              </p>
+              <label>
+                Applicant signature
+                <input
+                  value={applicantSignature}
+                  onChange={(event) => setApplicantSignature(event.target.value)}
+                />
+              </label>
+              <label>
+                Guarantor signature
+                <input
+                  value={guarantorSignature}
+                  onChange={(event) => setGuarantorSignature(event.target.value)}
+                />
+              </label>
+              <label>
+                Staff witness ID
+                <input
+                  value={staffWitnessId}
+                  onChange={(event) => setStaffWitnessId(event.target.value)}
+                />
+              </label>
+              <label>
+                Executed PDF document ID
+                <input
+                  value={executedDocumentId}
+                  onChange={(event) => setExecutedDocumentId(event.target.value)}
+                />
+              </label>
+              <label>
+                Executed PDF SHA-256
+                <input
+                  value={executedDocumentHash}
+                  onChange={(event) => setExecutedDocumentHash(event.target.value)}
+                />
+              </label>
+              <label>
+                Main head-office ID
+                <input
+                  value={headOfficeId}
+                  onChange={(event) => setHeadOfficeId(event.target.value)}
+                />
+              </label>
+              <label>
+                Main head-office location
+                <input
+                  value={headOfficeLocation}
+                  onChange={(event) => setHeadOfficeLocation(event.target.value)}
+                />
+              </label>
+              <button type="submit">Record physical execution</button>
+            </form>
+          ) : null}
+          {contract.status === "EXECUTED" ? (
+            <form
+              aria-label="Physical vehicle handover"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void completeHandover();
+              }}
+            >
+              <p>
+                Handover is blocked until the applicant acknowledgement ID,
+                explicit checklist results, witness location, and current
+                contract version are present.
+              </p>
+              <label>
+                Applicant acknowledgement ID
+                <input
+                  value={customerAcknowledgementId}
+                  onChange={(event) =>
+                    setCustomerAcknowledgementId(event.target.value)
+                  }
+                />
+              </label>
+              <fieldset>
+                <legend>Handover checklist</legend>
+                {Object.keys(checklist).map((itemId) => (
+                  <label key={itemId}>
+                    <input
+                      type="checkbox"
+                      checked={checklist[itemId]}
+                      onChange={(event) =>
+                        setChecklist((current) => ({
+                          ...current,
+                          [itemId]: event.target.checked,
+                        }))
+                      }
+                    />
+                    {itemId.replaceAll("_", " ")} — PASS
+                  </label>
+                ))}
+              </fieldset>
+              <button type="submit">Record physical handover</button>
+            </form>
           ) : null}
           {contract.status === "EXECUTED" ? (
             <button type="button" onClick={() => void activate()}>
@@ -322,6 +494,14 @@ function contractActionMessage(error: unknown): string {
     return "Generation blocked: the accepted locked offer is unavailable or expired.";
   if (code === "HANDOVER_REQUIRED")
     return "Activation blocked: complete the signed handover checklist first.";
+  if (code === "STALE_VERSION")
+    return "This control is stale. Refresh the contract before recording execution, handover, or activation.";
+  if (code === "CUSTOMER_ACKNOWLEDGEMENT_REQUIRED")
+    return "Handover blocked: the applicant must acknowledge the exact checklist in their secure session.";
+  if (code === "HEAD_OFFICE_BINDING_INVALID")
+    return "Physical control blocked: use the configured main head-office ID and location.";
+  if (code === "EXECUTED_DOCUMENT_NOT_CLEAN")
+    return "Execution blocked: provide the accepted clean executed-contract PDF evidence.";
   return "The contract control could not be completed.";
 }
 

@@ -99,6 +99,13 @@
       "when": 1787230830908,
       "tag": "0013_asset_contract_handover",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1787230830909,
+      "tag": "0014_asset_hardening",
+      "breakpoints": true
     }
   ]
 }

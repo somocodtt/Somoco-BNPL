@@ -40,9 +40,6 @@ export interface AssignmentRecord extends Record<string, unknown> {
 
 export interface TrackerAccessRecord {
   vehicleUnitId: string;
-  trackerIdentifier: string | null;
-  provider: string;
-  providerDeviceId: string;
   deepLink: string;
   accessedAt: string;
 }
@@ -67,12 +64,15 @@ export interface AssetService {
     validFrom: string;
     validTo: string;
     evidenceDocumentId?: string;
+    expectedVehicleVersion: number;
+    idempotencyKey: string;
     actor: StaffPrincipal;
     requestId: string;
   }): Promise<{
     vehicleUnitId: string;
     registrationNumber: string;
     validTo: string;
+    version: number;
     renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
   }>;
   recordInsurance(input: {
@@ -82,12 +82,15 @@ export interface AssetService {
     validFrom: string;
     validTo: string;
     evidenceDocumentId?: string;
+    expectedVehicleVersion: number;
+    idempotencyKey: string;
     actor: StaffPrincipal;
     requestId: string;
   }): Promise<{
     vehicleUnitId: string;
     policyNumber: string;
     validTo: string;
+    version: number;
     renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
   }>;
   associateTracker(input: {
@@ -95,19 +98,41 @@ export interface AssetService {
     provider: string;
     providerDeviceId: string;
     deepLink: string;
+    expectedVehicleVersion: number;
+    idempotencyKey: string;
     actor: StaffPrincipal;
     requestId: string;
-  }): Promise<void>;
+  }): Promise<{ vehicleUnitId: string; version: number }>;
   assignVehicle(input: {
     applicationId: string;
     vehicleUnitId: string;
     expectedVehicleVersion: number;
     previousAssignmentId?: string;
-    reassignmentApproval?: { approvedBy: string; reason: string };
+    reassignmentApproval?: {
+      approvalId?: string;
+      approvedBy?: string;
+      reason?: string;
+    };
     actor: StaffPrincipal;
     idempotencyKey: string;
     requestId: string;
   }): Promise<AssignmentRecord>;
+  requestReassignment(input: {
+    applicationId: string;
+    previousAssignmentId: string;
+    requestedVehicleUnitId: string;
+    reason: string;
+    effectiveUntil?: string;
+    actor: StaffPrincipal;
+    idempotencyKey: string;
+    requestId: string;
+  }): Promise<{ id: string; status: "PENDING"; effectiveFrom: string; effectiveUntil: string | null }>;
+  approveReassignment(input: {
+    approvalId: string;
+    actor: StaffPrincipal;
+    idempotencyKey: string;
+    requestId: string;
+  }): Promise<{ id: string; status: "APPROVED"; effectiveFrom: string; effectiveUntil: string | null }>;
   getAssignment(applicationId: string): Promise<AssignmentRecord | null>;
   getTrackerAccess(input: {
     vehicleUnitId: string;
@@ -243,20 +268,59 @@ export function createAssetService(options: {
         input.validTo,
         "REGISTRATION_DATE_INVALID",
       );
+      const registrationNumber = requiredIdentifier(
+        input.registrationNumber,
+        "REGISTRATION_REQUIRED",
+      );
+      validateExpectedVehicleVersion(input.expectedVehicleVersion);
+      const payloadHash = hashPayload({
+        vehicleUnitId: input.vehicleUnitId,
+        expectedVehicleVersion: input.expectedVehicleVersion,
+        registrationNumber,
+        validFrom: input.validFrom,
+        validTo: input.validTo,
+        evidenceDocumentId: input.evidenceDocumentId ?? null,
+      });
+      const scope = `vehicle:${input.vehicleUnitId}:registration`;
+      const existing = await assetContractRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
+      if (existing !== null) {
+        if (
+          existing.payloadHash !== payloadHash ||
+          existing.actorStaffUserId !== input.actor.staffUserId
+        )
+          throw idempotencyConflict();
+        return replayRegistration(existing.response);
+      }
       const now = new Date();
       try {
-        await withTransaction(options.database, async (tx) => {
+        return await withTransaction(options.database, async (tx) => {
           const repo = assetContractRepo(tx);
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "VEHICLE_REGISTRATION",
+            payloadHash,
+            actorStaffUserId: input.actor.staffUserId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (
+              command.payloadHash !== payloadHash ||
+              command.actorStaffUserId !== input.actor.staffUserId
+            )
+              throw idempotencyConflict();
+            return replayRegistration(command.response);
+          }
           const vehicle = await repo.lockVehicle(input.vehicleUnitId);
           if (vehicle === null)
             throw notFound("VEHICLE_NOT_FOUND", "Vehicle not found.");
           await repo.insertRegistration({
             id: randomUUID(),
             vehicleUnitId: input.vehicleUnitId,
-            registrationNumber: requiredIdentifier(
-              input.registrationNumber,
-              "REGISTRATION_REQUIRED",
-            ),
+            registrationNumber,
             validFrom: input.validFrom,
             validTo: input.validTo,
             ...(input.evidenceDocumentId === undefined
@@ -264,15 +328,38 @@ export function createAssetService(options: {
               : { evidenceDocumentId: input.evidenceDocumentId }),
             now,
           });
+          const updatedVehicle = await repo.updateVehicleRegistrationSummary(
+            vehicle.id,
+            input.expectedVehicleVersion,
+            registrationNumber,
+            now,
+          );
+          const response = {
+            vehicleUnitId: input.vehicleUnitId,
+            registrationNumber,
+            validTo: input.validTo,
+            version: updatedVehicle.version,
+            renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
+          };
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
             action: "VEHICLE_REGISTRATION_RECORDED",
             actorStaffUserId: input.actor.staffUserId,
             requestId: input.requestId,
-            data: { validTo: input.validTo },
+            data: { validTo: input.validTo, version: updatedVehicle.version },
             occurredAt: now,
           });
+          await enqueueOutbox(tx, {
+            id: randomUUID(),
+            topic: "asset.vehicle.registration_recorded",
+            aggregateType: "vehicle_unit",
+            aggregateId: vehicle.id,
+            payload: response,
+            occurredAt: now,
+          });
+          return response;
         });
       } catch (error) {
         if (isUniqueViolation(error))
@@ -281,14 +368,14 @@ export function createAssetService(options: {
             "REGISTRATION_DUPLICATE",
             "The registration is already recorded.",
           );
+        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+          throw new AppError(
+            409,
+            "STALE_VERSION",
+            "The vehicle changed before registration was recorded.",
+          );
         throw error;
       }
-      return {
-        vehicleUnitId: input.vehicleUnitId,
-        registrationNumber: input.registrationNumber.trim(),
-        validTo: input.validTo,
-        renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
-      };
     },
 
     async recordInsurance(input) {
@@ -298,24 +385,65 @@ export function createAssetService(options: {
         input.validTo,
         "INSURANCE_DATE_INVALID",
       );
+      const policyNumber = requiredIdentifier(
+        input.policyNumber,
+        "INSURANCE_REQUIRED",
+      );
+      const provider = requiredIdentifier(
+        input.provider,
+        "INSURANCE_PROVIDER_REQUIRED",
+      );
+      validateExpectedVehicleVersion(input.expectedVehicleVersion);
+      const payloadHash = hashPayload({
+        vehicleUnitId: input.vehicleUnitId,
+        expectedVehicleVersion: input.expectedVehicleVersion,
+        policyNumber,
+        provider,
+        validFrom: input.validFrom,
+        validTo: input.validTo,
+        evidenceDocumentId: input.evidenceDocumentId ?? null,
+      });
+      const scope = `vehicle:${input.vehicleUnitId}:insurance`;
+      const existing = await assetContractRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
+      if (existing !== null) {
+        if (
+          existing.payloadHash !== payloadHash ||
+          existing.actorStaffUserId !== input.actor.staffUserId
+        )
+          throw idempotencyConflict();
+        return replayInsurance(existing.response);
+      }
       const now = new Date();
       try {
-        await withTransaction(options.database, async (tx) => {
+        return await withTransaction(options.database, async (tx) => {
           const repo = assetContractRepo(tx);
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "VEHICLE_INSURANCE",
+            payloadHash,
+            actorStaffUserId: input.actor.staffUserId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (
+              command.payloadHash !== payloadHash ||
+              command.actorStaffUserId !== input.actor.staffUserId
+            )
+              throw idempotencyConflict();
+            return replayInsurance(command.response);
+          }
           const vehicle = await repo.lockVehicle(input.vehicleUnitId);
           if (vehicle === null)
             throw notFound("VEHICLE_NOT_FOUND", "Vehicle not found.");
           await repo.insertInsurance({
             id: randomUUID(),
             vehicleUnitId: input.vehicleUnitId,
-            policyNumber: requiredIdentifier(
-              input.policyNumber,
-              "INSURANCE_REQUIRED",
-            ),
-            provider: requiredIdentifier(
-              input.provider,
-              "INSURANCE_PROVIDER_REQUIRED",
-            ),
+            policyNumber,
+            provider,
             validFrom: input.validFrom,
             validTo: input.validTo,
             ...(input.evidenceDocumentId === undefined
@@ -323,15 +451,37 @@ export function createAssetService(options: {
               : { evidenceDocumentId: input.evidenceDocumentId }),
             now,
           });
+          const updatedVehicle = await repo.bumpVehicleVersion(
+            vehicle.id,
+            input.expectedVehicleVersion,
+            now,
+          );
+          const response = {
+            vehicleUnitId: input.vehicleUnitId,
+            policyNumber,
+            validTo: input.validTo,
+            version: updatedVehicle.version,
+            renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
+          };
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
             action: "VEHICLE_INSURANCE_RECORDED",
             actorStaffUserId: input.actor.staffUserId,
             requestId: input.requestId,
-            data: { validTo: input.validTo },
+            data: { validTo: input.validTo, version: updatedVehicle.version },
             occurredAt: now,
           });
+          await enqueueOutbox(tx, {
+            id: randomUUID(),
+            topic: "asset.vehicle.insurance_recorded",
+            aggregateType: "vehicle_unit",
+            aggregateId: vehicle.id,
+            payload: response,
+            occurredAt: now,
+          });
+          return response;
         });
       } catch (error) {
         if (isUniqueViolation(error))
@@ -340,14 +490,14 @@ export function createAssetService(options: {
             "INSURANCE_DUPLICATE",
             "The insurance policy is already recorded.",
           );
+        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+          throw new AppError(
+            409,
+            "STALE_VERSION",
+            "The vehicle changed before insurance was recorded.",
+          );
         throw error;
       }
-      return {
-        vehicleUnitId: input.vehicleUnitId,
-        policyNumber: input.policyNumber.trim(),
-        validTo: input.validTo,
-        renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
-      };
     },
 
     async associateTracker(input) {
@@ -371,10 +521,47 @@ export function createAssetService(options: {
           "The tracker link is invalid.",
         );
       }
+      validateExpectedVehicleVersion(input.expectedVehicleVersion);
+      const payloadHash = hashPayload({
+        vehicleUnitId: input.vehicleUnitId,
+        expectedVehicleVersion: input.expectedVehicleVersion,
+        provider,
+        providerDeviceId,
+        deepLink,
+      });
+      const scope = `vehicle:${input.vehicleUnitId}:tracker-associate`;
+      const existing = await assetContractRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
+      if (existing !== null) {
+        if (
+          existing.payloadHash !== payloadHash ||
+          existing.actorStaffUserId !== input.actor.staffUserId
+        )
+          throw idempotencyConflict();
+        return replayTrackerAssociation(existing.response);
+      }
       const now = new Date();
       try {
-        await withTransaction(options.database, async (tx) => {
+        return await withTransaction(options.database, async (tx) => {
           const repo = assetContractRepo(tx);
+          const command = await repo.insertCommand({
+            scope,
+            idempotencyKey: input.idempotencyKey,
+            commandType: "TRACKER_ASSOCIATE",
+            payloadHash,
+            actorStaffUserId: input.actor.staffUserId,
+            response: {},
+          });
+          if (!command.inserted) {
+            if (
+              command.payloadHash !== payloadHash ||
+              command.actorStaffUserId !== input.actor.staffUserId
+            )
+              throw idempotencyConflict();
+            return replayTrackerAssociation(command.response);
+          }
           const vehicle = await repo.lockVehicle(input.vehicleUnitId);
           if (vehicle === null)
             throw notFound("VEHICLE_NOT_FOUND", "Vehicle not found.");
@@ -386,6 +573,16 @@ export function createAssetService(options: {
             deepLink,
             associatedAt: now,
           });
+          const updatedVehicle = await repo.bumpVehicleVersion(
+            vehicle.id,
+            input.expectedVehicleVersion,
+            now,
+          );
+          const response = {
+            vehicleUnitId: vehicle.id,
+            version: updatedVehicle.version,
+          };
+          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
@@ -395,6 +592,15 @@ export function createAssetService(options: {
             data: { provider, providerDeviceId },
             occurredAt: now,
           });
+          await enqueueOutbox(tx, {
+            id: randomUUID(),
+            topic: "asset.vehicle.tracker_associated",
+            aggregateType: "vehicle_unit",
+            aggregateId: vehicle.id,
+            payload: response,
+            occurredAt: now,
+          });
+          return response;
         });
       } catch (error) {
         if (isUniqueViolation(error))
@@ -402,6 +608,12 @@ export function createAssetService(options: {
             409,
             "TRACKER_IDENTIFIER_DUPLICATE",
             "The tracker is already associated.",
+          );
+        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+          throw new AppError(
+            409,
+            "STALE_VERSION",
+            "The vehicle changed before tracker association was recorded.",
           );
         throw error;
       }
@@ -424,7 +636,7 @@ export function createAssetService(options: {
         vehicleUnitId: input.vehicleUnitId,
         expectedVehicleVersion: input.expectedVehicleVersion,
         previousAssignmentId: input.previousAssignmentId ?? null,
-        reassignmentApproval: input.reassignmentApproval ?? null,
+        reassignmentApproval: input.reassignmentApproval?.approvalId ?? null,
       });
       const scope = `application:${input.applicationId}:vehicle-assign`;
       const existing = await assetContractRepo(options.database).findCommand(
@@ -490,6 +702,16 @@ export function createAssetService(options: {
             true,
           );
           if (current !== null) {
+            const existingContract = await repo.findContractByApplication(
+              input.applicationId,
+            );
+            if (existingContract !== null) {
+              throw new AppError(
+                409,
+                "CONTRACT_REASSIGNMENT_BLOCKED",
+                "A generated contract binds the assigned vehicle; reassignment is denied.",
+              );
+            }
             if (input.previousAssignmentId !== current.id) {
               throw new AppError(
                 409,
@@ -499,13 +721,12 @@ export function createAssetService(options: {
             }
             if (
               input.reassignmentApproval === undefined ||
-              input.reassignmentApproval.reason.trim().length === 0 ||
-              input.reassignmentApproval.approvedBy === input.actor.staffUserId
+              typeof input.reassignmentApproval.approvalId !== "string"
             ) {
               throw new AppError(
                 403,
                 "REASSIGNMENT_APPROVAL_REQUIRED",
-                "An independent authorized reassignment approval and reason are required.",
+                "A persisted independent reassignment approval is required.",
               );
             }
           } else if (input.previousAssignmentId !== undefined) {
@@ -517,6 +738,23 @@ export function createAssetService(options: {
           }
           const deposit = await repo.findDeposit(input.applicationId, offer.id);
           const requiredDeposit = BigInt(offer.deposit_minor_units ?? 0);
+          const reassignmentApproval =
+            current === null || input.reassignmentApproval === undefined
+              ? null
+              : await repo.findEffectiveReassignmentApproval({
+                  id: input.reassignmentApproval.approvalId!,
+                  applicationId: input.applicationId,
+                  previousAssignmentId: current.id,
+                  requestedVehicleUnitId: input.vehicleUnitId,
+                  now,
+                });
+          if (current !== null && reassignmentApproval === null) {
+            throw new AppError(
+              403,
+              "REASSIGNMENT_APPROVAL_REQUIRED",
+              "The persisted reassignment approval is missing, expired, or not bound to this assignment and vehicle.",
+            );
+          }
           if (
             deposit === null ||
             BigInt(deposit.amount_minor_units) < requiredDeposit
@@ -534,8 +772,16 @@ export function createAssetService(options: {
             coverage === null ||
             coverage.registration_valid_to === null ||
             coverage.insurance_valid_to === null ||
-            !dateIsCurrent(coverage.registration_valid_to, now) ||
-            !dateIsCurrent(coverage.insurance_valid_to, now)
+            !coverageIsCurrent(
+              coverage.registration_valid_from,
+              coverage.registration_valid_to,
+              now,
+            ) ||
+            !coverageIsCurrent(
+              coverage.insurance_valid_from,
+              coverage.insurance_valid_to,
+              now,
+            )
           ) {
             throw new AppError(
               409,
@@ -586,14 +832,16 @@ export function createAssetService(options: {
               ? {}
               : {
                   supersedesAssignmentId: current.id,
-                  reassignmentApprovedBy:
-                    input.reassignmentApproval!.approvedBy,
-                  reassignmentReason: input.reassignmentApproval!.reason.trim(),
+                  reassignmentApprovedBy: reassignmentApproval!.approved_by!,
+                  reassignmentReason: reassignmentApproval!.reason.trim(),
                 }),
             assignedBy: input.actor.staffUserId,
             assignedAt: now,
           });
-          if (application.status === "APPROVED") {
+          if (
+            application.status === "APPROVED" ||
+            application.status === "AWAITING_ASSET_ASSIGNMENT"
+          ) {
             await repo.updateApplicationStatus({
               id: application.id,
               expectedVersion: application.version,
@@ -639,8 +887,7 @@ export function createAssetService(options: {
                 ? {}
                 : {
                     supersedesAssignmentId: current.id,
-                    reassignmentReason:
-                      input.reassignmentApproval!.reason.trim(),
+                    reassignmentReason: reassignmentApproval!.reason.trim(),
                   }),
             },
             occurredAt: now,
@@ -676,6 +923,243 @@ export function createAssetService(options: {
           );
         throw error;
       }
+    },
+
+    async requestReassignment(input) {
+      requireRole(input.actor, "INVENTORY_OFFICER");
+      const reason = requiredIdentifier(
+        input.reason,
+        "REASSIGNMENT_REASON_REQUIRED",
+      );
+      const payloadHash = hashPayload({
+        applicationId: input.applicationId,
+        previousAssignmentId: input.previousAssignmentId,
+        requestedVehicleUnitId: input.requestedVehicleUnitId,
+        reason,
+        effectiveUntil: input.effectiveUntil ?? null,
+      });
+      const scope = `application:${input.applicationId}:reassignment-request`;
+      const existing = await assetContractRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
+      if (existing !== null) {
+        if (
+          existing.payloadHash !== payloadHash ||
+          existing.actorStaffUserId !== input.actor.staffUserId
+        )
+          throw idempotencyConflict();
+        return replayReassignmentCapability(existing.response, "PENDING");
+      }
+      const now = new Date();
+      const effectiveUntil =
+        input.effectiveUntil === undefined
+          ? null
+          : parseDateOnly(input.effectiveUntil, "REASSIGNMENT_WINDOW_INVALID");
+      if (effectiveUntil !== null && effectiveUntil <= now)
+        throw new AppError(
+          409,
+          "REASSIGNMENT_WINDOW_INVALID",
+          "The reassignment approval must remain effective after now.",
+        );
+      return withTransaction(options.database, async (tx) => {
+        const repo = assetContractRepo(tx);
+        const application = await repo.findApplication(input.applicationId, true);
+        if (application === null)
+          throw notFound("APPLICATION_NOT_FOUND", "Application not found.");
+        const current = await repo.currentAssignment(input.applicationId, true);
+        if (current === null || current.id !== input.previousAssignmentId)
+          throw new AppError(
+            409,
+            "ASSIGNMENT_STALE",
+            "The reassignment request is not bound to the current assignment.",
+          );
+        const contract = await repo.findContractByApplication(input.applicationId);
+        if (contract !== null)
+          throw new AppError(
+            409,
+            "CONTRACT_REASSIGNMENT_BLOCKED",
+            "A generated contract binds the assigned vehicle; reassignment is denied.",
+          );
+        const target = await repo.lockVehicle(input.requestedVehicleUnitId);
+        if (target === null)
+          throw notFound("VEHICLE_NOT_FOUND", "Vehicle not found.");
+        const requestedByRole = input.actor.roles[0] ?? "INVENTORY_OFFICER";
+        const approval = await repo.insertReassignmentApproval({
+          id: randomUUID(),
+          applicationId: input.applicationId,
+          previousAssignmentId: current.id,
+          requestedVehicleUnitId: target.id,
+          requestedBy: input.actor.staffUserId,
+          requestedByRole,
+          reason,
+          effectiveFrom: now,
+          ...(effectiveUntil === null ? {} : { effectiveUntil }),
+        });
+        const response = {
+          id: approval.id,
+          status: "PENDING" as const,
+          effectiveFrom: toDate(approval.effective_from).toISOString(),
+          effectiveUntil:
+            approval.effective_until === null
+              ? null
+              : toDate(approval.effective_until).toISOString(),
+        };
+        const command = await repo.insertCommand({
+          scope,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "REASSIGNMENT_REQUEST",
+          payloadHash,
+          actorStaffUserId: input.actor.staffUserId,
+          applicationId: input.applicationId,
+          response,
+        });
+        if (!command.inserted) {
+          if (
+            command.payloadHash !== payloadHash ||
+            command.actorStaffUserId !== input.actor.staffUserId
+          )
+            throw idempotencyConflict();
+          return replayReassignmentCapability(command.response, "PENDING");
+        }
+        await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+        await appendAuditEvent(tx, {
+          aggregateType: "vehicle_assignment",
+          aggregateId: current.id,
+          action: "REASSIGNMENT_REQUESTED",
+          actorStaffUserId: input.actor.staffUserId,
+          requestId: input.requestId,
+          data: {
+            approvalId: approval.id,
+            requestedVehicleUnitId: target.id,
+            reason,
+            requestedByRole,
+          },
+          occurredAt: now,
+        });
+        await enqueueOutbox(tx, {
+          id: randomUUID(),
+          topic: "asset.vehicle.reassignment_requested",
+          aggregateType: "vehicle_assignment",
+          aggregateId: current.id,
+          payload: response,
+          occurredAt: now,
+        });
+        return response;
+      });
+    },
+
+    async approveReassignment(input) {
+      if (
+        !input.actor.roles.some((role) =>
+          ["INVENTORY_OFFICER", "AGM", "MD"].includes(role),
+        )
+      )
+        throw new AppError(
+          403,
+          "FORBIDDEN",
+          "This staff role cannot approve a reassignment.",
+        );
+      const payloadHash = hashPayload({ approvalId: input.approvalId });
+      const scope = `reassignment:${input.approvalId}:approve`;
+      const existing = await assetContractRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
+      if (existing !== null) {
+        if (
+          existing.payloadHash !== payloadHash ||
+          existing.actorStaffUserId !== input.actor.staffUserId
+        )
+          throw idempotencyConflict();
+        return replayReassignmentCapability(existing.response, "APPROVED");
+      }
+      const now = new Date();
+      return withTransaction(options.database, async (tx) => {
+        const repo = assetContractRepo(tx);
+        const pending = await repo.findReassignmentApproval(input.approvalId, true);
+        if (pending === null)
+          throw notFound("REASSIGNMENT_APPROVAL_NOT_FOUND", "Reassignment approval not found.");
+        if (pending.requested_by === input.actor.staffUserId)
+          throw new AppError(
+            403,
+            "REASSIGNMENT_APPROVER_INDEPENDENCE_REQUIRED",
+            "The requester cannot approve their own reassignment.",
+          );
+        if (pending.status !== "PENDING")
+          throw new AppError(
+            409,
+            "REASSIGNMENT_APPROVAL_STATE_INVALID",
+            "The reassignment approval is no longer pending.",
+          );
+        const approvedByRole = input.actor.roles[0] ?? "INVENTORY_OFFICER";
+        const approval = await repo.approveReassignmentApproval({
+          id: pending.id,
+          approvedBy: input.actor.staffUserId,
+          approvedByRole,
+          approvedAt: now,
+          now,
+        });
+        if (approval === null)
+          throw new AppError(
+            409,
+            "REASSIGNMENT_APPROVAL_STATE_INVALID",
+            "The reassignment approval expired or was approved concurrently.",
+          );
+        const response = {
+          id: approval.id,
+          status: "APPROVED" as const,
+          effectiveFrom: toDate(approval.effective_from).toISOString(),
+          effectiveUntil:
+            approval.effective_until === null
+              ? null
+              : toDate(approval.effective_until).toISOString(),
+        };
+        const command = await repo.insertCommand({
+          scope,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "REASSIGNMENT_APPROVE",
+          payloadHash,
+          actorStaffUserId: input.actor.staffUserId,
+          applicationId: approval.application_id,
+          response,
+        });
+        if (!command.inserted) {
+          if (
+            command.payloadHash !== payloadHash ||
+            command.actorStaffUserId !== input.actor.staffUserId
+          )
+            throw idempotencyConflict();
+          return replayReassignmentCapability(command.response, "APPROVED");
+        }
+        await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+        await appendAuditEvent(tx, {
+          aggregateType: "vehicle_assignment",
+          aggregateId: approval.previous_assignment_id,
+          action: "REASSIGNMENT_APPROVED",
+          actorStaffUserId: input.actor.staffUserId,
+          requestId: input.requestId,
+          data: {
+            approvalId: approval.id,
+            requestedBy: approval.requested_by,
+            requestedByRole: approval.requested_by_role,
+            approvedByRole,
+            reason: approval.reason,
+            effectiveFrom: approval.effective_from,
+            effectiveUntil: approval.effective_until,
+          },
+          occurredAt: now,
+        });
+        await enqueueOutbox(tx, {
+          id: randomUUID(),
+          topic: "asset.vehicle.reassignment_approved",
+          aggregateType: "vehicle_assignment",
+          aggregateId: approval.previous_assignment_id,
+          payload: response,
+          occurredAt: now,
+        });
+        return response;
+      });
     },
 
     async getAssignment(applicationId) {
@@ -721,9 +1205,6 @@ export function createAssetService(options: {
       });
       return {
         vehicleUnitId: input.vehicleUnitId,
-        trackerIdentifier: tracker.tracker_identifier,
-        provider: tracker.provider,
-        providerDeviceId: tracker.provider_device_id,
         deepLink: tracker.deep_link,
         accessedAt: now.toISOString(),
       };
@@ -760,12 +1241,58 @@ function validateDateWindow(from: string, to: string, code: string): void {
   ) {
     throw new AppError(400, code, "The validity dates are invalid.");
   }
+  const fromDate = new Date(`${from}T00:00:00.000Z`);
+  if (fromDate.getTime() > Date.now())
+    throw new AppError(
+      409,
+      code,
+      "A coverage record cannot begin in the future.",
+    );
 }
 
-function dateIsCurrent(value: string | Date, now: Date): boolean {
-  const date =
-    value instanceof Date ? value : new Date(`${value}T23:59:59.999Z`);
-  return Number.isFinite(date.getTime()) && date.getTime() >= now.getTime();
+function coverageIsCurrent(
+  validFrom: string | Date | null,
+  validUntil: string | Date | null,
+  now: Date,
+): boolean {
+  if (validFrom === null || validUntil === null) return false;
+  const from = dateAtUtcStart(validFrom);
+  const until = dateAtUtcStart(validUntil);
+  return (
+    Number.isFinite(from.getTime()) &&
+    Number.isFinite(until.getTime()) &&
+    from.getTime() <= now.getTime() &&
+    now.getTime() < until.getTime()
+  );
+}
+
+function dateAtUtcStart(value: string | Date): Date {
+  return value instanceof Date
+    ? value
+    : /^\d{4}-\d{2}-\d{2}$/.test(value)
+      ? new Date(`${value}T00:00:00.000Z`)
+      : new Date(value);
+}
+
+function validateExpectedVehicleVersion(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1)
+    throw new AppError(
+      400,
+      "VERSION_INVALID",
+      "The vehicle version is invalid.",
+    );
+}
+
+function parseDateOnly(value: string, code: string): Date {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
+    throw new AppError(400, code, "The date is invalid.");
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (
+    !Number.isFinite(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  )
+    throw new AppError(400, code, "The date is invalid.");
+  return parsed;
 }
 
 function serializeVehicle(row: VehicleRow): VehicleRecord {
@@ -777,7 +1304,7 @@ function serializeVehicle(row: VehicleRow): VehicleRecord {
     engineMotorIdentifier: row.engine_motor_identifier,
     condition: row.condition,
     accessories: row.accessories,
-    trackerIdentifier: row.tracker_identifier,
+    trackerIdentifier: null,
     registrationNumber: row.registration_number,
     status: row.status,
     version: row.version,
@@ -838,6 +1365,101 @@ function replayAssignment(value: Record<string, unknown>): AssignmentRecord {
       "The saved assignment command is invalid.",
     );
   return value as unknown as AssignmentRecord;
+}
+
+function replayRegistration(value: Record<string, unknown>): {
+  vehicleUnitId: string;
+  registrationNumber: string;
+  validTo: string;
+  version: number;
+  renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+} {
+  if (
+    typeof value.vehicleUnitId !== "string" ||
+    typeof value.registrationNumber !== "string" ||
+    typeof value.validTo !== "string" ||
+    typeof value.version !== "number"
+  )
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved registration command is invalid.",
+    );
+  return value as {
+    vehicleUnitId: string;
+    registrationNumber: string;
+    validTo: string;
+    version: number;
+    renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+  };
+}
+
+function replayInsurance(value: Record<string, unknown>): {
+  vehicleUnitId: string;
+  policyNumber: string;
+  validTo: string;
+  version: number;
+  renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+} {
+  if (
+    typeof value.vehicleUnitId !== "string" ||
+    typeof value.policyNumber !== "string" ||
+    typeof value.validTo !== "string" ||
+    typeof value.version !== "number"
+  )
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved insurance command is invalid.",
+    );
+  return value as {
+    vehicleUnitId: string;
+    policyNumber: string;
+    validTo: string;
+    version: number;
+    renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+  };
+}
+
+function replayTrackerAssociation(value: Record<string, unknown>): {
+  vehicleUnitId: string;
+  version: number;
+} {
+  if (typeof value.vehicleUnitId !== "string" || typeof value.version !== "number")
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved tracker command is invalid.",
+    );
+  return value as { vehicleUnitId: string; version: number };
+}
+
+function replayReassignmentCapability<S extends "PENDING" | "APPROVED">(
+  value: Record<string, unknown>,
+  status: S,
+): {
+  id: string;
+  status: S;
+  effectiveFrom: string;
+  effectiveUntil: string | null;
+} {
+  if (
+    typeof value.id !== "string" ||
+    value.status !== status ||
+    typeof value.effectiveFrom !== "string" ||
+    (value.effectiveUntil !== null && typeof value.effectiveUntil !== "string")
+  )
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved reassignment command is invalid.",
+    );
+  return value as {
+    id: string;
+    status: S;
+    effectiveFrom: string;
+    effectiveUntil: string | null;
+  };
 }
 
 function hashPayload(value: unknown): string {

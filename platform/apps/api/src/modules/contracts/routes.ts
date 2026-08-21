@@ -89,7 +89,8 @@ export async function registerContractRoutes(
       guarantorSignature: string;
       staffWitnessId: string;
       executionDate: string;
-      headOfficeLocation?: string;
+      headOfficeId: string;
+      headOfficeLocation: string;
       executedDocumentId: string;
       executedDocumentHash: string;
       authorizationReason?: string;
@@ -109,6 +110,8 @@ export async function registerContractRoutes(
             "guarantorSignature",
             "staffWitnessId",
             "executionDate",
+            "headOfficeId",
+            "headOfficeLocation",
             "executedDocumentId",
             "executedDocumentHash",
             "idempotencyKey",
@@ -127,6 +130,7 @@ export async function registerContractRoutes(
             },
             staffWitnessId: uuid,
             executionDate: { type: "string", format: "date-time" },
+            headOfficeId: { type: "string", minLength: 1, maxLength: 256 },
             headOfficeLocation: {
               type: "string",
               minLength: 1,
@@ -163,9 +167,11 @@ export async function registerContractRoutes(
       checklistVersion: string;
       checklist: Record<string, unknown>;
       customerAcknowledged: boolean;
+      customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
       condition: Record<string, unknown>;
       accessories: string[];
+      headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
       idempotencyKey: string;
@@ -183,9 +189,11 @@ export async function registerContractRoutes(
             "checklistVersion",
             "checklist",
             "customerAcknowledged",
+            "customerAcknowledgementId",
             "condition",
             "accessories",
             "headOfficeLocation",
+            "headOfficeId",
             "handedOverAt",
             "idempotencyKey",
           ],
@@ -194,6 +202,7 @@ export async function registerContractRoutes(
             checklistVersion: { type: "string", minLength: 1, maxLength: 128 },
             checklist: { type: "object" },
             customerAcknowledged: { type: "boolean", const: true },
+            customerAcknowledgementId: uuid,
             customerAcknowledgedByPersonId: uuid,
             condition: { type: "object" },
             accessories: { type: "array", items: { type: "string" } },
@@ -202,6 +211,7 @@ export async function registerContractRoutes(
               minLength: 1,
               maxLength: 256,
             },
+            headOfficeId: { type: "string", minLength: 1, maxLength: 256 },
             handedOverAt: { type: "string", format: "date-time" },
             idempotencyKey: idempotency,
           },
@@ -262,6 +272,42 @@ export async function registerContractRoutes(
           request.params.applicationId,
           requireCustomerPrincipal(request),
         ),
+      ),
+  );
+
+  app.post<{
+    Params: { contractId: string };
+    Body: {
+      checklistVersion: string;
+      checklist: Record<string, unknown>;
+      idempotencyKey: string;
+    };
+  }>(
+    "/v1/customer/contracts/:contractId/handover-acknowledgement",
+    {
+      schema: {
+        params: contractParams,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["checklistVersion", "checklist", "idempotencyKey"],
+          properties: {
+            checklistVersion: { type: "string", minLength: 1, maxLength: 128 },
+            checklist: { type: "object" },
+            idempotencyKey: idempotency,
+          },
+        },
+      },
+      preHandler: authenticateCustomer,
+    },
+    async (request, reply) =>
+      reply.code(201).send(
+        await handover.acknowledge({
+          contractId: request.params.contractId,
+          ...request.body,
+          actor: requireCustomerPrincipal(request),
+          requestId: request.id,
+        }),
       ),
   );
 }

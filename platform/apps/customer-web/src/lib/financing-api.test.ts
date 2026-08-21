@@ -13,6 +13,7 @@ describe("customer financing API adapter", () => {
       )
       .mockResolvedValueOnce(
         jsonResponse({
+          contractId: "contract-1",
           status: "EXECUTED",
           previewAvailable: true,
           executed: true,
@@ -20,6 +21,7 @@ describe("customer financing API adapter", () => {
           registrationNumber: null,
           registrationValidTo: null,
           insuranceValidTo: null,
+          handoverAcknowledged: false,
           schedule: [],
           canonicalHash: "should-not-be-used",
         }),

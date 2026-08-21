@@ -13,6 +13,7 @@ import {
   resetTestDatabase,
 } from "../../../packages/testkit/src/index.js";
 import type {
+  CustomerPrincipal,
   StaffPrincipal,
   StaffRole,
 } from "../src/modules/access/policy.js";
@@ -22,6 +23,7 @@ import {
 } from "../src/modules/assets/service.js";
 import {
   createContractService,
+  createProductionContractTemplateAttestation,
   createSyntheticContractTemplateForTesting,
   type ContractService,
 } from "../src/modules/contracts/service.js";
@@ -42,6 +44,10 @@ let closeDatabase: () => Promise<void>;
 let assets: AssetService;
 let contracts: ContractService;
 let handover: HandoverService;
+const testHeadOffice = {
+  id: "TEST_MAIN_HEAD_OFFICE",
+  location: "TEST_MAIN_HEAD_OFFICE",
+};
 
 beforeAll(() => {
   const connection = createDatabase(databaseUrl!);
@@ -57,8 +63,14 @@ beforeEach(async () => {
     database,
     template: createSyntheticContractTemplateForTesting(),
     environment: "test",
+    headOffice: testHeadOffice,
   });
-  handover = createHandoverService({ database, assets, contracts });
+  handover = createHandoverService({
+    database,
+    assets,
+    contracts,
+    headOffice: testHeadOffice,
+  });
 });
 
 afterAll(async () => {
@@ -185,14 +197,28 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       "reassignment-approver",
       "INVENTORY_OFFICER",
     );
+    const request = await assets.requestReassignment({
+      applicationId: graph.applicationId,
+      previousAssignmentId: assigned.id,
+      requestedVehicleUnitId: second.id,
+      reason: "Documented condition correction",
+      actor: actor.actor,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    const approval = await assets.approveReassignment({
+      approvalId: request.id,
+      actor: approver.actor,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
     const reassigned = await assets.assignVehicle({
       applicationId: graph.applicationId,
       vehicleUnitId: second.id,
       expectedVehicleVersion: second.version,
       previousAssignmentId: assigned.id,
       reassignmentApproval: {
-        approvedBy: approver.id,
-        reason: "Documented condition correction",
+        approvalId: approval.id,
       },
       actor: actor.actor,
       idempotencyKey: randomUUID(),
@@ -215,8 +241,10 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       provider: "Synthetic Tracker",
       providerDeviceId: `DEVICE-${vehicle.id.slice(0, 8)}`,
       deepLink: "https://tracker.example.test/device/7",
+      expectedVehicleVersion: vehicle.version,
       actor: inventory.actor,
       requestId: randomUUID(),
+      idempotencyKey: randomUUID(),
     });
     await expect(
       assets.getTrackerAccess({
@@ -272,6 +300,37 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         requestId: randomUUID(),
       }),
     ).rejects.toMatchObject({ code: "LEGAL_TEMPLATE_APPROVAL_REQUIRED" });
+    const testTemplateId = randomUUID();
+    await executeTestSql(
+      databaseUrl!,
+      "insert into contract_template_version (id, template_key, version_number, content_hash, approved_pdf_hash, approved_by, approved_at, effective_from, published_at, attestation_mode) values ($1, 'test-row-only', 99, $2, $3, $4, now(), now() - interval '1 day', now(), 'TEST')",
+      [testTemplateId, "1".repeat(64), "2".repeat(64), actor.id],
+    );
+    const forgedProductionAttestation =
+      createProductionContractTemplateAttestation({
+        templateVersionId: testTemplateId,
+        templateKey: "test-row-only",
+        versionNumber: 99,
+        contentHash: "1".repeat(64),
+        approvedPdfHash: "2".repeat(64),
+        approvedBy: actor.id,
+        effectiveFrom: "2026-01-01T00:00:00.000Z",
+      });
+    const productionWithForgedRow = createContractService({
+      database,
+      environment: "production",
+      template: forgedProductionAttestation,
+    });
+    await expect(
+      productionWithForgedRow.generate({
+        applicationId: graph.applicationId,
+        assignmentId: assignment.id,
+        templateVersionId: testTemplateId,
+        actor: actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "LEGAL_TEMPLATE_APPROVAL_REQUIRED" });
     const contract = await contracts.generate({
       applicationId: graph.applicationId,
       assignmentId: assignment.id,
@@ -279,6 +338,9 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       idempotencyKey: randomUUID(),
       requestId: randomUUID(),
     });
+    const genericDocumentId = await seedGenericAcceptedDocument(
+      graph.applicantId,
+    );
     await expect(
       contracts.recordPhysicalExecution({
         contractId: contract.id,
@@ -287,8 +349,10 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         guarantorSignature: "signed-guarantor",
         staffWitnessId: actor.actor.staffUserId,
         executionDate: new Date().toISOString(),
-        executedDocumentId: randomUUID(),
-        executedDocumentHash: "a".repeat(64),
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
+        executedDocumentId: genericDocumentId,
+        executedDocumentHash: "f".repeat(64),
         actor: actor.actor,
         idempotencyKey: randomUUID(),
         requestId: randomUUID(),
@@ -329,9 +393,28 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       guarantorSignature: "signed-guarantor",
       staffWitnessId: actor.actor.staffUserId,
       executionDate: new Date().toISOString(),
+      headOfficeId: testHeadOffice.id,
+      headOfficeLocation: testHeadOffice.location,
       executedDocumentId: documentId,
       executedDocumentHash: "b".repeat(64),
       actor: actor.actor,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    const customer = await seedCustomerPrincipal(graph.applicantId);
+    const checklist = {
+      items: [
+        { itemId: "identity_verified", result: "PASS" },
+        { itemId: "keys_received", result: "PASS" },
+        { itemId: "condition_recorded", result: "PASS" },
+        { itemId: "accessories_recorded", result: "PASS" },
+      ],
+    };
+    const customerAcknowledgement = await handover.acknowledge({
+      contractId: executed.id,
+      checklistVersion: "handover-v1",
+      checklist,
+      actor: customer,
       idempotencyKey: randomUUID(),
       requestId: randomUUID(),
     });
@@ -349,9 +432,11 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         checklistVersion: "handover-v1",
         checklist: { keys: true },
         customerAcknowledged: true,
+        customerAcknowledgementId: randomUUID(),
         condition: { exterior: "new" },
         accessories: ["helmet"],
-        headOfficeLocation: "Somoco head office",
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
         handedOverAt: new Date().toISOString(),
         actor: actor.actor,
         idempotencyKey: randomUUID(),
@@ -362,16 +447,13 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       contractId: executed.id,
       expectedVersion: executed.version,
       checklistVersion: "handover-v1",
-      checklist: {
-        identityVerified: true,
-        keys: true,
-        conditionRecorded: true,
-        accessoriesRecorded: true,
-      },
+      checklist,
       customerAcknowledged: true,
+      customerAcknowledgementId: customerAcknowledgement.id,
       condition: { exterior: "new" },
       accessories: ["helmet"],
-      headOfficeLocation: "Somoco head office",
+      headOfficeId: testHeadOffice.id,
+      headOfficeLocation: testHeadOffice.location,
       handedOverAt: new Date().toISOString(),
       actor: actor.actor,
       idempotencyKey: randomUUID(),
@@ -395,9 +477,164 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
     });
     expect(replay.id).toBe(active.id);
   });
+
+  it("requires applicant-backed checklist acknowledgement and rejects staff fabrication or replay", async () => {
+    const prepared = await prepareExecutedContract({ label: "ack-gates" });
+    const completeChecklist = {
+      items: [
+        { itemId: "identity_verified", result: "PASS" },
+        { itemId: "keys_received", result: "PASS" },
+        { itemId: "condition_recorded", result: "PASS" },
+        { itemId: "accessories_recorded", result: "PASS" },
+      ],
+    };
+    await expect(
+      handover.complete({
+        contractId: prepared.executed.id,
+        expectedVersion: prepared.executed.version,
+        checklistVersion: "handover-v1",
+        checklist: { complete: true },
+        customerAcknowledged: true,
+        customerAcknowledgementId: randomUUID(),
+        condition: {},
+        accessories: [],
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
+        handedOverAt: new Date().toISOString(),
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "HANDOVER_CHECKLIST_INCOMPLETE" });
+    const wrongCustomer = await seedCustomerPrincipal(prepared.graph.guarantorId);
+    const acknowledgementKey = randomUUID();
+    await expect(
+      handover.acknowledge({
+        contractId: prepared.executed.id,
+        checklistVersion: "handover-v1",
+        checklist: completeChecklist,
+        actor: wrongCustomer,
+        idempotencyKey: acknowledgementKey,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    const customer = await seedCustomerPrincipal(prepared.graph.applicantId);
+    const acknowledgement = await handover.acknowledge({
+      contractId: prepared.executed.id,
+      checklistVersion: "handover-v1",
+      checklist: completeChecklist,
+      actor: customer,
+      idempotencyKey: acknowledgementKey,
+      requestId: randomUUID(),
+    });
+    await expect(
+      handover.acknowledge({
+        contractId: prepared.executed.id,
+        checklistVersion: "handover-v1",
+        checklist: completeChecklist,
+        actor: wrongCustomer,
+        idempotencyKey: acknowledgementKey,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
+    await expect(
+      handover.complete({
+        contractId: prepared.executed.id,
+        expectedVersion: prepared.executed.version,
+        checklistVersion: "handover-v1",
+        checklist: completeChecklist,
+        customerAcknowledged: true,
+        customerAcknowledgementId: acknowledgement.id,
+        customerAcknowledgedByPersonId: prepared.graph.guarantorId,
+        condition: {},
+        accessories: [],
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
+        handedOverAt: new Date().toISOString(),
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "CUSTOMER_ACKNOWLEDGEMENT_INVALID" });
+  });
+
+  it("denies reassignment after a contract binds the assigned vehicle", async () => {
+    const prepared = await prepareExecutedContract({ label: "bound-race" });
+    const second = await registerVehicle(
+      prepared.graph.vehicleModelId,
+      prepared.actor.actor,
+      "0099",
+    );
+    await expect(
+      assets.assignVehicle({
+        applicationId: prepared.graph.applicationId,
+        vehicleUnitId: second.id,
+        expectedVehicleVersion: second.version,
+        previousAssignmentId: prepared.assignment.id,
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "CONTRACT_REASSIGNMENT_BLOCKED" });
+  });
+
+  it("rejects invalid locked repayment schedules instead of inventing a due date", async () => {
+    const prepared = await prepareExecutedContract({
+      label: "schedule-gates",
+      installments: [{ sequence: 2, dueDate: "2026-09-01", totalMinor: "70000" }],
+    });
+    const checklist = {
+      items: [
+        { itemId: "identity_verified", result: "PASS" },
+        { itemId: "keys_received", result: "PASS" },
+        { itemId: "condition_recorded", result: "PASS" },
+        { itemId: "accessories_recorded", result: "PASS" },
+      ],
+    };
+    const customer = await seedCustomerPrincipal(prepared.graph.applicantId);
+    const acknowledgement = await handover.acknowledge({
+      contractId: prepared.executed.id,
+      checklistVersion: "handover-v1",
+      checklist,
+      actor: customer,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    const completed = await handover.complete({
+      contractId: prepared.executed.id,
+      expectedVersion: prepared.executed.version,
+      checklistVersion: "handover-v1",
+      checklist,
+      customerAcknowledged: true,
+      customerAcknowledgementId: acknowledgement.id,
+      condition: {},
+      accessories: [],
+      headOfficeId: testHeadOffice.id,
+      headOfficeLocation: testHeadOffice.location,
+      handedOverAt: new Date().toISOString(),
+      actor: prepared.actor.actor,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    await expect(
+      contracts.activate({
+        contractId: completed.id,
+        expectedVersion: completed.version,
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "LOCKED_SCHEDULE_INVALID" });
+  });
 });
 
-async function seedGraph(): Promise<{
+async function seedGraph(input: {
+  installments?: readonly {
+    sequence: number;
+    dueDate: string;
+    totalMinor: string;
+  }[];
+} = {}): Promise<{
   applicantId: string;
   guarantorId: string;
   applicationId: string;
@@ -411,6 +648,9 @@ async function seedGraph(): Promise<{
   const offerId = randomUUID();
   const offerVersionId = randomUUID();
   const vehicleModelId = randomUUID();
+  const installments = input.installments ?? [
+    { sequence: 1, dueDate: "2026-09-01", totalMinor: "70000" },
+  ];
   const productId = randomUUID();
   const ruleId = randomUUID();
   await executeTestSql(
@@ -471,9 +711,7 @@ async function seedGraph(): Promise<{
         depositMinor: "30000",
         principalMinor: "70000",
         totalPayableMinor: "70000",
-        installments: [
-          { sequence: 1, dueDate: "2026-09-01", totalMinor: "70000" },
-        ],
+        installments,
       }),
       "c".repeat(64),
     ],
@@ -533,6 +771,8 @@ async function registerVehicle(
     registrationNumber: `GT-${suffix}`,
     validFrom: "2026-01-01",
     validTo: "2027-01-01",
+    expectedVehicleVersion: vehicle.version,
+    idempotencyKey: randomUUID(),
     actor,
     requestId: randomUUID(),
   });
@@ -542,10 +782,99 @@ async function registerVehicle(
     provider: "Synthetic Insurer",
     validFrom: "2026-01-01",
     validTo: "2027-01-01",
+    expectedVehicleVersion: vehicle.version + 1,
+    idempotencyKey: randomUUID(),
     actor,
     requestId: randomUUID(),
   });
-  return vehicle;
+  const current = (await assets.listInventory(actor)).find(
+    (candidate) => candidate.id === vehicle.id,
+  );
+  if (current === undefined) throw new Error("REGISTERED_VEHICLE_NOT_FOUND");
+  return current;
+}
+
+async function seedCustomerPrincipal(personId: string): Promise<CustomerPrincipal> {
+  const customerAccountId = randomUUID();
+  const sessionId = randomUUID();
+  await executeTestSql(
+    databaseUrl!,
+    "insert into customer_account (id, person_id, status, version) values ($1, $2, 'ACTIVE', 1)",
+    [customerAccountId, personId],
+  );
+  await executeTestSql(
+    databaseUrl!,
+    "insert into customer_session (id, customer_account_id, token_hash, expires_at) values ($1, $2, $3, now() + interval '1 hour')",
+    [sessionId, customerAccountId, createHash("sha256").update(sessionId).digest("hex")],
+  );
+  return {
+    kind: "customer",
+    customerAccountId,
+    personId,
+    sessionId,
+  };
+}
+
+async function prepareExecutedContract(input: {
+  label: string;
+  installments?: readonly {
+    sequence: number;
+    dueDate: string;
+    totalMinor: string;
+  }[];
+}): Promise<{
+  graph: Awaited<ReturnType<typeof seedGraph>>;
+  actor: { id: string; actor: StaffPrincipal };
+  vehicle: Awaited<ReturnType<typeof registerVehicle>>;
+  assignment: { id: string; version: number; vehicleUnitId: string };
+  contract: Awaited<ReturnType<ContractService["generate"]>>;
+  executed: Awaited<ReturnType<ContractService["recordPhysicalExecution"]>>;
+}> {
+  const graph = await seedGraph(
+    input.installments === undefined
+      ? {}
+      : { installments: input.installments },
+  );
+  const actor = await seedStaff(input.label, "INVENTORY_OFFICER");
+  const vehicle = await registerVehicle(
+    graph.vehicleModelId,
+    actor.actor,
+    input.label.slice(0, 4),
+  );
+  await seedAcceptedOffer(graph, { expired: false });
+  await seedReconciledDeposit(graph, "30000");
+  const assignment = await assets.assignVehicle({
+    applicationId: graph.applicationId,
+    vehicleUnitId: vehicle.id,
+    expectedVehicleVersion: vehicle.version,
+    actor: actor.actor,
+    idempotencyKey: randomUUID(),
+    requestId: randomUUID(),
+  });
+  const contract = await contracts.generate({
+    applicationId: graph.applicationId,
+    assignmentId: assignment.id,
+    actor: actor.actor,
+    idempotencyKey: randomUUID(),
+    requestId: randomUUID(),
+  });
+  const documentId = await seedCleanExecutedDocument(graph.applicantId);
+  const executed = await contracts.recordPhysicalExecution({
+    contractId: contract.id,
+    expectedVersion: contract.version,
+    applicantSignature: "signed-applicant",
+    guarantorSignature: "signed-guarantor",
+    staffWitnessId: actor.actor.staffUserId,
+    executionDate: new Date().toISOString(),
+    headOfficeId: testHeadOffice.id,
+    headOfficeLocation: testHeadOffice.location,
+    executedDocumentId: documentId,
+    executedDocumentHash: "b".repeat(64),
+    actor: actor.actor,
+    idempotencyKey: randomUUID(),
+    requestId: randomUUID(),
+  });
+  return { graph, actor, vehicle, assignment, contract, executed };
 }
 
 async function seedCleanExecutedDocument(personId: string): Promise<string> {
@@ -560,6 +889,23 @@ async function seedCleanExecutedDocument(personId: string): Promise<string> {
       "e".repeat(64),
       `accepted/task10/${id}`,
       "b".repeat(64),
+    ],
+  );
+  return id;
+}
+
+async function seedGenericAcceptedDocument(personId: string): Promise<string> {
+  const id = randomUUID();
+  await executeTestSql(
+    databaseUrl!,
+    "insert into privacy.document (id, person_id, document_type, object_key, declared_mime_type, declared_size_bytes, upload_ticket_hash, upload_expires_at, accepted_object_key, accepted_object_version_id, accepted_object_etag, sha256, status, malware_scanned) values ($1, $2, 'IDENTITY', $3, 'application/pdf', 128, $4, now() + interval '1 day', $5, 'v1', 'etag', $6, 'ACCEPTED', true)",
+    [
+      id,
+      personId,
+      `task10/generic/${id}`,
+      "a".repeat(64),
+      `accepted/task10/generic/${id}`,
+      "f".repeat(64),
     ],
   );
   return id;

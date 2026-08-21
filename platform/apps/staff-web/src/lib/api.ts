@@ -94,7 +94,7 @@ export interface StaffAssetApi {
       vehicleUnitId: string;
       expectedVehicleVersion: number;
       previousAssignmentId?: string;
-      reassignmentApproval?: { approvedBy: string; reason: string };
+      reassignmentApproval?: { approvalId: string };
       idempotencyKey: string;
     },
   ): Promise<StaffAssignmentSummary>;
@@ -143,7 +143,8 @@ export interface StaffContractApi {
       guarantorSignature: string;
       staffWitnessId: string;
       executionDate: string;
-      headOfficeLocation?: string;
+      headOfficeId: string;
+      headOfficeLocation: string;
       executedDocumentId: string;
       executedDocumentHash: string;
       authorizationReason?: string;
@@ -157,9 +158,11 @@ export interface StaffContractApi {
       checklistVersion: string;
       checklist: Record<string, unknown>;
       customerAcknowledged: true;
+      customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
       condition: Record<string, unknown>;
       accessories: readonly string[];
+      headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
       idempotencyKey: string;
@@ -255,7 +258,7 @@ export class FetchStaffApi implements StaffApi, ProductApi {
       vehicleUnitId: string;
       expectedVehicleVersion: number;
       previousAssignmentId?: string;
-      reassignmentApproval?: { approvedBy: string; reason: string };
+      reassignmentApproval?: { approvalId: string };
       idempotencyKey: string;
     },
   ): Promise<StaffAssignmentSummary> {
@@ -296,7 +299,8 @@ export class FetchStaffApi implements StaffApi, ProductApi {
       guarantorSignature: string;
       staffWitnessId: string;
       executionDate: string;
-      headOfficeLocation?: string;
+      headOfficeId: string;
+      headOfficeLocation: string;
       executedDocumentId: string;
       executedDocumentHash: string;
       authorizationReason?: string;
@@ -317,9 +321,11 @@ export class FetchStaffApi implements StaffApi, ProductApi {
       checklistVersion: string;
       checklist: Record<string, unknown>;
       customerAcknowledged: true;
+      customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
       condition: Record<string, unknown>;
       accessories: readonly string[];
+      headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
       idempotencyKey: string;

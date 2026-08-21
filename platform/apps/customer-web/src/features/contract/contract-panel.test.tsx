@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ContractPanel, type ContractApi } from "./contract-panel.js";
 
@@ -26,6 +27,7 @@ describe("customer contract panel", () => {
   it("renders executed handover summary and schedule without exposing internal hashes", async () => {
     const api = fakeApi();
     api.getContract.mockResolvedValueOnce({
+      contractId: "contract-1",
       status: "ACTIVE",
       previewAvailable: true,
       executed: true,
@@ -33,6 +35,7 @@ describe("customer contract panel", () => {
       registrationNumber: "GR-1234-24",
       registrationValidTo: "2027-12-31",
       insuranceValidTo: "2027-12-31",
+      handoverAcknowledged: true,
       schedule: [{ sequence: 1, dueDate: "2026-09-01", totalMinor: "77000" }],
     });
     render(<ContractPanel api={api} applicationId="application-1" />);
@@ -53,11 +56,47 @@ describe("customer contract panel", () => {
       "We could not load your contract state.",
     );
   });
+
+  it("keeps physical acknowledgement applicant-driven and checklist-bound", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    api.getContract.mockResolvedValueOnce({
+      contractId: "contract-1",
+      status: "EXECUTED",
+      previewAvailable: true,
+      executed: true,
+      assignedVehicleAvailable: false,
+      registrationNumber: null,
+      registrationValidTo: null,
+      insuranceValidTo: null,
+      handoverAcknowledged: false,
+      schedule: [],
+    });
+    render(<ContractPanel api={api} applicationId="application-1" />);
+    await user.click(
+      await screen.findByRole("button", { name: "Acknowledge handover" }),
+    );
+    expect(api.acknowledgeHandover).toHaveBeenCalledWith(
+      "contract-1",
+      expect.objectContaining({
+        checklistVersion: "handover-v1",
+        checklist: expect.objectContaining({ items: expect.any(Array) }),
+      }),
+    );
+    expect(
+      await screen.findByText("Your handover acknowledgement is recorded."),
+    ).toBeVisible();
+  });
 });
 
 function fakeApi(): ContractApi & { getContract: ReturnType<typeof vi.fn> } {
   return {
+    acknowledgeHandover: vi.fn().mockResolvedValue({
+      id: "ack-1",
+      acknowledgedAt: "2026-01-01T00:00:00.000Z",
+    }),
     getContract: vi.fn().mockResolvedValue({
+      contractId: "contract-1",
       status: "AWAITING_EXECUTION" as const,
       previewAvailable: true,
       executed: false,
@@ -65,6 +104,7 @@ function fakeApi(): ContractApi & { getContract: ReturnType<typeof vi.fn> } {
       registrationNumber: null,
       registrationValidTo: null,
       insuranceValidTo: null,
+      handoverAcknowledged: false,
       schedule: [],
     }),
   };

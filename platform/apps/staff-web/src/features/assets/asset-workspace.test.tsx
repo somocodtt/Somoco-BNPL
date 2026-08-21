@@ -78,6 +78,40 @@ describe("staff asset and contract workspace", () => {
       ),
     ).toBeVisible();
   });
+
+  it("shows physical execution evidence and explicit handover controls", async () => {
+    const user = userEvent.setup();
+    const api = fakeContractApi();
+    api.get.mockResolvedValueOnce({
+      id: "contract-1",
+      reference: "SOMOCO-1",
+      applicationId: "application-1",
+      offerVersionId: "offer-1",
+      vehicleUnitId: "vehicle-1",
+      status: "AWAITING_EXECUTION",
+      version: 1,
+      canonicalHash: "a".repeat(64),
+      previewReference: "preview/1",
+      ownershipHolder: "SOMOCO",
+      outstandingBalanceMinor: "70000",
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      activatedAt: null,
+    });
+    render(<ContractWorkspace api={api} />);
+    await user.type(screen.getByLabelText("Application ID"), "application-1");
+    await user.click(
+      screen.getByRole("button", { name: "Load contract controls" }),
+    );
+    expect(
+      await screen.findByRole("form", { name: "Physical contract execution" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Executed PDF document ID")).toBeVisible();
+    expect(screen.getByLabelText("Executed PDF SHA-256")).toBeVisible();
+    expect(screen.getByLabelText("Main head-office ID")).toBeVisible();
+    expect(
+      screen.getByText(/Physical applicant and guarantor signatures/),
+    ).toBeVisible();
+  });
 });
 
 function fakeAssetApi(): StaffAssetApi & {

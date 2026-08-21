@@ -10,6 +10,7 @@ export type CustomerContractStatus =
   | "TERMINATED";
 
 export interface CustomerContractView {
+  contractId: string;
   status: CustomerContractStatus;
   previewAvailable: boolean;
   executed: boolean;
@@ -17,6 +18,7 @@ export interface CustomerContractView {
   registrationNumber: string | null;
   registrationValidTo: string | null;
   insuranceValidTo: string | null;
+  handoverAcknowledged: boolean;
   schedule: readonly {
     sequence: number;
     dueDate: string;
@@ -26,6 +28,14 @@ export interface CustomerContractView {
 
 export interface ContractApi {
   getContract(applicationId: string): Promise<CustomerContractView | null>;
+  acknowledgeHandover(
+    contractId: string,
+    input: {
+      checklistVersion: string;
+      checklist: Record<string, unknown>;
+      idempotencyKey: string;
+    },
+  ): Promise<{ id: string; acknowledgedAt: string }>;
 }
 
 export function ContractPanel({
@@ -39,6 +49,17 @@ export function ContractPanel({
     CustomerContractView | null | undefined
   >(undefined);
   const [loadError, setLoadError] = useState(false);
+  const [acknowledging, setAcknowledging] = useState(false);
+  const [ackError, setAckError] = useState("");
+
+  const checklist = {
+    items: [
+      { itemId: "identity_verified", result: "PASS" },
+      { itemId: "keys_received", result: "PASS" },
+      { itemId: "condition_recorded", result: "PASS" },
+      { itemId: "accessories_recorded", result: "PASS" },
+    ],
+  };
 
   useEffect(() => {
     let active = true;
@@ -74,6 +95,26 @@ export function ContractPanel({
   if (contract === null) {
     return <p role="status">No contract preview is available yet.</p>;
   }
+  const activeContract = contract;
+
+  async function acknowledgeHandover() {
+    setAcknowledging(true);
+    setAckError("");
+    try {
+      await api.acknowledgeHandover(activeContract.contractId, {
+        checklistVersion: "handover-v1",
+        checklist,
+        idempotencyKey: crypto.randomUUID(),
+      });
+      setContract({ ...activeContract, handoverAcknowledged: true });
+    } catch {
+      setAckError(
+        "Your acknowledgement could not be recorded. Confirm the checklist and secure session, then try again.",
+      );
+    } finally {
+      setAcknowledging(false);
+    }
+  }
 
   return (
     <section className="panel contract-panel" aria-labelledby="contract-title">
@@ -90,6 +131,32 @@ export function ContractPanel({
       ) : (
         <p role="status">Contract execution is recorded.</p>
       )}
+      {contract.executed && !contract.handoverAcknowledged ? (
+        <section aria-labelledby="handover-ack-title">
+          <h2 id="handover-ack-title">Customer handover acknowledgement</h2>
+          <p>
+            Review the physical checklist at Somoco head office. Your secure
+            applicant session records this acknowledgement; staff cannot sign
+            for you.
+          </p>
+          <ul aria-label="Handover checklist">
+            {checklist.items.map((item) => (
+              <li key={item.itemId}>{item.itemId.replaceAll("_", " ")}: PASS</li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            onClick={() => void acknowledgeHandover()}
+            disabled={acknowledging}
+          >
+            {acknowledging ? "Recording acknowledgement…" : "Acknowledge handover"}
+          </button>
+          {ackError ? <p role="alert">{ackError}</p> : null}
+        </section>
+      ) : null}
+      {contract.handoverAcknowledged ? (
+        <p role="status">Your handover acknowledgement is recorded.</p>
+      ) : null}
       {contract.assignedVehicleAvailable ? (
         <section aria-labelledby="vehicle-summary-title">
           <h2 id="vehicle-summary-title">Assigned vehicle summary</h2>

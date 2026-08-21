@@ -339,6 +339,20 @@ export class FetchCustomerApi implements CustomerApi, OfferApi, ContractApi {
     return result === null ? null : mapContractView(result);
   }
 
+  acknowledgeHandover(
+    contractId: string,
+    input: {
+      checklistVersion: string;
+      checklist: Record<string, unknown>;
+      idempotencyKey: string;
+    },
+  ): Promise<{ id: string; acknowledgedAt: string }> {
+    return this.request(
+      `/v1/customer/contracts/${encodeURIComponent(contractId)}/handover-acknowledgement`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
   async get(applicationId: string): Promise<CustomerOffer | null> {
     const result = await this.request<Record<string, unknown> | null>(
       `/v1/customer/applications/${encodeURIComponent(applicationId)}/offer`,
@@ -493,6 +507,7 @@ function mapContractView(value: unknown): CustomerContractView {
   }
   if (!Array.isArray(value.schedule)) throw malformedContract();
   return {
+    contractId: requiredString(value.contractId, "contractId"),
     status: value.status as CustomerContractStatus,
     previewAvailable: value.previewAvailable,
     executed: value.executed,
@@ -500,6 +515,7 @@ function mapContractView(value: unknown): CustomerContractView {
     registrationNumber: nullableContractString(value.registrationNumber),
     registrationValidTo: nullableContractString(value.registrationValidTo),
     insuranceValidTo: nullableContractString(value.insuranceValidTo),
+    handoverAcknowledged: value.handoverAcknowledged === true,
     schedule: value.schedule.map((item) => {
       if (
         !isRecord(item) ||

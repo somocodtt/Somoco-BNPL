@@ -14,10 +14,11 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { staffUser } from "./access.js";
+import { customerAccount, customerSession, staffUser } from "./access.js";
 import { application } from "./applications.js";
 import { vehicleUnit } from "./assets.js";
 import { offerVersion } from "./offers.js";
+import { document, person } from "./privacy.js";
 
 export const contractTemplateVersion = pgTable(
   "contract_template_version",
@@ -158,8 +159,11 @@ export const contractExecution = pgTable(
     executionDate: timestamp("execution_date", {
       withTimezone: true,
     }).notNull(),
+    headOfficeId: text("head_office_id"),
     headOfficeLocation: text("head_office_location").notNull(),
-    executedDocumentId: uuid("executed_document_id").notNull(),
+    executedDocumentId: uuid("executed_document_id")
+      .notNull()
+      .references(() => document.id, { onDelete: "restrict" }),
     executedDocumentHash: text("executed_document_hash").notNull(),
     authorizationReason: text("authorization_reason"),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -279,6 +283,7 @@ export const handoverRecord = pgTable(
       withTimezone: true,
     }),
     customerAcknowledgedByPersonId: uuid("customer_acknowledged_by_person_id"),
+    headOfficeId: text("head_office_id"),
     condition: jsonb("condition")
       .$type<Record<string, unknown>>()
       .notNull()
@@ -294,6 +299,52 @@ export const handoverRecord = pgTable(
     handedOverAt: timestamp("handed_over_at", { withTimezone: true }).notNull(),
   },
   (table) => [uniqueIndex("handover_contract_unique").on(table.contractId)],
+);
+
+export const handoverCustomerAcknowledgement = pgTable(
+  "handover_customer_acknowledgement",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    contractId: uuid("contract_id")
+      .notNull()
+      .references(() => contract.id, { onDelete: "restrict" }),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => application.id, { onDelete: "restrict" }),
+    personId: uuid("person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "restrict" }),
+    customerAccountId: uuid("customer_account_id")
+      .notNull()
+      .references(() => customerAccount.id, { onDelete: "restrict" }),
+    customerSessionId: uuid("customer_session_id")
+      .notNull()
+      .references(() => customerSession.id, { onDelete: "restrict" }),
+    checklistVersion: text("checklist_version").notNull(),
+    checklistHash: text("checklist_hash").notNull(),
+    acknowledgedAt: timestamp("acknowledged_at", {
+      withTimezone: true,
+    }).notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("handover_ack_contract_idempotency_unique").on(
+      table.contractId,
+      table.idempotencyKey,
+    ),
+    index("handover_ack_contract_idx").on(table.contractId),
+    check(
+      "handover_ack_checklist_hash_sha256",
+      sql`${table.checklistHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "handover_ack_checklist_version_nonempty",
+      sql`length(btrim(${table.checklistVersion})) > 0`,
+    ),
+  ],
 );
 
 export const assetContractCommand = pgTable(
@@ -335,7 +386,7 @@ export const assetContractCommand = pgTable(
     ),
     check(
       "asset_contract_command_type_allowed",
-      sql`${table.commandType} in ('VEHICLE_REGISTER', 'VEHICLE_ASSIGN', 'CONTRACT_GENERATE', 'CONTRACT_EXECUTE', 'HANDOVER_COMPLETE', 'CONTRACT_ACTIVATE', 'TRACKER_ACCESS')`,
+      sql`${table.commandType} in ('VEHICLE_REGISTER', 'VEHICLE_ASSIGN', 'CONTRACT_GENERATE', 'CONTRACT_EXECUTE', 'HANDOVER_COMPLETE', 'CONTRACT_ACTIVATE', 'TRACKER_ACCESS', 'VEHICLE_REGISTRATION', 'VEHICLE_INSURANCE', 'TRACKER_ASSOCIATE', 'HANDOVER_ACKNOWLEDGE', 'REASSIGNMENT_REQUEST', 'REASSIGNMENT_APPROVE')`,
     ),
   ],
 );

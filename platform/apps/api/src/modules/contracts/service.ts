@@ -11,6 +11,7 @@ import type { CustomerPrincipal, StaffPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 
 export interface ContractTemplateAttestation {
+  templateVersionId?: string;
   templateKey: string;
   versionNumber: number;
   contentHash: string;
@@ -45,6 +46,8 @@ export function createProductionContractTemplateAttestation(
 ): ContractTemplateAttestation {
   if (
     !isTemplateShape(input) ||
+    typeof input.templateVersionId !== "string" ||
+    !isUuid(input.templateVersionId) ||
     typeof input.approvedBy !== "string" ||
     input.approvedBy.trim().length === 0
   )
@@ -78,6 +81,7 @@ export interface ContractRecord extends Record<string, unknown> {
 }
 
 export interface CustomerContractView {
+  contractId: string;
   status: ContractRecord["status"];
   previewAvailable: boolean;
   executed: boolean;
@@ -85,6 +89,7 @@ export interface CustomerContractView {
   registrationNumber: string | null;
   registrationValidTo: string | null;
   insuranceValidTo: string | null;
+  handoverAcknowledged: boolean;
   schedule: readonly {
     sequence: number;
     dueDate: string;
@@ -108,7 +113,8 @@ export interface ContractService {
     guarantorSignature: string;
     staffWitnessId: string;
     executionDate: string;
-    headOfficeLocation?: string;
+    headOfficeId: string;
+    headOfficeLocation: string;
     executedDocumentId: string;
     executedDocumentHash: string;
     authorizationReason?: string;
@@ -134,8 +140,14 @@ export function createContractService(options: {
   database: Database;
   template?: ContractTemplateAttestation;
   environment?: "test" | "production";
+  headOffice?: { id: string; location: string };
 }): ContractService {
   const environment = options.environment ?? "production";
+  const headOffice =
+    options.headOffice ??
+    (environment === "test"
+      ? { id: "TEST_MAIN_HEAD_OFFICE", location: "TEST_MAIN_HEAD_OFFICE" }
+      : undefined);
   if (options.template !== undefined && !isTrustedTemplate(options.template)) {
     throw new Error("LEGAL_TEMPLATE_ATTESTATION_INVALID");
   }
@@ -258,7 +270,28 @@ export function createContractService(options: {
             input.templateVersionId === undefined
               ? null
               : await repo.findTemplate(input.templateVersionId, now);
-          if (templateRow === null) {
+          if (environment === "production") {
+            if (
+              template.templateVersionId === undefined ||
+              input.templateVersionId !== template.templateVersionId ||
+              templateRow === null ||
+              templateRow.attestation_mode !== "PRODUCTION" ||
+              templateRow.id !== template.templateVersionId ||
+              templateRow.template_key !== template.templateKey ||
+              templateRow.version_number !== template.versionNumber ||
+              templateRow.content_hash !== template.contentHash ||
+              templateRow.approved_pdf_hash !== template.approvedPdfHash ||
+              templateRow.approved_by !== template.approvedBy ||
+              !sameInstant(templateRow.effective_from, effectiveFrom) ||
+              !sameOptionalInstant(templateRow.effective_until, effectiveUntil)
+            ) {
+              throw new AppError(
+                403,
+                "LEGAL_TEMPLATE_APPROVAL_REQUIRED",
+                "The exact attested production legal template is required.",
+              );
+            }
+          } else if (templateRow === null) {
             const templateId = input.templateVersionId ?? randomUUID();
             templateRow = await repo.insertTemplate({
               id: templateId,
@@ -273,6 +306,12 @@ export function createContractService(options: {
               attestationMode: templateMode.get(template) ?? "TEST",
             });
           }
+          if (templateRow === null)
+            throw new AppError(
+              403,
+              "LEGAL_TEMPLATE_APPROVAL_REQUIRED",
+              "The exact attested legal template is required.",
+            );
           const canonicalHash = hashPayload({
             applicationId: input.applicationId,
             applicantPersonId: application.applicant_person_id,
@@ -389,6 +428,11 @@ export function createContractService(options: {
           "EXECUTED_DOCUMENT_HASH_INVALID",
           "The executed document hash is invalid.",
         );
+      const executionHeadOffice = requireConfiguredHeadOffice(
+        headOffice,
+        input.headOfficeId,
+        input.headOfficeLocation,
+      );
       const payloadHash = hashPayload({
         contractId: input.contractId,
         expectedVersion: input.expectedVersion,
@@ -396,7 +440,8 @@ export function createContractService(options: {
         guarantorSignature: input.guarantorSignature,
         staffWitnessId: input.staffWitnessId,
         executionDate: executionDate.toISOString(),
-        headOfficeLocation: input.headOfficeLocation ?? "Somoco head office",
+        headOfficeId: executionHeadOffice.id,
+        headOfficeLocation: executionHeadOffice.location,
         executedDocumentId: input.executedDocumentId,
         executedDocumentHash: hash,
         authorizationReason: input.authorizationReason ?? null,
@@ -464,10 +509,8 @@ export function createContractService(options: {
           guarantorSignature: input.guarantorSignature.trim(),
           staffWitnessId: input.staffWitnessId,
           executionDate,
-          headOfficeLocation: required(
-            input.headOfficeLocation ?? "Somoco head office",
-            "HEAD_OFFICE_LOCATION_REQUIRED",
-          ),
+          headOfficeId: executionHeadOffice.id,
+          headOfficeLocation: executionHeadOffice.location,
           executedDocumentId: input.executedDocumentId,
           executedDocumentHash: hash,
           ...(input.authorizationReason === undefined
@@ -518,8 +561,8 @@ export function createContractService(options: {
             executionId: execution.id,
             executedDocumentId: input.executedDocumentId,
             executedDocumentHash: hash,
-            headOfficeLocation:
-              input.headOfficeLocation ?? "Somoco head office",
+            headOfficeId: executionHeadOffice.id,
+            headOfficeLocation: executionHeadOffice.location,
           },
           occurredAt: now,
         });
@@ -586,24 +629,30 @@ export function createContractService(options: {
           offer === null
             ? null
             : await repo.findDeposit(contract.application_id, offer.id);
-        const coverage =
-          assignment === null
-            ? null
-            : await repo.findCurrentInsuranceRegistration(
-                assignment.vehicle_unit_id,
-              );
+        const coverage = await repo.findCurrentInsuranceRegistration(
+          contract.vehicle_unit_id,
+        );
         if (
           execution === null ||
           handover === null ||
           assignment === null ||
+          assignment.vehicle_unit_id !== contract.vehicle_unit_id ||
           offer === null ||
           offer.status !== "ACCEPTED" ||
           deposit === null ||
           coverage === null ||
           coverage.registration_valid_to === null ||
           coverage.insurance_valid_to === null ||
-          !dateIsCurrent(coverage.registration_valid_to, now) ||
-          !dateIsCurrent(coverage.insurance_valid_to, now)
+          !coverageIsCurrent(
+            coverage.registration_valid_from,
+            coverage.registration_valid_to,
+            now,
+          ) ||
+          !coverageIsCurrent(
+            coverage.insurance_valid_from,
+            coverage.insurance_valid_to,
+            now,
+          )
         ) {
           throw new AppError(
             409,
@@ -611,7 +660,7 @@ export function createContractService(options: {
             "Execution, reconciled deposit, assignment, checklist, registration, and insurance gates are required.",
           );
         }
-        const vehicle = await repo.lockVehicle(assignment.vehicle_unit_id);
+        const vehicle = await repo.lockVehicle(contract.vehicle_unit_id);
         if (vehicle === null || vehicle.status !== "HANDED_OVER")
           throw new AppError(
             409,
@@ -637,13 +686,16 @@ export function createContractService(options: {
             now,
           });
         const terms = offer.terms;
-        const installments = extractInstallments(terms);
+        const installments = parseLockedSchedule(
+          terms,
+          BigInt(offer.total_payable_minor_units ?? 0),
+          now,
+        );
+        const firstInstallment = installments[0]!;
         await repo.insertRepaymentSchedule({
           contractId: contract.id,
           totalMinor: BigInt(offer.total_payable_minor_units ?? 0),
-          firstDueDate:
-            installments[0]?.dueDate ??
-            new Date(now.getTime() + 86_400_000).toISOString().slice(0, 10),
+          firstDueDate: firstInstallment.dueDate,
           installments: installments.map((item) => ({
             ...item,
             totalMinor: BigInt(item.totalMinor),
@@ -677,7 +729,7 @@ export function createContractService(options: {
           requestId: input.requestId,
           data: {
             ownershipHolder: "SOMOCO",
-            firstDueDate: installments[0]?.dueDate ?? null,
+            firstDueDate: firstInstallment.dueDate,
           },
           occurredAt: now,
         });
@@ -709,9 +761,16 @@ export function createContractService(options: {
       if (contract === null) return null;
       const offer = await repo.lockOfferByApplication(applicationId);
       const terms = offer?.terms;
-      const vehicle = await repo.customerVehicleSummary(applicationId);
+      const vehicle = await repo.customerVehicleSummary(
+        applicationId,
+        contract.vehicle_unit_id,
+      );
       const execution = await repo.latestExecution(contract.id);
+      const acknowledgement = await repo.findLatestHandoverAcknowledgement(
+        contract.id,
+      );
       return {
+        contractId: contract.id,
         status: contract.status as ContractRecord["status"],
         previewAvailable:
           contract.status === "AWAITING_EXECUTION" ||
@@ -725,6 +784,7 @@ export function createContractService(options: {
           vehicle?.handed_over === true ? vehicle.registration_valid_to : null,
         insuranceValidTo:
           vehicle?.handed_over === true ? vehicle.insurance_valid_to : null,
+        handoverAcknowledged: acknowledgement !== null,
         schedule: extractInstallments(terms),
       };
     },
@@ -809,10 +869,20 @@ function parseDate(value: string, code: string): Date {
   return parsed;
 }
 
-function dateIsCurrent(value: string | Date, now: Date): boolean {
-  const parsed =
-    value instanceof Date ? value : new Date(`${value}T23:59:59.999Z`);
-  return Number.isFinite(parsed.getTime()) && parsed.getTime() >= now.getTime();
+function coverageIsCurrent(
+  validFrom: string | Date | null,
+  validUntil: string | Date | null,
+  now: Date,
+): boolean {
+  if (validFrom === null || validUntil === null) return false;
+  const from = dateAtUtcStart(validFrom);
+  const until = dateAtUtcStart(validUntil);
+  return (
+    Number.isFinite(from.getTime()) &&
+    Number.isFinite(until.getTime()) &&
+    from.getTime() <= now.getTime() &&
+    now.getTime() < until.getTime()
+  );
 }
 
 function required(value: string, code: string): string {
@@ -855,6 +925,115 @@ function extractInstallments(
   });
 }
 
+function parseLockedSchedule(
+  value: Record<string, unknown> | null | undefined,
+  lockedTotalMinor: bigint,
+  now: Date,
+): { sequence: number; dueDate: string; totalMinor: string }[] {
+  if (value === null || value === undefined || !Array.isArray(value.installments))
+    throw new AppError(
+      409,
+      "LOCKED_SCHEDULE_INVALID",
+      "The accepted offer does not contain a locked repayment schedule.",
+    );
+  const rows = value.installments;
+  if (rows.length === 0)
+    throw new AppError(
+      409,
+      "LOCKED_SCHEDULE_INVALID",
+      "The accepted offer schedule cannot be empty.",
+    );
+  const parsed: { sequence: number; dueDate: string; totalMinor: string }[] = [];
+  let sum = 0n;
+  for (let index = 0; index < rows.length; index += 1) {
+    const item = rows[index];
+    if (typeof item !== "object" || item === null) invalidSchedule();
+    const row = item as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(row.sequence) ||
+      row.sequence !== index + 1 ||
+      typeof row.dueDate !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(row.dueDate) ||
+      !isValidDateOnly(row.dueDate) ||
+      typeof row.totalMinor !== "string" ||
+      !/^\d+$/.test(row.totalMinor) ||
+      BigInt(row.totalMinor) <= 0n
+    )
+      invalidSchedule();
+    const due = dateAtUtcStart(row.dueDate);
+    if (due.getTime() < dateAtUtcStart(now).getTime()) invalidSchedule();
+    const totalMinor = row.totalMinor as string;
+    sum += BigInt(totalMinor);
+    parsed.push({
+      sequence: row.sequence as number,
+      dueDate: row.dueDate,
+      totalMinor,
+    });
+  }
+  if (sum !== lockedTotalMinor) invalidSchedule();
+  return parsed;
+}
+
+function invalidSchedule(): never {
+  throw new AppError(
+    409,
+    "LOCKED_SCHEDULE_INVALID",
+    "The accepted offer schedule must contain exact ordered dates and amounts whose sum equals the locked payable total.",
+  );
+}
+
+function isValidDateOnly(value: string): boolean {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return (
+    Number.isFinite(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === value
+  );
+}
+
+function dateAtUtcStart(value: string | Date): Date {
+  if (value instanceof Date) return value;
+  return /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00.000Z`)
+    : new Date(value);
+}
+
+function requireConfiguredHeadOffice(
+  configured: { id: string; location: string } | undefined,
+  id: string,
+  location: string,
+): { id: string; location: string } {
+  if (configured === undefined)
+    throw new AppError(
+      503,
+      "HEAD_OFFICE_CONFIGURATION_REQUIRED",
+      "The configured main head-office binding is unavailable.",
+    );
+  if (
+    id.trim() !== configured.id ||
+    location.trim() !== configured.location ||
+    configured.id.trim().length === 0 ||
+    configured.location.trim().length === 0
+  )
+    throw new AppError(
+      409,
+      "HEAD_OFFICE_BINDING_INVALID",
+      "Execution must occur at the configured main head office.",
+    );
+  return { id: configured.id, location: configured.location };
+}
+
+function sameInstant(value: Date | string, expected: Date): boolean {
+  return toDate(value).getTime() === expected.getTime();
+}
+
+function sameOptionalInstant(
+  value: Date | string | null,
+  expected: Date | undefined,
+): boolean {
+  if (value === null || expected === undefined) return value === null && expected === undefined;
+  return toDate(value).getTime() === expected.getTime();
+}
+
 function notFound(code: string, detail: string): AppError {
   return new AppError(404, code, detail);
 }
@@ -887,6 +1066,12 @@ function isTemplateShape(value: unknown): value is ContractTemplateAttestation {
     typeof row.approvedPdfHash === "string" &&
     /^[0-9a-f]{64}$/.test(row.approvedPdfHash) &&
     typeof row.effectiveFrom === "string"
+  );
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
   );
 }
 
