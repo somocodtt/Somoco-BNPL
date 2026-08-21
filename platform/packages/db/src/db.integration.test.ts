@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(17);
+    expect(before.rows[0]?.count).toBe(18);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -501,6 +501,26 @@ describe("PostgreSQL persistence", () => {
         .where(sql`${installment.id} = ${graph.installmentIds[0]}`),
     ).rejects.toMatchObject({ cause: { code: "23514" } });
   });
+
+  it("requires every reversal or refund ledger entry to link to an existing entry", async () => {
+    const graph = await insertFinancialGraph(db);
+    await expect(
+      db.execute(sql`
+        insert into ledger_entry
+          (posting_key, contract_id, entry_type, direction, currency, amount_minor_units, balance_after_minor_units, occurred_at)
+        values
+          (${`missing-link-${randomUUID()}`}, ${graph.contractId}, 'REVERSAL', 'DEBIT', 'GHS', 1, 1, now())
+      `),
+    ).rejects.toMatchObject({ cause: { code: "23514" } });
+    await expect(
+      db.execute(sql`
+        insert into ledger_entry
+          (posting_key, contract_id, entry_type, direction, currency, amount_minor_units, balance_after_minor_units, reverses_entry_id, occurred_at)
+        values
+          (${`foreign-link-${randomUUID()}`}, ${graph.contractId}, 'REFUND', 'DEBIT', 'GHS', 1, 1, ${randomUUID()}, now())
+      `),
+    ).rejects.toMatchObject({ cause: { code: "23503" } });
+  });
 });
 
 describe("populated legacy schema migration", () => {
@@ -637,6 +657,7 @@ describe("populated legacy schema migration", () => {
       "0014_asset_hardening.sql",
       "0015_asset_privacy_controls.sql",
       "0016_payment_ledger_reconciliation.sql",
+      "0017_wooden_selene.sql",
     ]) {
       await applyMigrationFile(pool, migration);
     }

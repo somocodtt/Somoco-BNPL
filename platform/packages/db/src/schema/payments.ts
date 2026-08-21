@@ -45,6 +45,49 @@ export const ledgerEntryType = pgEnum("ledger_entry_type", [
   "ADJUSTMENT",
 ]);
 
+export const paymentAllocationPolicy = pgTable(
+  "payment_allocation_policy",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    version: text("version").notNull(),
+    policyHash: text("policy_hash").notNull(),
+    workedExampleHash: text("worked_example_hash").notNull(),
+    workedExample: jsonb("worked_example")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    financeApprovedBy: text("finance_approved_by").notNull(),
+    complianceApprovedBy: text("compliance_approved_by").notNull(),
+    approvedAt: timestamp("approved_at", { withTimezone: true }).notNull(),
+    status: text("status").notNull().default("APPROVED"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("payment_allocation_policy_version_unique").on(table.version),
+    check(
+      "payment_allocation_policy_version_nonempty",
+      sql`length(btrim(${table.version})) > 0`,
+    ),
+    check(
+      "payment_allocation_policy_hash_sha256",
+      sql`${table.policyHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "payment_allocation_policy_worked_hash_sha256",
+      sql`${table.workedExampleHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "payment_allocation_policy_approvers_distinct",
+      sql`length(btrim(${table.financeApprovedBy})) > 0 and length(btrim(${table.complianceApprovedBy})) > 0 and ${table.financeApprovedBy} <> ${table.complianceApprovedBy}`,
+    ),
+    check(
+      "payment_allocation_policy_status_allowed",
+      sql`${table.status} in ('APPROVED', 'REVOKED')`,
+    ),
+  ],
+);
+
 export const depositReconciliation = pgTable(
   "deposit_reconciliation",
   {
@@ -209,6 +252,15 @@ export const ledgerEntry = pgTable(
       foreignColumns: [installment.id, installment.contractId],
       name: "ledger_installment_contract_fk",
     }).onDelete("restrict"),
+    foreignKey({
+      columns: [table.reversesEntryId],
+      foreignColumns: [table.id],
+      name: "ledger_reverses_entry_fk",
+    }).onDelete("restrict"),
+    check(
+      "ledger_reversal_link_consistent",
+      sql`(${table.entryType} in ('REVERSAL', 'REFUND') and ${table.reversesEntryId} is not null) or (${table.entryType} not in ('REVERSAL', 'REFUND') and ${table.reversesEntryId} is null)`,
+    ),
   ],
 );
 
@@ -222,6 +274,7 @@ export const reconciliationCase = pgTable(
     ),
     status: text("status").notNull().default("OPEN"),
     reason: text("reason").notNull(),
+    dedupeKey: text("dedupe_key"),
     resolution: jsonb("resolution").$type<Record<string, unknown>>(),
     resolvedBy: uuid("resolved_by").references(() => staffUser.id, {
       onDelete: "restrict",
@@ -235,6 +288,9 @@ export const reconciliationCase = pgTable(
       .notNull(),
   },
   (table) => [
+    uniqueIndex("reconciliation_case_dedupe_key_unique")
+      .on(table.dedupeKey)
+      .where(sql`${table.dedupeKey} is not null`),
     check(
       "reconciliation_case_status_allowed",
       sql`${table.status} in ('OPEN', 'INVESTIGATING', 'RESOLVED')`,

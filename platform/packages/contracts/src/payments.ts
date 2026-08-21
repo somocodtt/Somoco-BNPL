@@ -8,6 +8,7 @@ export const CanonicalPaymentEventSchema = z.strictObject({
     "PAYMENT_REVERSED",
     "PAYMENT_REFUNDED",
   ]),
+  channel: z.enum(["USSD", "MOBILE_MONEY"]),
   providerTransactionId: z.string().min(1).max(128),
   payerPhoneE164: PhoneNumberSchema,
   customerReference: z.string().min(1).max(64),

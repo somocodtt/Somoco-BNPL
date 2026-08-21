@@ -172,6 +172,7 @@ describe("deterministic integration simulators", () => {
           event: {
             eventId: "evt-1001",
             eventType: "PAYMENT_SUCCEEDED",
+            channel: "MOBILE_MONEY",
             providerTransactionId: "txn-1001",
             payerPhoneE164: "+233201234567",
             customerReference: "customer-1001",
@@ -311,6 +312,7 @@ describe("production document adapters", () => {
           return {
             eventId: "event-1",
             eventType: "PAYMENT_SUCCEEDED" as const,
+            channel: "MOBILE_MONEY" as const,
             providerTransactionId: "transaction-1",
             payerPhoneE164: "+233201234567",
             customerReference: "contract-1",

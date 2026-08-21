@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type {
+  CustomerPaymentAccount,
   CustomerPaymentInstructions,
   CustomerPaymentRecord,
   CustomerPaymentsApi,
@@ -12,6 +13,9 @@ export function PaymentPanel({ api }: { api: CustomerPaymentsApi }) {
   const [payments, setPayments] = useState<
     readonly CustomerPaymentRecord[] | null
   >(null);
+  const [accounts, setAccounts] = useState<
+    readonly CustomerPaymentAccount[] | null
+  >(null);
   const [receipts, setReceipts] = useState<
     readonly CustomerReceiptRecord[] | null
   >(null);
@@ -20,17 +24,25 @@ export function PaymentPanel({ api }: { api: CustomerPaymentsApi }) {
   useEffect(() => {
     let active = true;
     setInstructions(null);
+    setAccounts(null);
     setPayments(null);
     setReceipts(null);
     setError(false);
     void Promise.all([
       api.getPaymentInstructions(),
+      api.getPaymentAccounts(),
       api.getPayments(),
       api.getReceipts(),
     ]).then(
-      ([loadedInstructions, loadedPayments, loadedReceipts]) => {
+      ([
+        loadedInstructions,
+        loadedAccounts,
+        loadedPayments,
+        loadedReceipts,
+      ]) => {
         if (!active) return;
         setInstructions(loadedInstructions);
+        setAccounts(loadedAccounts);
         setPayments(loadedPayments);
         setReceipts(loadedReceipts);
       },
@@ -47,15 +59,16 @@ export function PaymentPanel({ api }: { api: CustomerPaymentsApi }) {
     return (
       <p role="alert">We could not load your payment account. Try again.</p>
     );
-  if (instructions === null || payments === null || receipts === null)
+  if (
+    instructions === null ||
+    accounts === null ||
+    payments === null ||
+    receipts === null
+  )
     return <p aria-busy="true">Loading payment account</p>;
 
-  const accountBalance =
-    payments.find((payment) => payment.outstandingBalanceMinorUnits !== null)
-      ?.outstandingBalanceMinorUnits ?? "0";
-  const nextDueDate =
-    payments.find((payment) => payment.nextDueDate !== null)?.nextDueDate ??
-    null;
+  const accountBalance = accounts[0]?.outstandingBalanceMinorUnits ?? "0";
+  const nextDueDate = accounts[0]?.nextDueDate ?? null;
   return (
     <section className="panel payment-panel" aria-labelledby="payment-title">
       <h1 id="payment-title">Payments and receipts</h1>

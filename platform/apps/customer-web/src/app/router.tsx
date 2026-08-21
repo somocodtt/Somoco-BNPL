@@ -8,6 +8,7 @@ import {
   type ContractApi,
 } from "../features/contract/contract-panel.js";
 import { PaymentPanel } from "../features/payments/payment-panel.js";
+import { ReceiptDetailPanel } from "../features/payments/receipt-detail-panel.js";
 import type {
   ApplicantMutation,
   CustomerApi,
@@ -138,6 +139,10 @@ export function CustomerRouter({
         phoneE164={phoneE164}
       />
     );
+  }
+  const receiptId = readReceiptId();
+  if (receiptId !== null && paymentsApi !== undefined) {
+    return <ReceiptDetailPanel api={paymentsApi} receiptId={receiptId} />;
   }
   if (loadError)
     return (
@@ -320,4 +325,11 @@ function readInvitationToken(): string | null {
     `${window.location.pathname}${window.location.search}`,
   );
   return token;
+}
+
+function readReceiptId(): string | null {
+  const match = /^\/account\/receipts\/([0-9a-fA-F-]{36})$/.exec(
+    window.location.pathname,
+  );
+  return match?.[1] ?? null;
 }

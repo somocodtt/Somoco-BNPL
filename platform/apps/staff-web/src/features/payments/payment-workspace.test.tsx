@@ -99,6 +99,33 @@ describe("staff payment workspace", () => {
       screen.getByRole("button", { name: "Request credit adjustment" }),
     ).toBeVisible();
   });
+
+  it("exposes authorized reconciliation resolution and settlement comparison controls", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    api.listReconciliationCases.mockResolvedValueOnce([
+      { id: "case-1", reason: "SETTLEMENT_VARIANCE", status: "OPEN" },
+    ]);
+    render(<PaymentWorkspace api={api} actorId="cfo-1" roles={["CFO"]} />);
+    await screen.findByText(/SETTLEMENT_VARIANCE/);
+    await user.click(screen.getByRole("button", { name: "Resolve case" }));
+    expect(api.resolveReconciliationCase).toHaveBeenCalledWith(
+      "case-1",
+      expect.objectContaining({ resolution: expect.any(Object) }),
+    );
+    await user.type(screen.getByLabelText("Settlement reference"), "set-1");
+    await user.type(
+      screen.getByLabelText("Provider total in minor units"),
+      "1000",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Compare settlement" }),
+    );
+    expect(api.compareSettlement).toHaveBeenCalledWith({
+      settlementReference: "set-1",
+      providerTotalMinorUnits: "1000",
+    });
+  });
 });
 
 function fakeApi(): StaffPaymentsApi & {
@@ -107,6 +134,8 @@ function fakeApi(): StaffPaymentsApi & {
   listSettlements: ReturnType<typeof vi.fn>;
   listAdjustments: ReturnType<typeof vi.fn>;
   decideAdjustment: ReturnType<typeof vi.fn>;
+  resolveReconciliationCase: ReturnType<typeof vi.fn>;
+  compareSettlement: ReturnType<typeof vi.fn>;
 } {
   return {
     listPaymentInbox: vi.fn().mockResolvedValue([]),
@@ -119,5 +148,9 @@ function fakeApi(): StaffPaymentsApi & {
     decideAdjustment: vi
       .fn()
       .mockResolvedValue({ id: "adjustment-1", status: "APPROVED" as const }),
+    resolveReconciliationCase: vi.fn().mockResolvedValue(undefined),
+    compareSettlement: vi
+      .fn()
+      .mockResolvedValue({ status: "MATCHED", varianceMinorUnits: "0" }),
   };
 }

@@ -54,6 +54,20 @@ export function createReconciliationService(options: {
         );
       return withTransaction(options.database, async (tx) => {
         const repo = paymentRepo(tx);
+        const existing = await repo.findSettlementBatch(
+          input.provider,
+          input.settlementReference,
+        );
+        if (existing !== null)
+          return {
+            id: existing.id,
+            settlementReference: existing.settlementReference,
+            providerTotalMinorUnits: String(existing.providerTotalMinorUnits),
+            ledgerTotalMinorUnits: String(existing.ledgerTotalMinorUnits),
+            varianceMinorUnits: String(existing.varianceMinorUnits),
+            status: existing.status as "MATCHED" | "VARIANCE",
+            reconciliationCaseId: existing.reconciliationCaseId,
+          };
         const ledgerTotal = await repo.sumLedgerForSettlement(
           input.settlementReference,
         );
@@ -63,6 +77,7 @@ export function createReconciliationService(options: {
           variance === 0n
             ? undefined
             : await repo.createReconciliationCase({
+                dedupeKey: `SETTLEMENT_VARIANCE:${input.provider}:${input.settlementReference}`,
                 reason: "SETTLEMENT_VARIANCE",
                 resolution: {
                   settlementReference: input.settlementReference,

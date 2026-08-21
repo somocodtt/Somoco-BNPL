@@ -22,6 +22,11 @@ export function PaymentWorkspace({
   const canMakeAdjustment = roles.includes("FINANCE_OFFICER");
   const canCheckAdjustment =
     roles.includes("CFO") || roles.includes("COMPLIANCE_AUDITOR");
+  const canResolveReconciliation =
+    roles.includes("FINANCE_OFFICER") ||
+    roles.includes("CFO") ||
+    roles.includes("COMPLIANCE_AUDITOR");
+  const canCompareSettlement = canResolveReconciliation || roles.includes("MD");
 
   useEffect(() => {
     let active = true;
@@ -85,6 +90,29 @@ export function PaymentWorkspace({
     }
   }
 
+  async function resolveCase(caseId: string) {
+    setActionError("");
+    setNotice("");
+    try {
+      await api.resolveReconciliationCase(caseId, {
+        resolution: { resolvedBy: actorId },
+      });
+      setData((current) =>
+        current === null
+          ? current
+          : {
+              ...current,
+              cases: current.cases.map((item) =>
+                item.id === caseId ? { ...item, status: "RESOLVED" } : item,
+              ),
+            },
+      );
+      setNotice("Reconciliation case resolved");
+    } catch {
+      setActionError("The reconciliation case could not be resolved.");
+    }
+  }
+
   return (
     <main className="staff-shell payment-workspace">
       <section className="panel" aria-labelledby="payments-title">
@@ -119,6 +147,14 @@ export function PaymentWorkspace({
               <li key={stringValue(item.id) ?? String(index)}>
                 {stringValue(item.reason) ?? "Reconciliation case"} —{" "}
                 {stringValue(item.status) ?? "OPEN"}
+                {item.status === "OPEN" && canResolveReconciliation ? (
+                  <button
+                    type="button"
+                    onClick={() => void resolveCase(stringValue(item.id) ?? "")}
+                  >
+                    Resolve case
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>
@@ -140,6 +176,9 @@ export function PaymentWorkspace({
           </ul>
         )}
       </section>
+      {canCompareSettlement ? (
+        <SettlementComparisonForm api={api} onCompared={setNotice} />
+      ) : null}
       <section className="panel" aria-labelledby="adjustments-title">
         <h2 id="adjustments-title">Maker-checker adjustments</h2>
         {data.adjustments.length === 0 ? (
@@ -191,6 +230,63 @@ export function PaymentWorkspace({
       {actionError ? <p role="alert">{actionError}</p> : null}
       {notice ? <p role="status">{notice}</p> : null}
     </main>
+  );
+}
+
+function SettlementComparisonForm({
+  api,
+  onCompared,
+}: {
+  api: StaffPaymentsApi;
+  onCompared: (notice: string) => void;
+}) {
+  const [reference, setReference] = useState("");
+  const [total, setTotal] = useState("");
+  const [error, setError] = useState("");
+  return (
+    <section className="panel" aria-labelledby="settlement-compare-title">
+      <h2 id="settlement-compare-title">Compare settlement</h2>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          setError("");
+          void api
+            .compareSettlement({
+              settlementReference: reference,
+              providerTotalMinorUnits: total,
+            })
+            .then(
+              () => {
+                onCompared("Settlement comparison saved");
+                setReference("");
+                setTotal("");
+              },
+              () => setError("The settlement comparison could not be saved."),
+            );
+        }}
+      >
+        <label>
+          Settlement reference
+          <input
+            value={reference}
+            onChange={(event) => setReference(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          Provider total in minor units
+          <input
+            inputMode="numeric"
+            pattern="(0|[1-9][0-9]*)"
+            value={total}
+            onChange={(event) => setTotal(event.target.value)}
+            required
+          />
+        </label>
+        <button type="submit">Compare settlement</button>
+        {error ? <p role="alert">{error}</p> : null}
+      </form>
+    </section>
   );
 }
 

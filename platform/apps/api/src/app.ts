@@ -310,12 +310,13 @@ export async function buildApp(
     customerOtp,
   );
   if (options.payments !== undefined) {
+    const ussdInstructions = options.payments.ussdInstructions;
+    if (ussdInstructions === undefined || ussdInstructions.trim() === "")
+      throw new Error("PAYMENT_USSD_INSTRUCTIONS_REQUIRED");
     const receipts = createReceiptService({
       database,
       accountLinkBaseUrl: options.payments.accountLinkBaseUrl,
-      ussdInstructions:
-        options.payments.ussdInstructions ??
-        "Use Somoco's approved USSD payment instructions.",
+      ussdInstructions,
     });
     const ledger = createLedgerService({ database, receipts });
     const reconciliation = createReconciliationService({ database });
@@ -330,9 +331,7 @@ export async function buildApp(
       ledger,
       reconciliation,
       receipts,
-      ussdInstructions:
-        options.payments.ussdInstructions ??
-        "Use Somoco's approved USSD payment instructions.",
+      ussdInstructions,
     };
     await registerPaymentRoutes(
       app,

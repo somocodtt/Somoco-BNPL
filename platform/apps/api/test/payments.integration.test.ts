@@ -25,6 +25,7 @@ import type {
   PaymentWebhookVerifier,
   SmsPort,
 } from "@somo/integrations";
+import { otpDerivationKeyId } from "@somo/integrations";
 import { sql } from "../../../packages/db/node_modules/drizzle-orm/index.js";
 import { buildApp } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
@@ -35,6 +36,8 @@ import {
 } from "../src/modules/payments/webhook-service.js";
 import { createLedgerService } from "../src/modules/payments/ledger-service.js";
 import { createReconciliationService } from "../src/modules/payments/reconciliation-service.js";
+import { createReceiptService } from "../src/modules/payments/receipt-service.js";
+import type { CustomerPrincipal } from "../src/modules/access/policy.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (databaseUrl === undefined) throw new Error("TEST_DATABASE_URL is required");
@@ -59,15 +62,18 @@ const config: AppConfig = {
   requireVerifiedMfa: false,
 };
 
-const event: CanonicalPaymentEvent = {
-  eventId: "evt-payment-1",
-  eventType: "PAYMENT_SUCCEEDED",
-  providerTransactionId: "txn-payment-1",
-  payerPhoneE164: "+233201234567",
-  customerReference: "UNKNOWN-CUSTOMER-1",
-  amount: { currency: "GHS", minorUnits: "10000" },
-  occurredAt: "2026-08-21T12:00:00.000Z",
-};
+const event: CanonicalPaymentEvent = Object.assign(
+  {
+    eventId: "evt-payment-1",
+    eventType: "PAYMENT_SUCCEEDED" as const,
+    providerTransactionId: "txn-payment-1",
+    payerPhoneE164: "+233201234567",
+    customerReference: "UNKNOWN-CUSTOMER-1",
+    amount: { currency: "GHS" as const, minorUnits: "10000" },
+    occurredAt: "2026-08-21T12:00:00.000Z",
+  },
+  { channel: "MOBILE_MONEY" as const },
+);
 
 function verifierFor(
   implementation: (input: {
@@ -82,6 +88,10 @@ function verifierFor(
 function policy(): AllocationPolicy {
   return {
     version: "finance-policy-v1",
+    policyHash: "a".repeat(64),
+    workedExampleHash: "b".repeat(64),
+    financeApprovedBy: "finance-approver-1",
+    complianceApprovedBy: "compliance-approver-1",
     approvedBy: "finance-approver-1",
     approvedAt: "2026-08-01T00:00:00.000Z",
     decide: ({ amountMinorUnits }) => ({
@@ -107,6 +117,7 @@ describe("Somoco payment boundary", () => {
   beforeEach(async () => {
     await resetTestDatabase(databaseUrl);
     await migrateDatabase(database);
+    await seedAllocationPolicy(database, policy());
   });
 
   afterAll(async () => {
@@ -277,9 +288,7 @@ describe("Somoco payment boundary", () => {
   it("posts one exact matched payment, issues one receipt, and reconciles the deposit gate", async () => {
     const graph = await insertContractGraph(database);
     const matchedPolicy: AllocationPolicy = {
-      version: "finance-policy-v1",
-      approvedBy: "finance-approver-1",
-      approvedAt: "2026-08-01T00:00:00.000Z",
+      ...policy(),
       decide: ({ amountMinorUnits, installments }) => ({
         outcome: "MATCHED",
         allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
@@ -371,9 +380,7 @@ describe("Somoco payment boundary", () => {
   it("links reversal compensation to the original immutable ledger entry", async () => {
     const graph = await insertContractGraph(database);
     const matchedPolicy: AllocationPolicy = {
-      version: "finance-policy-v1",
-      approvedBy: "finance-approver-1",
-      approvedAt: "2026-08-01T00:00:00.000Z",
+      ...policy(),
       decide: ({ amountMinorUnits, installments }) => ({
         outcome: "MATCHED",
         allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
@@ -426,6 +433,13 @@ describe("Somoco payment boundary", () => {
         )
       ).rows[0],
     ).toMatchObject({ outstanding: "100000", paid: "0", status: "REVERSED" });
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ status: string }>(
+          sql`select status from deposit_reconciliation`,
+        )
+      ).rows[0],
+    ).toEqual({ status: "REJECTED" });
   });
 
   it("requires separate maker and checker for adjustment decisions", async () => {
@@ -517,8 +531,275 @@ describe("Somoco payment boundary", () => {
       varianceMinorUnits: "1000",
       reconciliationCaseId: expect.any(String),
     });
+    const repeated = await reconciliation.compareSettlement({
+      settlementReference: "settle-variance",
+      provider: "SOMOCO_PAYMENTS",
+      providerTotalMinorUnits: 1000n,
+    });
+    expect(repeated).toEqual(
+      expect.objectContaining({
+        id: expect.any(String),
+        reconciliationCaseId: expect.any(String),
+      }),
+    );
+    expect(repeated.id).toBe(
+      (
+        await reconciliation.compareSettlement({
+          settlementReference: "settle-variance",
+          provider: "SOMOCO_PAYMENTS",
+          providerTotalMinorUnits: 1000n,
+        })
+      ).id,
+    );
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ count: number }>(
+          sql`select count(*)::int as count from reconciliation_case where reason = 'SETTLEMENT_VARIANCE'`,
+        )
+      ).rows[0]?.count,
+    ).toBe(1);
+  });
+
+  it("rejects an allocation policy without persisted Finance and Compliance approval evidence", async () => {
+    const graph = await insertContractGraph(database);
+    const unpersisted = {
+      ...policy(),
+      version: "unpersisted-policy-v9",
+      decide: ({
+        amountMinorUnits,
+        installments,
+      }: Parameters<AllocationPolicy["decide"]>[0]) => ({
+        outcome: "MATCHED" as const,
+        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
+      }),
+    } as AllocationPolicy;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-unpersisted-policy",
+        customerReference: graph.reference,
+      })),
+      policy: unpersisted,
+    });
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("unpersisted-policy")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("ALLOCATION_POLICY_NOT_APPROVED");
+  });
+
+  it("serializes concurrent payment postings on the contract and installment rows", async () => {
+    const graph = await insertContractGraph(database);
+    const matchedPolicy: AllocationPolicy = {
+      ...policy(),
+      decide: ({ amountMinorUnits, installments }) => ({
+        outcome: "MATCHED",
+        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
+      }),
+    };
+    let sequence = 0;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => {
+        sequence += 1;
+        return {
+          ...event,
+          eventId: `evt-concurrent-${sequence}`,
+          providerTransactionId: `txn-concurrent-${sequence}`,
+          customerReference: graph.reference,
+          amount: { currency: "GHS", minorUnits: "60000" },
+        };
+      }),
+      policy: matchedPolicy,
+    });
+    const results = await Promise.allSettled([
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("concurrent-1")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("concurrent-2")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ]);
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await getInternalDatabase(database).execute<{
+          balance: string;
+          paid: string;
+          entries: number;
+        }>(
+          sql`select c.outstanding_balance_minor_units::text as balance, i.paid_minor_units::text as paid, (select count(*)::int from ledger_entry l where l.contract_id = c.id and l.entry_type = 'REPAYMENT') as entries from contract c join installment i on i.contract_id = c.id where c.id = ${graph.contractId}`,
+        )
+      ).rows[0],
+    ).toEqual({ balance: "40000", paid: "60000", entries: 1 });
+  });
+
+  it("fails closed when the canonical payment channel is missing or invalid", async () => {
+    const graph = await insertContractGraph(database);
+    const matchedPolicy: AllocationPolicy = {
+      ...policy(),
+      decide: ({ amountMinorUnits, installments }) => ({
+        outcome: "MATCHED",
+        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
+      }),
+    };
+    const invalidChannel = {
+      ...event,
+      eventId: "evt-invalid-channel",
+      customerReference: graph.reference,
+      channel: "BANK_TRANSFER",
+    } as unknown as CanonicalPaymentEvent;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => invalidChannel),
+      policy: matchedPolicy,
+    });
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("invalid-channel")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("MALFORMED_PAYMENT_EVENT");
+  });
+
+  it("exposes zero-payment contract balance and due date separately from posted history", async () => {
+    const graph = await insertContractGraph(database);
+    const receipts = createReceiptService({
+      database,
+      accountLinkBaseUrl: "https://customer.somo.example/account",
+      ussdInstructions: "Dial *123# and select Somoco Payments.",
+    });
+    const actor: CustomerPrincipal = {
+      kind: "customer",
+      customerAccountId: randomUUID(),
+      personId: (
+        await getInternalDatabase(database).execute<{ person_id: string }>(
+          sql`select applicant_person_id as person_id from application where id = (select application_id from contract where id = ${graph.contractId})`,
+        )
+      ).rows[0]!.person_id,
+      sessionId: randomUUID(),
+    };
+    await expect(receipts.listCustomerPayments(actor)).resolves.toEqual([]);
+    await expect(receipts.listCustomerAccounts(actor)).resolves.toEqual([
+      expect.objectContaining({
+        contractReference: graph.reference,
+        outstandingBalanceMinorUnits: "100000",
+        nextDueDate: "2026-09-01",
+      }),
+    ]);
+  });
+
+  it("returns an authenticated receipt detail only to its customer", async () => {
+    const graph = await insertContractGraph(database);
+    const matchedPolicy: AllocationPolicy = {
+      ...policy(),
+      decide: ({ amountMinorUnits, installments }) => ({
+        outcome: "MATCHED",
+        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
+      }),
+    };
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-receipt-detail",
+        customerReference: graph.reference,
+      })),
+      policy: matchedPolicy,
+    });
+    const result = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("receipt-detail")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    const receipts = createReceiptService({
+      database,
+      accountLinkBaseUrl: "https://customer.somo.example/account",
+      ussdInstructions: "Dial *123# and select Somoco Payments.",
+    }) as ReturnType<typeof createReceiptService> & {
+      getCustomerReceipt(
+        actor: CustomerPrincipal,
+        receiptId: string,
+      ): Promise<Record<string, unknown> | null>;
+    };
+    const actor: CustomerPrincipal = {
+      kind: "customer",
+      customerAccountId: randomUUID(),
+      personId: (
+        await getInternalDatabase(database).execute<{ person_id: string }>(
+          sql`select applicant_person_id as person_id from application where id = (select application_id from contract where id = ${graph.contractId})`,
+        )
+      ).rows[0]!.person_id,
+      sessionId: randomUUID(),
+    };
+    await expect(
+      receipts.getCustomerReceipt(actor, result.receiptId!),
+    ).resolves.toMatchObject({
+      receiptNumber: expect.stringContaining("SOMO-"),
+      paymentTransactionId: result.paymentTransactionId,
+      status: "POSTED",
+      securePath: expect.stringContaining(`/receipts/${result.receiptId}`),
+    });
+    await expect(
+      receipts.getCustomerReceipt(
+        { ...actor, personId: randomUUID() },
+        result.receiptId!,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("requires database reversal linkage and rejects unlinked reversal entries", async () => {
+    const graph = await insertContractGraph(database);
+    const internal = getInternalDatabase(database);
+    await expect(
+      internal.execute(sql`
+        insert into ledger_entry
+          (posting_key, contract_id, entry_type, direction, currency, amount_minor_units, balance_after_minor_units, occurred_at)
+        values
+          (${`unlinked-reversal-${randomUUID()}`}, ${graph.contractId}, 'REVERSAL', 'DEBIT', 'GHS', 1, 1, now())
+      `),
+    ).rejects.toThrow();
+    await expect(
+      internal.execute(sql`
+        insert into ledger_entry
+          (posting_key, contract_id, entry_type, direction, currency, amount_minor_units, balance_after_minor_units, reverses_entry_id, occurred_at)
+        values
+          (${`unknown-reversal-${randomUUID()}`}, ${graph.contractId}, 'REVERSAL', 'DEBIT', 'GHS', 1, 1, ${randomUUID()}, now())
+      `),
+    ).rejects.toThrow();
   });
 });
+
+async function seedAllocationPolicy(
+  database: Database,
+  approval: AllocationPolicy,
+): Promise<void> {
+  await getInternalDatabase(database).execute(sql`
+    insert into payment_allocation_policy
+      (version, policy_hash, worked_example_hash, worked_example,
+       finance_approved_by, compliance_approved_by, approved_at, status)
+    values
+      (${approval.version}, ${approval.policyHash}, ${approval.workedExampleHash}, ${JSON.stringify(
+        {
+          version: approval.version,
+          workedExample: "finance-approved-test-example",
+        },
+      )}::jsonb, ${approval.financeApprovedBy}, ${approval.complianceApprovedBy}, ${approval.approvedAt}, 'APPROVED')
+  `);
+}
 
 async function insertContractGraph(
   database: Database,
@@ -635,6 +916,7 @@ describe("payment HTTP composition", () => {
   beforeEach(async () => {
     await resetTestDatabase(databaseUrl);
     await migrateDatabase(database);
+    await seedAllocationPolicy(database, policy());
   });
   afterAll(async () => {
     await closeDatabase();
@@ -651,11 +933,36 @@ describe("payment HTTP composition", () => {
       config,
       database,
       logger: false,
+      identity: {
+        sms,
+        otpPolicy: {
+          ttlMs: 120_000,
+          attemptLimit: 3,
+          resendCooldownMs: 30_000,
+          codeLength: 6,
+          hashSecret: "test-otp-hash-secret-with-at-least-32-characters",
+          deliveryDerivationSecret:
+            "test-delivery-secret-with-at-least-32-characters",
+          deliveryDerivationKeyId: otpDerivationKeyId(
+            "test-delivery-secret-with-at-least-32-characters",
+          ),
+          sessionTtlMs: 3_600_000,
+        },
+        consentCatalog: {
+          documents: [
+            {
+              purpose: "NIA_IDENTITY_VERIFICATION",
+              currentVersion: "nia-consent-v1",
+            },
+          ],
+        },
+      },
       payments: {
         verifier: verifierFor(async () => event),
         allocationPolicy: policy(),
         sms,
         accountLinkBaseUrl: "https://customer.somo.example/account",
+        ussdInstructions: "Dial *123# and select Somoco Payments.",
       },
     });
     const webhook = await app.inject({
@@ -681,6 +988,24 @@ describe("payment HTTP composition", () => {
     });
     expect(malformed.statusCode).toBe(400);
     expect(malformed.json()).toMatchObject({ code: "MALFORMED_JSON" });
+    expect(
+      app.hasRoute({
+        method: "GET",
+        url: "/v1/customer/receipts/:receiptId",
+      }),
+    ).toBe(true);
+    expect(
+      app.hasRoute({
+        method: "POST",
+        url: "/v1/staff/payments/reconciliation/:caseId/resolve",
+      }),
+    ).toBe(true);
+    expect(
+      app.hasRoute({
+        method: "POST",
+        url: "/v1/staff/payments/settlements/compare",
+      }),
+    ).toBe(true);
     const cash = await app.inject({
       method: "POST",
       url: "/v1/staff/payments/cash",
@@ -688,5 +1013,63 @@ describe("payment HTTP composition", () => {
     });
     expect(cash.statusCode).toBe(404);
     await app.close();
+  });
+
+  it("authenticates raw malformed bytes before JSON parsing", async () => {
+    const sms: SmsPort = {
+      send: async () => ({
+        providerReference: randomUUID(),
+        acceptedAt: new Date().toISOString(),
+      }),
+    };
+    const app = await buildApp({
+      config,
+      database,
+      logger: false,
+      payments: {
+        verifier: verifierFor(async () => {
+          throw new Error("INVALID_SIGNATURE");
+        }),
+        allocationPolicy: policy(),
+        sms,
+        accountLinkBaseUrl: "https://customer.somo.example/account",
+        ussdInstructions: "Dial *123# and select Somoco Payments.",
+      },
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/integrations/payments/somoco",
+      headers: {
+        "content-type": "application/json",
+        "x-payment-signature": "bad",
+        "x-payment-timestamp": "2026-08-21T12:00:00.000Z",
+      },
+      payload: '{"eventId":',
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ code: "INVALID_SIGNATURE" });
+    await app.close();
+  });
+
+  it("requires explicit approved USSD instructions in the payment composition", async () => {
+    const sms: SmsPort = {
+      send: async () => ({
+        providerReference: randomUUID(),
+        acceptedAt: new Date().toISOString(),
+      }),
+    };
+    await expect(
+      buildApp({
+        config,
+        database,
+        logger: false,
+        payments: {
+          verifier: verifierFor(async () => event),
+          allocationPolicy: policy(),
+          sms,
+          accountLinkBaseUrl: "https://customer.somo.example/account",
+        },
+      }),
+    ).rejects.toThrow("PAYMENT_USSD_INSTRUCTIONS_REQUIRED");
   });
 });

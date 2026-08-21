@@ -1,6 +1,7 @@
 export interface CanonicalPaymentEvent {
   eventId: string;
   eventType: "PAYMENT_SUCCEEDED" | "PAYMENT_REVERSED" | "PAYMENT_REFUNDED";
+  channel: "USSD" | "MOBILE_MONEY";
   providerTransactionId: string;
   payerPhoneE164: string;
   customerReference: string;

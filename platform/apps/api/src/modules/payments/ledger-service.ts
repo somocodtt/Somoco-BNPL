@@ -22,6 +22,10 @@ export interface AllocationDecision {
 
 export interface AllocationPolicy {
   readonly version: string;
+  readonly policyHash: string;
+  readonly workedExampleHash: string;
+  readonly financeApprovedBy: string;
+  readonly complianceApprovedBy: string;
   readonly approvedBy: string;
   readonly approvedAt: string;
   decide(input: {
@@ -113,6 +117,25 @@ export function createLedgerService(options: {
         tx: DatabaseTransaction,
       ): Promise<LedgerPostResult> => {
         const repo = paymentRepo(tx);
+        const approvedPolicy = await repo.findApprovedAllocationPolicy(
+          input.policy!.version,
+        );
+        if (
+          approvedPolicy === null ||
+          approvedPolicy.policyHash !== input.policy!.policyHash ||
+          approvedPolicy.workedExampleHash !==
+            input.policy!.workedExampleHash ||
+          approvedPolicy.financeApprovedBy !==
+            input.policy!.financeApprovedBy ||
+          approvedPolicy.complianceApprovedBy !==
+            input.policy!.complianceApprovedBy
+        ) {
+          throw new AppError(
+            409,
+            "ALLOCATION_POLICY_NOT_APPROVED",
+            "The persisted Finance and Compliance allocation policy approval is required.",
+          );
+        }
         const duplicate = await repo.findByProviderTransaction(
           "SOMOCO_PAYMENTS",
           input.providerTransactionId,
@@ -429,6 +452,10 @@ export function createLedgerService(options: {
           original.id,
           input.eventType === "PAYMENT_REFUNDED" ? "REFUNDED" : "REVERSED",
         );
+        await repo.invalidateDeposit({
+          paymentTransactionId: original.id,
+          reason: sha256(`${input.eventId}:deposit-invalidated`),
+        });
         const updated = await repo.updateStatus(
           payment.id,
           input.eventType === "PAYMENT_REFUNDED" ? "REFUNDED" : "REVERSED",
@@ -589,6 +616,11 @@ export function createLedgerService(options: {
 function validatePolicy(policy: AllocationPolicy): void {
   if (
     policy.version.trim().length === 0 ||
+    !/^[0-9a-f]{64}$/.test(policy.policyHash) ||
+    !/^[0-9a-f]{64}$/.test(policy.workedExampleHash) ||
+    policy.financeApprovedBy.trim().length === 0 ||
+    policy.complianceApprovedBy.trim().length === 0 ||
+    policy.financeApprovedBy === policy.complianceApprovedBy ||
     policy.approvedBy.trim().length === 0 ||
     !Number.isFinite(Date.parse(policy.approvedAt))
   )
@@ -602,7 +634,13 @@ function validatePolicy(policy: AllocationPolicy): void {
 function inferChannel(
   payload: Record<string, unknown> | undefined,
 ): "USSD" | "MOBILE_MONEY" {
-  return payload?.channel === "USSD" ? "USSD" : "MOBILE_MONEY";
+  if (payload?.channel === "USSD" || payload?.channel === "MOBILE_MONEY")
+    return payload.channel;
+  throw new AppError(
+    400,
+    "PAYMENT_CHANNEL_REQUIRED",
+    "The payment channel must be explicitly USSD or Mobile Money.",
+  );
 }
 
 function sha256(value: string): string {
@@ -616,8 +654,9 @@ async function issueReceipt(
 ) {
   const existing = await repo.findReceipt(payment.id);
   if (existing !== null) return existing;
+  const receiptId = randomUUID();
   return repo.issueReceipt({
-    id: randomUUID(),
+    id: receiptId,
     paymentTransactionId: payment.id,
     ...(payment.contractId === null ? {} : { contractId: payment.contractId }),
     receiptNumber: `SOMO-${payment.id.slice(0, 12).toUpperCase()}`,
@@ -625,6 +664,6 @@ async function issueReceipt(
     amountMinorUnits: payment.amountMinorUnits,
     currency: payment.currency,
     issuedAt: now,
-    securePath: `/account/receipts/${payment.id}`,
+    securePath: `/account/receipts/${receiptId}`,
   });
 }

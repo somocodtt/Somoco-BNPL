@@ -37,3 +37,28 @@ Base: `66c27d2445938201a46b544244c33c17d43487ea`
 ## External readiness note
 
 The repository supplies the provider-neutral Somoco payment verifier and production connector boundary. Somoco must still provide and validate the real payment webhook/settlement contract, production connector provenance, SMS worker deployment configuration, and hosting secrets before accepting live customer payments. No invented provider algorithm or credential is included.
+
+## Fix round 1 — integrity and operations hardening (base `c839fced7727b9e5eaafd8022cbf1bca6c29652a`)
+
+### TDD evidence
+
+- RED accepted: the first fix-round API run had 10 failures/12 passes across 22 tests. The DB linkage check had 1 failure/31 passes; customer and staff payment UI each had 1 failure/3 passes. Failures covered raw-byte/auth ordering, reversal deposit invalidation, settlement replay, persisted policy approval, concurrent posting, explicit channel, customer account/receipt reads, receipt routes, DB reversal linkage, finance controls, and explicit USSD configuration.
+- GREEN: the focused real-PostgreSQL API suite passes 22/22 after the fix round. The DB integration/migration suite passes 32/32, the worker suite passes 33/33, integrations 22/22, contracts 9/9, customer payment UI 4/4, and staff payment UI 4/4.
+- Raw webhook bytes are authenticated before JSON parsing; reversal/refund compensation rejects the deposit gate; contract/installment rows are locked for atomic posting; and settlement variance cases use persisted dedupe keys with replay-stable settlement batches.
+- Customer reads now use posted ledger-backed payments/receipts and expose contract balances/due dates independently of payment history. Receipt links use the authenticated receipt identifier, and staff finance resolution/settlement comparison routes and controls are wired.
+
+### Database and migration evidence
+
+- Fresh migration journal applies 18 migrations and remains at 18 on repeat. Populated migration tests pass through 0017 without changing legacy financial values; reversal/refund rows require an existing linked ledger entry and valid linkage type.
+- Migration 0017 adds the persisted Finance/Compliance allocation-policy evidence table, reconciliation dedupe key, reversal self-FK, and reversal-link consistency check. Drizzle generation reports no schema changes after the migration is present.
+
+### Fix-round verification gates
+
+- API, customer-web, staff-web, worker, contracts, integrations, and database typechecks pass; database public-API typecheck also passes.
+- Targeted lint passes for changed API/payment files and full lint passes for customer-web, staff-web, worker, database, contracts, and integrations. The full API lint still reports only the three pre-existing unrelated errors in `assets/service.ts`, `products/dto.ts`, and `products/service.gate-status.test.ts`.
+- API, database, contracts, integrations, customer-web, and staff-web builds pass. Worker production TypeScript build passes; the standard native esbuild bundle invocation is blocked in this sandbox by access-denied traversal of the pnpm junction target. A preserve-symlinks/external-dependency smoke bundle completes at 133.2 kB; the original Task 11 implementation bundle was previously verified at 480.5 kB.
+- Prettier check and `git diff --check` pass for the complete fix-round diff.
+
+### Fix-round review note
+
+- The exact base-to-head review covers the raw transport boundary, payment repository locking/idempotency, policy provenance, receipt authorization/linking, staff finance routes/UI, canonical payment channel, migration constraints, and production USSD fail-closed composition. No simulator, cash, automatic immobilization, guessed SAP behavior, or provider credential was added.

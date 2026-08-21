@@ -118,6 +118,7 @@ describe("shared transport contracts", () => {
       CanonicalPaymentEventSchema.safeParse({
         eventId: "payment-event-001",
         eventType: "PAYMENT_SUCCEEDED",
+        channel: "MOBILE_MONEY",
         providerTransactionId: "provider-transaction-001",
         payerPhoneE164: "+233201234567",
         customerReference: "SOMO-001",
@@ -129,6 +130,7 @@ describe("shared transport contracts", () => {
       CanonicalPaymentEventSchema.safeParse({
         eventId: "payment-event-001",
         eventType: "PAYMENT_SUCCEEDED",
+        channel: "MOBILE_MONEY",
         providerTransactionId: "provider-transaction-001",
         payerPhoneE164: "+233201234567",
         customerReference: "SOMO-001",

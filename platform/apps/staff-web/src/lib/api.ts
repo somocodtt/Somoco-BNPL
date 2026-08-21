@@ -69,7 +69,15 @@ export interface StaffPaymentWorkspaceData {
 export interface StaffPaymentsApi {
   listPaymentInbox(): Promise<readonly Record<string, unknown>[]>;
   listReconciliationCases(): Promise<readonly Record<string, unknown>[]>;
+  resolveReconciliationCase(
+    caseId: string,
+    input: { resolution: Record<string, unknown> },
+  ): Promise<void>;
   listSettlements(): Promise<readonly Record<string, unknown>[]>;
+  compareSettlement(input: {
+    settlementReference: string;
+    providerTotalMinorUnits: string;
+  }): Promise<Record<string, unknown>>;
   listAdjustments(): Promise<readonly Record<string, unknown>[]>;
   requestAdjustment(input: {
     contractId: string;
@@ -543,11 +551,34 @@ export class FetchStaffApi implements StaffApi, ProductApi, StaffPaymentsApi {
     );
   }
 
+  async resolveReconciliationCase(
+    caseId: string,
+    input: { resolution: Record<string, unknown> },
+  ): Promise<void> {
+    await this.request(
+      `/v1/staff/payments/reconciliation/${encodeURIComponent(caseId)}/resolve`,
+      { method: "POST", body: input },
+    );
+  }
+
   async listSettlements(): Promise<readonly Record<string, unknown>[]> {
     return arrayOfRecords(
       await this.request("/v1/staff/payments/settlements"),
       "MALFORMED_PAYMENT_SETTLEMENTS",
     );
+  }
+
+  async compareSettlement(input: {
+    settlementReference: string;
+    providerTotalMinorUnits: string;
+  }): Promise<Record<string, unknown>> {
+    const body = await this.request("/v1/staff/payments/settlements/compare", {
+      method: "POST",
+      body: input,
+    });
+    if (!isRecord(body))
+      throw malformedStaff("MALFORMED_SETTLEMENT_COMPARISON");
+    return body;
   }
 
   async listAdjustments(): Promise<readonly Record<string, unknown>[]> {

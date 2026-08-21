@@ -4,8 +4,15 @@ import { PaymentPanel } from "./payment-panel.js";
 import type { CustomerPaymentsApi } from "../../lib/api.js";
 
 function api(
-  overrides: Partial<CustomerPaymentsApi> = {},
-): CustomerPaymentsApi {
+  overrides: Partial<CustomerPaymentsApi> &
+    Partial<{
+      getPaymentAccounts(): Promise<readonly Record<string, unknown>[]>;
+      getReceipt(receiptId: string): Promise<Record<string, unknown>>;
+    }> = {},
+): CustomerPaymentsApi & {
+  getPaymentAccounts: ReturnType<typeof vi.fn>;
+  getReceipt: ReturnType<typeof vi.fn>;
+} {
   return {
     getPaymentInstructions: vi.fn(async () => ({
       channel: "USSD_MOBILE_MONEY" as const,
@@ -14,7 +21,12 @@ function api(
     })),
     getPayments: vi.fn(async () => []),
     getReceipts: vi.fn(async () => []),
+    getPaymentAccounts: vi.fn(async () => []),
+    getReceipt: vi.fn(async (receiptId: string) => ({ receiptId })),
     ...overrides,
+  } as CustomerPaymentsApi & {
+    getPaymentAccounts: ReturnType<typeof vi.fn>;
+    getReceipt: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -35,6 +47,14 @@ describe("customer payment panel", () => {
     render(
       <PaymentPanel
         api={api({
+          getPaymentAccounts: vi.fn(async () => [
+            {
+              contractId: "c1",
+              contractReference: "C-1",
+              outstandingBalanceMinorUnits: "87500",
+              nextDueDate: "2026-08-28",
+            },
+          ]),
           getPayments: vi.fn(async () => [
             {
               id: "p1",
@@ -87,5 +107,26 @@ describe("customer payment panel", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert")).toHaveTextContent("could not load"),
     );
+  });
+
+  it("loads contract accounts for balance and due dates even when payment history is empty", async () => {
+    const customerApi = api({
+      getPaymentAccounts: vi.fn(async () => [
+        {
+          contractId: "contract-1",
+          contractReference: "CONTRACT-1",
+          outstandingBalanceMinorUnits: "100000",
+          nextDueDate: "2026-09-01",
+        },
+      ]),
+    });
+    render(<PaymentPanel api={customerApi} />);
+    await waitFor(() =>
+      expect(customerApi.getPaymentAccounts).toHaveBeenCalledOnce(),
+    );
+    expect(
+      await screen.findByText("Outstanding balance: GHS 1000.00"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Next due date: 2026-09-01")).toBeInTheDocument();
   });
 });

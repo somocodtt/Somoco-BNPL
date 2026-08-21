@@ -19,9 +19,16 @@ export interface ReceiptService {
   listCustomerPayments(
     actor: CustomerPrincipal,
   ): Promise<readonly Record<string, unknown>[]>;
+  listCustomerAccounts(
+    actor: CustomerPrincipal,
+  ): Promise<readonly Record<string, unknown>[]>;
   listCustomerReceipts(
     actor: CustomerPrincipal,
   ): Promise<readonly Record<string, unknown>[]>;
+  getCustomerReceipt(
+    actor: CustomerPrincipal,
+    receiptId: string,
+  ): Promise<Record<string, unknown> | null>;
 }
 
 export function createReceiptService(options: {
@@ -42,8 +49,9 @@ export function createReceiptService(options: {
         const existing = await repo.findReceipt(input.payment.id);
         if (existing !== null) return existing;
         const issuedAt = input.now ?? new Date();
+        const receiptId = randomUUID();
         const receipt = await repo.issueReceipt({
-          id: randomUUID(),
+          id: receiptId,
           paymentTransactionId: input.payment.id,
           ...(input.payment.contractId === null
             ? {}
@@ -53,7 +61,7 @@ export function createReceiptService(options: {
           amountMinorUnits: input.payment.amountMinorUnits,
           currency: input.payment.currency,
           issuedAt,
-          securePath: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(input.payment.id)}`,
+          securePath: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(receiptId)}`,
         });
         await enqueueOutbox(tx, {
           id: randomUUID(),
@@ -66,7 +74,7 @@ export function createReceiptService(options: {
             phoneE164: input.payment.payerReference,
             template: "PAYMENT_RECEIPT",
             variables: {
-              receiptLink: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(input.payment.id)}`,
+              receiptLink: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(receiptId)}`,
               ussdInstructions,
             },
           },
@@ -81,8 +89,16 @@ export function createReceiptService(options: {
     async listCustomerPayments(actor) {
       return paymentRepoForRead(options.database, actor).listCustomerPayments();
     },
+    async listCustomerAccounts(actor) {
+      return paymentRepoForRead(options.database, actor).listCustomerAccounts();
+    },
     async listCustomerReceipts(actor) {
       return paymentRepoForRead(options.database, actor).listCustomerReceipts();
+    },
+    async getCustomerReceipt(actor, receiptId) {
+      return paymentRepoForRead(options.database, actor).getCustomerReceipt(
+        receiptId,
+      );
     },
   };
 }
@@ -94,9 +110,19 @@ function paymentRepoForRead(database: Database, actor: CustomerPrincipal) {
         paymentRepo(tx).listCustomerPayments(actor.personId),
       );
     },
+    async listCustomerAccounts() {
+      return withTransaction(database, async (tx) =>
+        paymentRepo(tx).listCustomerAccounts(actor.personId),
+      );
+    },
     async listCustomerReceipts() {
       return withTransaction(database, async (tx) =>
         paymentRepo(tx).listCustomerReceipts(actor.personId),
+      );
+    },
+    async getCustomerReceipt(receiptId: string) {
+      return withTransaction(database, async (tx) =>
+        paymentRepo(tx).getCustomerReceipt(actor.personId, receiptId),
       );
     },
   };

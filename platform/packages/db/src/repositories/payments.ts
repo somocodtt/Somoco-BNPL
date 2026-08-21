@@ -3,6 +3,7 @@ import { contract, installment } from "../schema/contracts.js";
 import {
   ledgerEntry,
   paymentAdjustment,
+  paymentAllocationPolicy,
   paymentReceipt,
   paymentSettlementBatch,
   paymentTransaction,
@@ -21,6 +22,8 @@ export type PaymentReceipt = typeof paymentReceipt.$inferSelect;
 export type ReconciliationCase = typeof reconciliationCase.$inferSelect;
 export type PaymentAdjustment = typeof paymentAdjustment.$inferSelect;
 export type PaymentSettlementBatch = typeof paymentSettlementBatch.$inferSelect;
+export type PaymentAllocationPolicy =
+  typeof paymentAllocationPolicy.$inferSelect;
 
 export interface ContractPaymentContext {
   contractId: string;
@@ -81,6 +84,21 @@ export function paymentRepo(db: DatabaseTransaction) {
           and(
             eq(paymentTransaction.provider, provider as "SOMOCO_PAYMENTS"),
             eq(paymentTransaction.eventId, eventId),
+          ),
+        )
+        .limit(1);
+      return row ?? null;
+    },
+    async findApprovedAllocationPolicy(
+      version: string,
+    ): Promise<PaymentAllocationPolicy | null> {
+      const [row] = await executor
+        .select()
+        .from(paymentAllocationPolicy)
+        .where(
+          and(
+            eq(paymentAllocationPolicy.version, version),
+            eq(paymentAllocationPolicy.status, "APPROVED"),
           ),
         )
         .limit(1);
@@ -173,7 +191,8 @@ export function paymentRepo(db: DatabaseTransaction) {
         .select({ outstanding: contract.outstandingBalanceMinorUnits })
         .from(contract)
         .where(eq(contract.id, input.contractId))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (current === undefined) throw new Error("CONTRACT_NOT_FOUND");
       const [inst] = await executor
         .select({
@@ -187,7 +206,8 @@ export function paymentRepo(db: DatabaseTransaction) {
             eq(installment.contractId, input.contractId),
           ),
         )
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (inst === undefined) throw new Error("INSTALLMENT_NOT_FOUND");
       const amount = BigInt(inst.amount);
       const paid = BigInt(inst.paid);
@@ -234,7 +254,8 @@ export function paymentRepo(db: DatabaseTransaction) {
         .select({ outstanding: contract.outstandingBalanceMinorUnits })
         .from(contract)
         .where(eq(contract.id, input.contractId))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (current === undefined) throw new Error("CONTRACT_NOT_FOUND");
       const [inst] = await executor
         .select({
@@ -248,7 +269,8 @@ export function paymentRepo(db: DatabaseTransaction) {
             eq(installment.contractId, input.contractId),
           ),
         )
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (inst === undefined) throw new Error("INSTALLMENT_NOT_FOUND");
       const paid = BigInt(inst.paid);
       if (input.paymentMinorUnits > paid) {
@@ -382,9 +404,34 @@ export function paymentRepo(db: DatabaseTransaction) {
       if (row === undefined) throw new Error("DEPOSIT_RECONCILIATION_FAILED");
       return row;
     },
+    async invalidateDeposit(input: {
+      paymentTransactionId: string;
+      reason: string;
+    }) {
+      const [row] = await executor
+        .update(depositReconciliation)
+        .set({
+          status: "REJECTED",
+          reconciledAt: null,
+          evidenceHash: input.reason,
+          version: sql`${depositReconciliation.version} + 1`,
+        })
+        .where(
+          and(
+            eq(
+              depositReconciliation.paymentTransactionId,
+              input.paymentTransactionId,
+            ),
+            eq(depositReconciliation.status, "RECONCILED"),
+          ),
+        )
+        .returning();
+      return row ?? null;
+    },
     async createReconciliationCase(input: {
       paymentTransactionId?: string;
       reason: string;
+      dedupeKey?: string;
       resolution?: Record<string, unknown>;
     }): Promise<ReconciliationCase> {
       const existing =
@@ -407,21 +454,39 @@ export function paymentRepo(db: DatabaseTransaction) {
                 .limit(1)
             )[0];
       if (existing !== undefined) return existing;
-      const [inserted] = await executor
-        .insert(reconciliationCase)
-        .values({
-          ...(input.paymentTransactionId === undefined
-            ? {}
-            : { paymentTransactionId: input.paymentTransactionId }),
-          reason: input.reason,
-          ...(input.resolution === undefined
-            ? {}
-            : { resolution: input.resolution }),
-        })
-        .returning();
-      if (inserted === undefined)
-        throw new Error("RECONCILIATION_CASE_CREATE_FAILED");
-      return inserted;
+      const values = {
+        ...(input.paymentTransactionId === undefined
+          ? {}
+          : { paymentTransactionId: input.paymentTransactionId }),
+        reason: input.reason,
+        ...(input.dedupeKey === undefined
+          ? {}
+          : { dedupeKey: input.dedupeKey }),
+        ...(input.resolution === undefined
+          ? {}
+          : { resolution: input.resolution }),
+      };
+      const [inserted] =
+        input.dedupeKey === undefined
+          ? await executor.insert(reconciliationCase).values(values).returning()
+          : await executor
+              .insert(reconciliationCase)
+              .values(values)
+              .onConflictDoNothing({
+                target: reconciliationCase.dedupeKey,
+                where: sql`${reconciliationCase.dedupeKey} is not null`,
+              })
+              .returning();
+      if (inserted !== undefined) return inserted;
+      if (input.dedupeKey !== undefined) {
+        const [existingByKey] = await executor
+          .select()
+          .from(reconciliationCase)
+          .where(eq(reconciliationCase.dedupeKey, input.dedupeKey))
+          .limit(1);
+        if (existingByKey !== undefined) return existingByKey;
+      }
+      throw new Error("RECONCILIATION_CASE_CREATE_FAILED");
     },
     async findReceipt(
       paymentTransactionId: string,
@@ -533,6 +598,22 @@ export function paymentRepo(db: DatabaseTransaction) {
         throw new Error("SETTLEMENT_DEDUPLICATION_FAILED");
       return existing;
     },
+    async findSettlementBatch(
+      provider: "SOMOCO_PAYMENTS",
+      settlementReference: string,
+    ): Promise<PaymentSettlementBatch | null> {
+      const [row] = await executor
+        .select()
+        .from(paymentSettlementBatch)
+        .where(
+          and(
+            eq(paymentSettlementBatch.provider, provider),
+            eq(paymentSettlementBatch.settlementReference, settlementReference),
+          ),
+        )
+        .limit(1);
+      return row ?? null;
+    },
     async sumLedgerForSettlement(settlementReference: string): Promise<bigint> {
       const result = await executor.execute<{ total: bigint | string }>(
         sql`select coalesce(sum(case when l.direction = 'CREDIT' then l.amount_minor_units else -l.amount_minor_units end), 0)::bigint as total from ledger_entry l join payment_transaction p on p.id = l.payment_transaction_id where p.settlement_reference = ${settlementReference}`,
@@ -559,8 +640,15 @@ export function paymentRepo(db: DatabaseTransaction) {
                  order by i.installment_number asc limit 1) as next_due_date
           from payment_transaction p
           left join contract c on c.id = p.contract_id
-          left join application a on a.id = c.application_id
+         left join application a on a.id = c.application_id
          where a.applicant_person_id = ${personId}
+           and p.status = 'POSTED'
+           and exists (
+             select 1
+               from ledger_entry l
+              where l.payment_transaction_id = p.id
+                and l.direction = 'CREDIT'
+           )
          order by p.occurred_at desc, p.id desc
       `);
       return result.rows.map((row) => ({
@@ -575,6 +663,33 @@ export function paymentRepo(db: DatabaseTransaction) {
           row.outstanding_balance_minor_units === null
             ? null
             : String(row.outstanding_balance_minor_units),
+        nextDueDate: row.next_due_date,
+      }));
+    },
+    async listCustomerAccounts(personId: string) {
+      const result = await executor.execute<{
+        contract_id: string;
+        contract_reference: string;
+        outstanding_balance_minor_units: bigint | string;
+        next_due_date: string | null;
+      }>(sql`
+        select c.id as contract_id,
+               c.reference as contract_reference,
+               c.outstanding_balance_minor_units,
+               (select i.due_date from installment i
+                 where i.contract_id = c.id and i.status <> 'PAID'
+                 order by i.installment_number asc limit 1) as next_due_date
+          from contract c
+          join application a on a.id = c.application_id
+         where a.applicant_person_id = ${personId}
+         order by c.reference asc
+      `);
+      return result.rows.map((row) => ({
+        contractId: row.contract_id,
+        contractReference: row.contract_reference,
+        outstandingBalanceMinorUnits: String(
+          row.outstanding_balance_minor_units,
+        ),
         nextDueDate: row.next_due_date,
       }));
     },
@@ -593,8 +708,15 @@ export function paymentRepo(db: DatabaseTransaction) {
           from payment_receipt r
           join payment_transaction p on p.id = r.payment_transaction_id
           join contract c on c.id = r.contract_id
-          join application a on a.id = c.application_id
+         join application a on a.id = c.application_id
          where a.applicant_person_id = ${personId}
+           and p.status = 'POSTED'
+           and exists (
+             select 1
+               from ledger_entry l
+              where l.payment_transaction_id = p.id
+                and l.direction = 'CREDIT'
+           )
          order by r.issued_at desc, r.id desc
       `);
       return result.rows.map((row) => ({
@@ -606,6 +728,52 @@ export function paymentRepo(db: DatabaseTransaction) {
         issuedAt: new Date(row.issued_at).toISOString(),
         securePath: row.secure_path,
       }));
+    },
+    async getCustomerReceipt(personId: string, receiptId: string) {
+      const result = await executor.execute<{
+        id: string;
+        receipt_number: string;
+        payment_transaction_id: string;
+        amount_minor_units: bigint | string;
+        currency: string;
+        issued_at: Date;
+        secure_path: string;
+        status: string;
+        provider_transaction_id: string;
+        occurred_at: Date;
+      }>(sql`
+        select r.id, r.receipt_number, r.payment_transaction_id,
+               r.amount_minor_units, r.currency, r.issued_at, r.secure_path,
+               p.status, p.provider_transaction_id, p.occurred_at
+          from payment_receipt r
+          join payment_transaction p on p.id = r.payment_transaction_id
+          join contract c on c.id = r.contract_id
+          join application a on a.id = c.application_id
+         where r.id = ${receiptId}
+           and a.applicant_person_id = ${personId}
+           and p.status = 'POSTED'
+           and exists (
+             select 1
+               from ledger_entry l
+              where l.payment_transaction_id = p.id
+                and l.direction = 'CREDIT'
+           )
+         limit 1
+      `);
+      const row = result.rows[0];
+      if (row === undefined) return null;
+      return {
+        id: row.id,
+        receiptNumber: row.receipt_number,
+        paymentTransactionId: row.payment_transaction_id,
+        amountMinorUnits: String(row.amount_minor_units),
+        currency: row.currency,
+        issuedAt: new Date(row.issued_at).toISOString(),
+        securePath: row.secure_path,
+        status: row.status,
+        providerTransactionId: row.provider_transaction_id,
+        occurredAt: new Date(row.occurred_at).toISOString(),
+      };
     },
     async listFinanceInbox() {
       const result = await executor.execute<{

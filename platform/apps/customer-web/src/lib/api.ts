@@ -154,10 +154,25 @@ export interface CustomerReceiptRecord {
   securePath: string;
 }
 
+export interface CustomerPaymentAccount {
+  contractId: string;
+  contractReference: string;
+  outstandingBalanceMinorUnits: string;
+  nextDueDate: string | null;
+}
+
+export interface CustomerReceiptDetail extends CustomerReceiptRecord {
+  status: "POSTED";
+  providerTransactionId: string;
+  occurredAt: string;
+}
+
 export interface CustomerPaymentsApi {
   getPaymentInstructions(): Promise<CustomerPaymentInstructions>;
+  getPaymentAccounts(): Promise<readonly CustomerPaymentAccount[]>;
   getPayments(): Promise<readonly CustomerPaymentRecord[]>;
   getReceipts(): Promise<readonly CustomerReceiptRecord[]>;
+  getReceipt(receiptId: string): Promise<CustomerReceiptDetail>;
 }
 
 import type { CustomerOffer, OfferApi } from "../features/offer/offer-panel.js";
@@ -370,12 +385,22 @@ export class FetchCustomerApi
     return this.request("/v1/customer/payment-instructions");
   }
 
+  getPaymentAccounts(): Promise<readonly CustomerPaymentAccount[]> {
+    return this.request("/v1/customer/payment-accounts");
+  }
+
   getPayments(): Promise<readonly CustomerPaymentRecord[]> {
     return this.request("/v1/customer/payments");
   }
 
   getReceipts(): Promise<readonly CustomerReceiptRecord[]> {
     return this.request("/v1/customer/receipts");
+  }
+
+  getReceipt(receiptId: string): Promise<CustomerReceiptDetail> {
+    return this.request(
+      `/v1/customer/receipts/${encodeURIComponent(receiptId)}`,
+    );
   }
 
   async getContract(

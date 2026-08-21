@@ -38,6 +38,10 @@ export async function registerPaymentRawBodyParser(
     (request, body, done) => {
       const raw = new Uint8Array(body as Uint8Array);
       request.paymentRawBody = raw as unknown as Uint8Array;
+      if (request.url.split("?", 1)[0] === "/v1/integrations/payments/somoco") {
+        done(null, raw);
+        return;
+      }
       try {
         done(null, JSON.parse(new TextDecoder().decode(raw)) as unknown);
       } catch {
@@ -99,6 +103,7 @@ export async function registerPaymentRoutes(
         rawBody,
         signature,
         requestTimestamp,
+        validateJson: true,
       });
       return reply.code(202).send(result);
     },
@@ -117,6 +122,16 @@ export async function registerPaymentRoutes(
         ),
     );
     app.get(
+      "/v1/customer/payment-accounts",
+      { preHandler: authenticateCustomer },
+      async (request, reply) =>
+        reply.send(
+          await composition.receipts.listCustomerAccounts(
+            requireCustomerPrincipal(request),
+          ),
+        ),
+    );
+    app.get(
       "/v1/customer/receipts",
       { preHandler: authenticateCustomer },
       async (request, reply) =>
@@ -125,6 +140,31 @@ export async function registerPaymentRoutes(
             requireCustomerPrincipal(request),
           ),
         ),
+    );
+    app.get<{
+      Params: { receiptId: string };
+    }>(
+      "/v1/customer/receipts/:receiptId",
+      {
+        preHandler: authenticateCustomer,
+        schema: {
+          params: {
+            type: "object",
+            additionalProperties: false,
+            required: ["receiptId"],
+            properties: { receiptId: { type: "string", pattern: uuidPattern } },
+          },
+        },
+      },
+      async (request, reply) => {
+        const receipt = await composition.receipts.getCustomerReceipt(
+          requireCustomerPrincipal(request),
+          request.params.receiptId,
+        );
+        if (receipt === null)
+          throw new AppError(404, "RECEIPT_NOT_FOUND", "Receipt not found.");
+        return reply.send(receipt);
+      },
     );
     app.get(
       "/v1/customer/payment-instructions",
@@ -147,6 +187,39 @@ export async function registerPaymentRoutes(
     async (request, reply) => {
       assertFinanceRead(requireStaffPrincipal(request));
       return reply.send(await composition.reconciliation.listInbox());
+    },
+  );
+  app.post<{
+    Params: { caseId: string };
+    Body: { resolution: Record<string, unknown> };
+  }>(
+    "/v1/staff/payments/reconciliation/:caseId/resolve",
+    { preHandler: staffMutation, schema: reconciliationResolutionSchema },
+    async (request, reply) => {
+      const actor = requireStaffPrincipal(request);
+      assertFinanceRead(actor);
+      await composition.reconciliation.resolveCase({
+        caseId: request.params.caseId,
+        actor,
+        resolution: request.body.resolution,
+      });
+      return reply.code(204).send();
+    },
+  );
+  app.post<{
+    Body: { settlementReference: string; providerTotalMinorUnits: string };
+  }>(
+    "/v1/staff/payments/settlements/compare",
+    { preHandler: staffMutation, schema: settlementComparisonSchema },
+    async (request, reply) => {
+      assertFinanceRead(requireStaffPrincipal(request));
+      return reply.send(
+        await composition.reconciliation.compareSettlement({
+          settlementReference: request.body.settlementReference,
+          provider: "SOMOCO_PAYMENTS",
+          providerTotalMinorUnits: BigInt(request.body.providerTotalMinorUnits),
+        }),
+      );
     },
   );
   app.get(
@@ -268,6 +341,37 @@ const adjustmentDecisionSchema = {
     properties: {
       decision: { type: "string", enum: ["APPROVE", "REJECT"] },
       reason: { type: "string", minLength: 1, maxLength: 500 },
+    },
+  },
+} as const;
+const reconciliationResolutionSchema = {
+  params: {
+    type: "object",
+    additionalProperties: false,
+    required: ["caseId"],
+    properties: { caseId: { type: "string", pattern: uuidPattern } },
+  },
+  body: {
+    type: "object",
+    additionalProperties: false,
+    required: ["resolution"],
+    properties: {
+      resolution: { type: "object", additionalProperties: true },
+    },
+  },
+} as const;
+const settlementComparisonSchema = {
+  body: {
+    type: "object",
+    additionalProperties: false,
+    required: ["settlementReference", "providerTotalMinorUnits"],
+    properties: {
+      settlementReference: { type: "string", minLength: 1, maxLength: 128 },
+      providerTotalMinorUnits: {
+        type: "string",
+        pattern: "^(0|[1-9][0-9]*)$",
+        maxLength: 20,
+      },
     },
   },
 } as const;

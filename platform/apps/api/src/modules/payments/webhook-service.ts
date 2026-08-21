@@ -23,6 +23,7 @@ export interface PaymentWebhookInput {
   rawBody: Uint8Array;
   signature: string;
   requestTimestamp: string;
+  validateJson?: boolean;
 }
 
 export interface PaymentWebhookAcknowledgement {
@@ -56,6 +57,17 @@ export function createPaymentWebhookService(options: {
         event = await options.verifier.verify(input);
       } catch (cause) {
         throw mapVerifierFailure(cause);
+      }
+      if (input.validateJson === true) {
+        try {
+          JSON.parse(new TextDecoder().decode(input.rawBody));
+        } catch {
+          throw new AppError(
+            400,
+            "MALFORMED_JSON",
+            "The payment event body is malformed.",
+          );
+        }
       }
       validateCanonicalEvent(event);
       return withTransaction(options.database, async (tx) => {
@@ -136,7 +148,7 @@ async function processEvent(input: {
         : { settlementReference: event.settlementReference }),
       policy: input.policy,
       providerPayload: {
-        channel: "MOBILE_MONEY",
+        channel: event.channel,
         settlementReference: event.settlementReference,
       },
     });
@@ -170,6 +182,12 @@ function validateCanonicalEvent(event: CanonicalPaymentEvent): void {
       400,
       "MALFORMED_PAYMENT_EVENT",
       "The payment event is malformed.",
+    );
+  if (event.channel !== "USSD" && event.channel !== "MOBILE_MONEY")
+    throw new AppError(
+      400,
+      "MALFORMED_PAYMENT_EVENT",
+      "The payment channel is malformed.",
     );
   if (
     !(
