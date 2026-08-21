@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { NiaPort } from "./nia.js";
+import type { PaymentWebhookVerifier } from "./payments.js";
 import type { SmsPort } from "./sms.js";
 import type { TrackerPort } from "./tracker.js";
 
@@ -10,11 +11,7 @@ const productionCapabilities = new WeakMap<
 >();
 
 export type ProductionAdapterCapability =
-  | "SMS"
-  | "NIA"
-  | "OBJECT_STORAGE"
-  | "MALWARE_SCANNER"
-  | "TRACKER";
+  "SMS" | "NIA" | "OBJECT_STORAGE" | "MALWARE_SCANNER" | "TRACKER" | "PAYMENTS";
 
 export interface ExternalConnectorProvenance {
   packageName: string;
@@ -38,9 +35,14 @@ export interface ProductionConnectorBoundary {
     provenance: ExternalConnectorProvenance;
     adapter: TrackerPort;
   }): TrackerPort;
+  register(input: {
+    kind: "PAYMENTS";
+    provenance: ExternalConnectorProvenance;
+    adapter: PaymentWebhookVerifier;
+  }): PaymentWebhookVerifier;
   require<T extends object>(
     adapter: T,
-    kind: "SMS" | "NIA" | "TRACKER",
+    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS",
   ): T;
 }
 
@@ -103,12 +105,15 @@ export function requireProductionConnector<T extends object>(
 }
 
 export function createProductionConnectorBoundary(): ProductionConnectorBoundary {
-  const registered = new WeakMap<object, "SMS" | "NIA" | "TRACKER">();
+  const registered = new WeakMap<
+    object,
+    "SMS" | "NIA" | "TRACKER" | "PAYMENTS"
+  >();
   function register(input: {
-    kind: "SMS" | "NIA" | "TRACKER";
+    kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS";
     provenance: ExternalConnectorProvenance;
-    adapter: SmsPort | NiaPort | TrackerPort;
-  }): SmsPort | NiaPort | TrackerPort {
+    adapter: SmsPort | NiaPort | TrackerPort | PaymentWebhookVerifier;
+  }): SmsPort | NiaPort | TrackerPort | PaymentWebhookVerifier {
     validateExternalConnectorProvenance(input.provenance);
     if (isSimulatorAdapter(input.adapter)) {
       throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
@@ -118,7 +123,11 @@ export function createProductionConnectorBoundary(): ProductionConnectorBoundary
         ? createExternalSmsConnector(input.adapter as SmsPort)
         : input.kind === "NIA"
           ? createExternalNiaConnector(input.adapter as NiaPort)
-          : createExternalTrackerConnector(input.adapter as TrackerPort);
+          : input.kind === "TRACKER"
+            ? createExternalTrackerConnector(input.adapter as TrackerPort)
+            : createExternalPaymentConnector(
+                input.adapter as PaymentWebhookVerifier,
+              );
     markProductionAdapter(connector, input.kind);
     registered.set(connector, input.kind);
     return connector;
@@ -127,13 +136,26 @@ export function createProductionConnectorBoundary(): ProductionConnectorBoundary
     register: register as ProductionConnectorBoundary["register"],
     require<T extends object>(
       adapter: T,
-      kind: "SMS" | "NIA" | "TRACKER",
+      kind: "SMS" | "NIA" | "TRACKER" | "PAYMENTS",
     ): T {
       if (registered.get(adapter) !== kind) {
         throw new Error("PRODUCTION_CONNECTOR_REGISTRATION_REQUIRED");
       }
       return adapter;
     },
+  });
+}
+
+function createExternalPaymentConnector(
+  adapter: PaymentWebhookVerifier,
+): PaymentWebhookVerifier {
+  if (typeof adapter.verify !== "function") {
+    throw new Error("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  }
+  const verify = adapter.verify.bind(adapter);
+  return Object.freeze({
+    verify: (input: Parameters<PaymentWebhookVerifier["verify"]>[0]) =>
+      runExternalConnectorOperation(() => verify(input)),
   });
 }
 

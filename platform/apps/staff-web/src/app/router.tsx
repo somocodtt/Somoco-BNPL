@@ -8,12 +8,14 @@ import {
   type ProductApi,
 } from "../features/products/product-workspace.js";
 import { AssetWorkspace } from "../features/assets/asset-workspace.js";
+import { PaymentWorkspace } from "../features/payments/payment-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
   StaffApi,
   StaffAssetApi,
   StaffContractApi,
+  StaffPaymentsApi,
   StaffSession,
 } from "../lib/api.js";
 
@@ -23,12 +25,14 @@ export function StaffRouter({
   productsApi,
   assetsApi,
   contractsApi,
+  paymentsApi,
 }: {
   api: StaffApi;
   initialSession?: StaffSession | null;
   productsApi?: ProductApi;
   assetsApi?: StaffAssetApi;
   contractsApi?: StaffContractApi;
+  paymentsApi?: StaffPaymentsApi;
 }) {
   const [session, setSession] = useState<StaffSession | null>(initialSession);
   const [queue, setQueue] = useState<QueueApplication[] | null>(null);
@@ -67,6 +71,18 @@ export function StaffRouter({
       role,
     ),
   );
+  const canOperatePayments = session.roles.some((role) =>
+    ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR", "MD"].includes(role),
+  );
+  if (paymentsApi !== undefined && canOperatePayments) {
+    return (
+      <PaymentWorkspace
+        api={paymentsApi}
+        actorId={session.staffUserId}
+        roles={session.roles}
+      />
+    );
+  }
   if (productsApi !== undefined && canOperateFinancing) {
     return (
       <ProductWorkspace

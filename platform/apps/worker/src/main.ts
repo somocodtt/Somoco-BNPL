@@ -293,6 +293,7 @@ function waitForPoll(
 export * from "./jobs/dispatch-outbox.js";
 export * from "./jobs/recompute-arrears.js";
 export * from "./jobs/send-notification.js";
+export * from "./jobs/reconcile-payments.js";
 export * from "./database-outbox-store.js";
 
 const entrypoint = process.argv[1];

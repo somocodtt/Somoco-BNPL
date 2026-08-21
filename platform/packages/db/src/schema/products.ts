@@ -97,7 +97,7 @@ export const financingRuleVersion = pgTable(
       mode: "bigint",
     })
       .notNull()
-      .default(0n),
+      .default(sql`0`),
     annualRateBps: numeric("annual_rate_bps", {
       precision: 9,
       scale: 0,
@@ -126,8 +126,8 @@ export const financingRuleVersion = pgTable(
       .notNull()
       .default({}),
     disclosureVersion: text("disclosure_version"),
-    disclosureContent: jsonb("disclosure_content")
-      .$type<Record<string, unknown>>(),
+    disclosureContent:
+      jsonb("disclosure_content").$type<Record<string, unknown>>(),
     disclosureHash: text("disclosure_hash"),
     fixtureHashes: jsonb("fixture_hashes")
       .$type<string[]>()

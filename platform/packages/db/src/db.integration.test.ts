@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(16);
+    expect(before.rows[0]?.count).toBe(17);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -612,6 +612,70 @@ describe("populated legacy schema migration", () => {
       message: expect.stringContaining("legacy registration owner"),
     });
     await expectLegacySchemaUnchanged(pool);
+  });
+
+  it("upgrades populated payment and ledger rows through the payment migration without changing financial values", async () => {
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "USSD",
+      registeredOwner: "SOMOCO",
+    });
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+      "0009_whole_nightmare.sql",
+      "0010_controlled_financing.sql",
+      "0011_financing_binding.sql",
+      "0012_financing_disclosures.sql",
+      "0013_asset_contract_handover.sql",
+      "0014_asset_hardening.sql",
+      "0015_asset_privacy_controls.sql",
+      "0016_payment_ledger_reconciliation.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+    const financial = await pool.query<{
+      payment_amount: string;
+      ledger_amount: string;
+      payment_event_id: string | null;
+      receipt_count: number;
+      settlement_count: number;
+    }>(
+      `select payment.amount_minor_units::text as payment_amount,
+              ledger.amount_minor_units::text as ledger_amount,
+              payment.event_id as payment_event_id,
+              (select count(*)::int from payment_receipt) as receipt_count,
+              (select count(*)::int from payment_settlement_batch) as settlement_count
+         from payment_transaction payment
+         join ledger_entry ledger on ledger.payment_transaction_id = payment.id
+        where payment.id = $1`,
+      [legacy.paymentTransactionId],
+    );
+    expect(financial.rows[0]).toEqual({
+      payment_amount: "10000",
+      ledger_amount: "10000",
+      payment_event_id: null,
+      receipt_count: 0,
+      settlement_count: 0,
+    });
+    await expect(
+      pool.query(
+        `select distinct trigger_name from information_schema.triggers
+          where event_object_table in ('payment_receipt', 'payment_settlement_batch')
+          order by trigger_name`,
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        { trigger_name: "payment_receipt_append_only" },
+        { trigger_name: "payment_settlement_batch_append_only" },
+      ],
+    });
   });
 
   it("backfills active 0003 claims as started attempts that can be abandoned and reclaimed", async () => {
@@ -1215,7 +1279,7 @@ async function insertFinancialGraph(
     annualRateBps: "1200",
     allowedTenuresMonths: [12],
     repaymentFrequencies: ["MONTHLY"],
-    calculationMethod: "DECLINING_BALANCE",
+    calculationMethod: "REDUCING_BALANCE",
   });
   await db.insert(offer).values({ id: offerId, applicationId });
   await db.insert(offerVersion).values({
@@ -1453,7 +1517,7 @@ async function insertLegacyFinancialGraph(
     [vehicleUnitId, `REG-${suffix}`, options.registeredOwner],
   );
 
-  return { contractId, installmentId, ledgerEntryId };
+  return { contractId, installmentId, ledgerEntryId, paymentTransactionId };
 }
 
 async function expectLegacySchemaUnchanged(pool: Pool): Promise<void> {

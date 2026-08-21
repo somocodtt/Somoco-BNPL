@@ -59,6 +59,31 @@ export interface StaffApi {
   }): Promise<StaffSession>;
 }
 
+export interface StaffPaymentWorkspaceData {
+  inbox: readonly Record<string, unknown>[];
+  cases: readonly Record<string, unknown>[];
+  settlements: readonly Record<string, unknown>[];
+  adjustments: readonly Record<string, unknown>[];
+}
+
+export interface StaffPaymentsApi {
+  listPaymentInbox(): Promise<readonly Record<string, unknown>[]>;
+  listReconciliationCases(): Promise<readonly Record<string, unknown>[]>;
+  listSettlements(): Promise<readonly Record<string, unknown>[]>;
+  listAdjustments(): Promise<readonly Record<string, unknown>[]>;
+  requestAdjustment(input: {
+    contractId: string;
+    amountMinorUnits: string;
+    direction: "DEBIT" | "CREDIT";
+    reason: string;
+    idempotencyKey: string;
+  }): Promise<{ id: string; status: "PENDING" }>;
+  decideAdjustment(
+    adjustmentId: string,
+    input: { decision: "APPROVE" | "REJECT"; reason: string },
+  ): Promise<{ id: string; status: "APPROVED" | "REJECTED" }>;
+}
+
 export interface StaffAssetSummary {
   id: string;
   vehicleModelId: string;
@@ -231,7 +256,7 @@ export class ProblemError extends Error {
   }
 }
 
-export class FetchStaffApi implements StaffApi, ProductApi {
+export class FetchStaffApi implements StaffApi, ProductApi, StaffPaymentsApi {
   private csrfToken = "";
 
   constructor(
@@ -504,6 +529,71 @@ export class FetchStaffApi implements StaffApi, ProductApi {
     );
   }
 
+  async listPaymentInbox(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/payments/inbox"),
+      "MALFORMED_PAYMENT_INBOX",
+    );
+  }
+
+  async listReconciliationCases(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/payments/reconciliation"),
+      "MALFORMED_RECONCILIATION_CASES",
+    );
+  }
+
+  async listSettlements(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/payments/settlements"),
+      "MALFORMED_PAYMENT_SETTLEMENTS",
+    );
+  }
+
+  async listAdjustments(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/payments/adjustments"),
+      "MALFORMED_PAYMENT_ADJUSTMENTS",
+    );
+  }
+
+  async requestAdjustment(input: {
+    contractId: string;
+    amountMinorUnits: string;
+    direction: "DEBIT" | "CREDIT";
+    reason: string;
+    idempotencyKey: string;
+  }): Promise<{ id: string; status: "PENDING" }> {
+    const body = await this.request("/v1/staff/payments/adjustments", {
+      method: "POST",
+      body: input,
+    });
+    if (
+      !isRecord(body) ||
+      typeof body.id !== "string" ||
+      body.status !== "PENDING"
+    )
+      throw malformedStaff("MALFORMED_PAYMENT_ADJUSTMENT");
+    return { id: body.id, status: "PENDING" };
+  }
+
+  async decideAdjustment(
+    adjustmentId: string,
+    input: { decision: "APPROVE" | "REJECT"; reason: string },
+  ): Promise<{ id: string; status: "APPROVED" | "REJECTED" }> {
+    const body = await this.request(
+      `/v1/staff/payments/adjustments/${encodeURIComponent(adjustmentId)}/decision`,
+      { method: "POST", body: input },
+    );
+    if (
+      !isRecord(body) ||
+      typeof body.id !== "string" ||
+      (body.status !== "APPROVED" && body.status !== "REJECTED")
+    )
+      throw malformedStaff("MALFORMED_PAYMENT_ADJUSTMENT");
+    return { id: body.id, status: body.status };
+  }
+
   private async request(
     path: string,
     options: { method?: string; body?: unknown } = {},
@@ -536,6 +626,15 @@ export class FetchStaffApi implements StaffApi, ProductApi {
     }
     return body;
   }
+}
+
+function arrayOfRecords(
+  value: unknown,
+  code: string,
+): readonly Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.some((item) => !isRecord(item)))
+    throw malformedStaff(code);
+  return value;
 }
 
 function mapAssetSummary(value: unknown): StaffAssetSummary {

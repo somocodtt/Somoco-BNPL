@@ -303,9 +303,27 @@ describe("production document adapters", () => {
         },
       },
     });
+    const payments = boundary.register({
+      kind: "PAYMENTS",
+      provenance: externalProvenance("somoco-payments"),
+      adapter: {
+        async verify() {
+          return {
+            eventId: "event-1",
+            eventType: "PAYMENT_SUCCEEDED" as const,
+            providerTransactionId: "transaction-1",
+            payerPhoneE164: "+233201234567",
+            customerReference: "contract-1",
+            amount: { currency: "GHS" as const, minorUnits: "10000" },
+            occurredAt: checkedAt,
+          };
+        },
+      },
+    });
 
     expect(boundary.require(sms, "SMS")).toBe(sms);
     expect(boundary.require(nia, "NIA")).toBe(nia);
+    expect(boundary.require(payments, "PAYMENTS")).toBe(payments);
     expect(Object.isFrozen(sms)).toBe(true);
     expect(Object.isFrozen(nia)).toBe(true);
     expect(() =>

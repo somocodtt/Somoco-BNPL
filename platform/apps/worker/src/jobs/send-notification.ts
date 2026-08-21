@@ -79,7 +79,9 @@ export function createSendGuarantorInvitationHandler(options: {
         policy.tokenVersion,
       );
       const invitationUrl = new URL(invitationBaseUrl);
-      invitationUrl.hash = new URLSearchParams({ invitation: token }).toString();
+      invitationUrl.hash = new URLSearchParams({
+        invitation: token,
+      }).toString();
       return options.sms.send({
         idempotencyKey: message.id,
         phoneE164: delivery.phoneE164,
@@ -102,6 +104,25 @@ export function createSendNotificationHandler(sms: SmsPort) {
         phoneE164: payload.phoneE164,
         template: payload.template,
         variables: payload.variables,
+      });
+    },
+    [[sms, "SMS"]],
+  );
+}
+
+export function createSendReceiptHandler(sms: SmsPort) {
+  return createOutboxHandler(
+    [sms],
+    async (message: OutboxMessage) => {
+      const payload = receiptPayload(message.payload);
+      return sms.send({
+        idempotencyKey: message.id,
+        phoneE164: payload.phoneE164,
+        template: "PAYMENT_RECEIPT",
+        variables: {
+          receiptLink: payload.receiptLink,
+          ussdInstructions: payload.ussdInstructions,
+        },
       });
     },
     [[sms, "SMS"]],
@@ -255,6 +276,48 @@ function notificationPayload(payload: unknown): {
       Record<string, string>
     >,
   };
+}
+
+function receiptPayload(payload: unknown): {
+  phoneE164: string;
+  receiptLink: string;
+  ussdInstructions: string;
+} {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload))
+    invalidPayload();
+  const candidate = payload as Record<string, unknown>;
+  const phoneE164 = candidate.phoneE164;
+  const variables = candidate.variables;
+  if (
+    typeof phoneE164 !== "string" ||
+    !/^\+[1-9][0-9]{7,14}$/.test(phoneE164) ||
+    typeof variables !== "object" ||
+    variables === null ||
+    Array.isArray(variables)
+  )
+    invalidPayload();
+  const values = variables as Record<string, unknown>;
+  const receiptLink = values.receiptLink;
+  const ussdInstructions = values.ussdInstructions;
+  let url: URL;
+  try {
+    url = new URL(typeof receiptLink === "string" ? receiptLink : "");
+  } catch {
+    invalidPayload();
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    typeof receiptLink !== "string" ||
+    typeof ussdInstructions !== "string" ||
+    ussdInstructions.trim().length === 0 ||
+    ussdInstructions.length > 240
+  )
+    invalidPayload();
+  return { phoneE164, receiptLink, ussdInstructions };
 }
 
 function invalidPayload(): never {

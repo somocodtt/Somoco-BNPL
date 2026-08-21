@@ -14,6 +14,7 @@ import {
 } from "./plugins/request-context.js";
 import { redactedLogPaths, registerSecurity } from "./plugins/security.js";
 import {
+  requireProductionConnector,
   type MalwareScannerPort,
   type NiaPort,
   type ObjectStoragePort,
@@ -57,6 +58,16 @@ import {
 } from "./modules/contracts/service.js";
 import { createHandoverService } from "./modules/contracts/handover-service.js";
 import { registerContractRoutes } from "./modules/contracts/routes.js";
+import {
+  registerPaymentRawBodyParser,
+  registerPaymentRoutes,
+  type PaymentRouteComposition,
+} from "./modules/payments/webhook-routes.js";
+import { createPaymentWebhookService } from "./modules/payments/webhook-service.js";
+import { createLedgerService } from "./modules/payments/ledger-service.js";
+import { createReconciliationService } from "./modules/payments/reconciliation-service.js";
+import { createReceiptService } from "./modules/payments/receipt-service.js";
+import type { PaymentWebhookVerifier } from "@somo/integrations";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -97,6 +108,13 @@ export interface BuildAppOptions {
     template?: ContractTemplateAttestation;
     headOffice?: { id: string; location: string };
   };
+  payments?: {
+    verifier: PaymentWebhookVerifier;
+    allocationPolicy: import("./modules/payments/ledger-service.js").AllocationPolicy;
+    sms: SmsPort;
+    accountLinkBaseUrl: string;
+    ussdInstructions?: string;
+  };
 }
 
 export async function buildApp(
@@ -115,6 +133,7 @@ export async function buildApp(
     throw new Error("PRODUCTION_FIXTURE_GATE_REQUIRED");
   }
   assertProductionIdentityDependencies(config, options.identity);
+  assertProductionPaymentDependencies(config, options.payments);
   const connection =
     options.database === undefined
       ? createDatabase(config.databaseUrl)
@@ -148,6 +167,10 @@ export async function buildApp(
       requestIdLogLabel: "requestId",
     }),
   });
+
+  if (options.payments !== undefined) {
+    await registerPaymentRawBodyParser(app);
+  }
 
   if (connection !== undefined) {
     app.addHook("onClose", async () => {
@@ -286,6 +309,41 @@ export async function buildApp(
     handoverService,
     customerOtp,
   );
+  if (options.payments !== undefined) {
+    const receipts = createReceiptService({
+      database,
+      accountLinkBaseUrl: options.payments.accountLinkBaseUrl,
+      ussdInstructions:
+        options.payments.ussdInstructions ??
+        "Use Somoco's approved USSD payment instructions.",
+    });
+    const ledger = createLedgerService({ database, receipts });
+    const reconciliation = createReconciliationService({ database });
+    const webhook = createPaymentWebhookService({
+      database,
+      verifier: options.payments.verifier,
+      policy: options.payments.allocationPolicy,
+      receipts,
+    });
+    const composition: PaymentRouteComposition = {
+      webhook,
+      ledger,
+      reconciliation,
+      receipts,
+      ussdInstructions:
+        options.payments.ussdInstructions ??
+        "Use Somoco's approved USSD payment instructions.",
+    };
+    await registerPaymentRoutes(
+      app,
+      config,
+      accessService,
+      composition,
+      customerOtp,
+    );
+  } else if (config.environment === "production") {
+    throw new Error("PRODUCTION_PAYMENT_COMPOSITION_REQUIRED");
+  }
   return app;
 }
 
@@ -300,4 +358,18 @@ function assertProductionIdentityDependencies(
     return;
   }
   validateProductionIdentityComposition(identity);
+}
+
+function assertProductionPaymentDependencies(
+  config: AppConfig,
+  payments: BuildAppOptions["payments"],
+): void {
+  const production =
+    config.environment === "production" ||
+    process.env.NODE_ENV === "production";
+  if (!production) return;
+  if (payments === undefined)
+    throw new Error("PRODUCTION_PAYMENT_COMPOSITION_REQUIRED");
+  requireProductionConnector(payments.verifier, "PAYMENTS");
+  requireProductionConnector(payments.sms, "SMS");
 }

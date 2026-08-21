@@ -7,7 +7,7 @@ import "./styles.css";
 const api = new FetchCustomerApi();
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <CustomerRouter api={api} offerApi={api} contractApi={api} />
+    <CustomerRouter api={api} offerApi={api} contractApi={api} paymentsApi={api} />
   </StrictMode>,
 );
 

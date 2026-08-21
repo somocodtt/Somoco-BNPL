@@ -106,6 +106,9 @@ export const paymentTransaction = pgTable(
     provider: paymentProvider("provider").notNull(),
     channel: paymentChannel("channel").notNull(),
     providerTransactionId: text("provider_transaction_id").notNull(),
+    eventId: text("event_id"),
+    eventType: text("event_type"),
+    settlementReference: text("settlement_reference"),
     contractId: uuid("contract_id").references(() => contract.id, {
       onDelete: "restrict",
     }),
@@ -136,10 +139,17 @@ export const paymentTransaction = pgTable(
       table.provider,
       table.providerTransactionId,
     ),
+    uniqueIndex("payment_provider_event_unique")
+      .on(table.provider, table.eventId)
+      .where(sql`${table.eventId} is not null`),
     index("payment_contract_idx").on(table.contractId),
     check("payment_currency_ghs", sql`${table.currency} = 'GHS'`),
     check("payment_amount_nonnegative", sql`${table.amountMinorUnits} >= 0`),
     check("payment_version_positive", sql`${table.version} > 0`),
+    check(
+      "payment_event_type_allowed",
+      sql`${table.eventType} is null or ${table.eventType} in ('PAYMENT_SUCCEEDED', 'PAYMENT_REVERSED', 'PAYMENT_REFUNDED')`,
+    ),
   ],
 );
 
@@ -163,6 +173,7 @@ export const ledgerEntry = pgTable(
       mode: "bigint",
     }).notNull(),
     reversesEntryId: uuid("reverses_entry_id"),
+    allocationPolicyVersion: text("allocation_policy_version"),
     metadata: jsonb("metadata")
       .$type<Record<string, unknown>>()
       .notNull()
@@ -183,6 +194,10 @@ export const ledgerEntry = pgTable(
     check(
       "ledger_balance_nonnegative",
       sql`${table.balanceAfterMinorUnits} >= 0`,
+    ),
+    check(
+      "ledger_policy_version_nonempty",
+      sql`${table.allocationPolicyVersion} is null or length(btrim(${table.allocationPolicyVersion})) > 0`,
     ),
     foreignKey({
       columns: [table.paymentTransactionId, table.contractId],
@@ -225,6 +240,145 @@ export const reconciliationCase = pgTable(
       sql`${table.status} in ('OPEN', 'INVESTIGATING', 'RESOLVED')`,
     ),
     check("reconciliation_case_version_positive", sql`${table.version} > 0`),
+  ],
+);
+
+export const paymentReceipt = pgTable(
+  "payment_receipt",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    paymentTransactionId: uuid("payment_transaction_id")
+      .notNull()
+      .references(() => paymentTransaction.id, { onDelete: "restrict" }),
+    contractId: uuid("contract_id").references(() => contract.id, {
+      onDelete: "restrict",
+    }),
+    receiptNumber: text("receipt_number").notNull(),
+    payerReference: text("payer_reference").notNull(),
+    amountMinorUnits: bigint("amount_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    currency: text("currency").notNull().default("GHS"),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull(),
+    securePath: text("secure_path").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("payment_receipt_transaction_unique").on(
+      table.paymentTransactionId,
+    ),
+    uniqueIndex("payment_receipt_number_unique").on(table.receiptNumber),
+    check(
+      "payment_receipt_amount_positive",
+      sql`${table.amountMinorUnits} > 0`,
+    ),
+    check("payment_receipt_currency_ghs", sql`${table.currency} = 'GHS'`),
+  ],
+);
+
+export const paymentAdjustment = pgTable(
+  "payment_adjustment",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    contractId: uuid("contract_id")
+      .notNull()
+      .references(() => contract.id, { onDelete: "restrict" }),
+    makerStaffUserId: uuid("maker_staff_user_id")
+      .notNull()
+      .references(() => staffUser.id, { onDelete: "restrict" }),
+    checkerStaffUserId: uuid("checker_staff_user_id").references(
+      () => staffUser.id,
+      { onDelete: "restrict" },
+    ),
+    ledgerEntryId: uuid("ledger_entry_id").references(() => ledgerEntry.id, {
+      onDelete: "restrict",
+    }),
+    amountMinorUnits: bigint("amount_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    direction: ledgerDirection("direction").notNull(),
+    reason: text("reason").notNull(),
+    status: text("status").notNull().default("PENDING"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    decisionAt: timestamp("decision_at", { withTimezone: true }),
+    decisionReason: text("decision_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("payment_adjustment_idempotency_unique").on(
+      table.idempotencyKey,
+    ),
+    check(
+      "payment_adjustment_amount_positive",
+      sql`${table.amountMinorUnits} > 0`,
+    ),
+    check(
+      "payment_adjustment_status_allowed",
+      sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,
+    ),
+    check(
+      "payment_adjustment_checker_separate",
+      sql`${table.checkerStaffUserId} is null or ${table.checkerStaffUserId} <> ${table.makerStaffUserId}`,
+    ),
+    check(
+      "payment_adjustment_decision_consistent",
+      sql`${table.status} = 'PENDING' or (${table.checkerStaffUserId} is not null and ${table.decisionAt} is not null)`,
+    ),
+  ],
+);
+
+export const paymentSettlementBatch = pgTable(
+  "payment_settlement_batch",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    provider: paymentProvider("provider").notNull(),
+    settlementReference: text("settlement_reference").notNull(),
+    settlementCurrency: text("settlement_currency").notNull().default("GHS"),
+    providerTotalMinorUnits: bigint("provider_total_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    ledgerTotalMinorUnits: bigint("ledger_total_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    varianceMinorUnits: bigint("variance_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    status: text("status").notNull(),
+    reconciliationCaseId: uuid("reconciliation_case_id").references(
+      () => reconciliationCase.id,
+      { onDelete: "restrict" },
+    ),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull(),
+    reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("payment_settlement_provider_reference_unique").on(
+      table.provider,
+      table.settlementReference,
+    ),
+    check(
+      "payment_settlement_provider_total_nonnegative",
+      sql`${table.providerTotalMinorUnits} >= 0`,
+    ),
+    check(
+      "payment_settlement_ledger_total_nonnegative",
+      sql`${table.ledgerTotalMinorUnits} >= 0`,
+    ),
+    check(
+      "payment_settlement_currency_ghs",
+      sql`${table.settlementCurrency} = 'GHS'`,
+    ),
+    check(
+      "payment_settlement_status_allowed",
+      sql`${table.status} in ('MATCHED', 'VARIANCE', 'PENDING')`,
+    ),
   ],
 );
 

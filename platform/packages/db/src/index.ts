@@ -144,6 +144,11 @@ export { ledgerRepo, type NewLedgerEntry } from "./repositories/ledger.js";
 export {
   paymentRepo,
   type NewPaymentTransaction,
+  type PaymentTransaction,
+  type PaymentReceipt,
+  type ReconciliationCase,
+  type PaymentAdjustment,
+  type PaymentSettlementBatch,
 } from "./repositories/payments.js";
 export { withTransaction, type DatabaseTransaction } from "./transaction.js";
 export { migrateDatabase } from "./schema/migration.js";

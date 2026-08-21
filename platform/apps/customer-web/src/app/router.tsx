@@ -7,12 +7,14 @@ import {
   ContractPanel,
   type ContractApi,
 } from "../features/contract/contract-panel.js";
+import { PaymentPanel } from "../features/payments/payment-panel.js";
 import type {
   ApplicantMutation,
   CustomerApi,
   CustomerSession,
   OnboardingState,
 } from "../lib/api.js";
+import type { CustomerPaymentsApi } from "../lib/api.js";
 import { SafeMutationQueue } from "../lib/offline-queue.js";
 
 export function CustomerRouter({
@@ -21,12 +23,14 @@ export function CustomerRouter({
   initialPhoneE164 = null,
   offerApi,
   contractApi,
+  paymentsApi,
 }: {
   api: CustomerApi;
   initialSession?: CustomerSession | null;
   initialPhoneE164?: string | null;
   offerApi?: OfferApi;
   contractApi?: ContractApi;
+  paymentsApi?: CustomerPaymentsApi;
 }) {
   const [session, setSession] = useState(initialSession);
   const [phoneE164, setPhoneE164] = useState(initialPhoneE164);
@@ -186,6 +190,7 @@ export function CustomerRouter({
             applicationId={loadedState.draft!.id}
           />
         ) : null}
+        {paymentsApi !== undefined ? <PaymentPanel api={paymentsApi} /> : null}
       </>
     );
   }

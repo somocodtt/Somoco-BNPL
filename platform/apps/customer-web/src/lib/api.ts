@@ -126,9 +126,45 @@ export interface CustomerApi {
   ): Promise<DraftSummary>;
 }
 
+export interface CustomerPaymentInstructions {
+  channel: "USSD_MOBILE_MONEY";
+  ussdInstructions: string;
+  cashAccepted: false;
+}
+
+export interface CustomerPaymentRecord {
+  id: string;
+  providerTransactionId: string;
+  amountMinorUnits: string;
+  currency: "GHS";
+  status: string;
+  occurredAt: string;
+  contractReference: string | null;
+  outstandingBalanceMinorUnits: string | null;
+  nextDueDate: string | null;
+}
+
+export interface CustomerReceiptRecord {
+  id: string;
+  receiptNumber: string;
+  paymentTransactionId: string;
+  amountMinorUnits: string;
+  currency: "GHS";
+  issuedAt: string;
+  securePath: string;
+}
+
+export interface CustomerPaymentsApi {
+  getPaymentInstructions(): Promise<CustomerPaymentInstructions>;
+  getPayments(): Promise<readonly CustomerPaymentRecord[]>;
+  getReceipts(): Promise<readonly CustomerReceiptRecord[]>;
+}
+
 import type { CustomerOffer, OfferApi } from "../features/offer/offer-panel.js";
 
-export class FetchCustomerApi implements CustomerApi, OfferApi, ContractApi {
+export class FetchCustomerApi
+  implements CustomerApi, CustomerPaymentsApi, OfferApi, ContractApi
+{
   #sessionToken: string | null = null;
   #offerVersions = new Map<string, number>();
 
@@ -328,6 +364,18 @@ export class FetchCustomerApi implements CustomerApi, OfferApi, ContractApi {
         body: JSON.stringify(input),
       },
     );
+  }
+
+  getPaymentInstructions(): Promise<CustomerPaymentInstructions> {
+    return this.request("/v1/customer/payment-instructions");
+  }
+
+  getPayments(): Promise<readonly CustomerPaymentRecord[]> {
+    return this.request("/v1/customer/payments");
+  }
+
+  getReceipts(): Promise<readonly CustomerReceiptRecord[]> {
+    return this.request("/v1/customer/receipts");
   }
 
   async getContract(
