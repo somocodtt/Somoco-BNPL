@@ -381,7 +381,7 @@ function assertOfferDisclosure(input: {
     typeof input.disclosureVersion !== "string" ||
     input.disclosureVersion.trim().length === 0 ||
     !isRecord(input.disclosureContent) ||
-    !isRecord(input.permittedFees) ||
+    !isApprovedFeePolicy(input.permittedFees) ||
     typeof input.disclosureHash !== "string" ||
     !/^[0-9a-f]{64}$/.test(input.disclosureHash)
   ) {
@@ -403,6 +403,14 @@ function assertOfferDisclosure(input: {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isApprovedFeePolicy(value: unknown): value is Record<string, unknown> {
+  try {
+    return isRecord(value) && Object.getPrototypeOf(value) === Object.prototype && Object.keys(value).length === 0;
+  } catch {
+    return false;
+  }
 }
 
 function serializeTerms(input: {

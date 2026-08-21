@@ -10,6 +10,10 @@ import type {
  * amount cannot accidentally make a route's JSON response unserialisable.
  */
 export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unknown> {
+  assertApprovedFeePolicy(rule.permittedFees);
+  if (rule.gateStatus !== "OPEN" && rule.gateStatus !== "CLOSED") {
+    throw new Error("RULE_GATE_STATUS_REQUIRED");
+  }
   return {
     id: rule.id,
     productId: rule.productId,
@@ -40,7 +44,7 @@ export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unkn
     effectiveUntil: rule.effectiveUntil?.toISOString() ?? null,
     publishedAt: rule.publishedAt?.toISOString() ?? null,
     status: rule.approved && rule.publishedAt !== null ? "PUBLISHED" : "DRAFT",
-    gate: rule.gateStatus ?? "CLOSED",
+    gate: rule.gateStatus,
   };
 }
 
@@ -72,6 +76,7 @@ export function serializeExceptionDto(exception: ExceptionRecord): Record<string
 
 export function serializeOfferDto(offer: OfferRecord): Record<string, unknown> {
   const terms = offer.offerVersion?.terms ?? {};
+  assertApprovedFeePolicy(terms.fees);
   const installments = Array.isArray(terms.installments)
     ? terms.installments.map((item) => serializeInstallment(item))
     : [];
@@ -101,7 +106,7 @@ export function serializeOfferDto(offer: OfferRecord): Record<string, unknown> {
     tenureMonths: numberValue(terms.tenureMonths),
     method: stringValue(terms.method),
     rateBasisPoints: numberValue(terms.rateBasisPoints),
-    fees: isRecord(terms.fees) ? terms.fees : {},
+    fees: terms.fees,
     disclosureVersion: stringValue(terms.disclosureVersion) ?? offer.disclosedVersion,
     disclosureContent: isRecord(terms.disclosureContent) ? terms.disclosureContent : null,
     installments,
@@ -134,4 +139,15 @@ function numberValue(value: unknown): number | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertApprovedFeePolicy(value: unknown): asserts value is Record<string, unknown> {
+  try {
+    if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.keys(value).length > 0) {
+      throw new Error("FEES_POLICY_INVALID");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "FEES_POLICY_INVALID") throw error;
+    throw new Error("FEES_POLICY_INVALID");
+  }
 }

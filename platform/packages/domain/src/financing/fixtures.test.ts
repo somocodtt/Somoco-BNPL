@@ -3,6 +3,7 @@ import {
   FinanceApprovalGate,
   canonicalizeJson,
   hashWorkedExample,
+  isProductionFinanceApprovalGate,
   isTrustedFinanceApprovalGate,
   type WorkedExampleFixture,
 } from "./fixtures.js";
@@ -80,5 +81,16 @@ describe("finance fixture provenance and canonicalization", () => {
     expect(() => canonicalizeJson({ amount: Number.NaN })).toThrow("CANONICAL_JSON_VALUE_INVALID");
     expect(() => canonicalizeJson({ amount: Number.POSITIVE_INFINITY })).toThrow("CANONICAL_JSON_VALUE_INVALID");
     expect(() => canonicalizeJson({ amount: BigInt(1) })).toThrow("CANONICAL_JSON_VALUE_INVALID");
+  });
+
+  it("does not trust an overridable production marker on a gate instance or proxy", () => {
+    const testingGate = FinanceApprovalGate.forTesting();
+    const productionGate = FinanceApprovalGate.production();
+    expect(() => Object.defineProperty(testingGate, "isProduction", { value: true })).toThrow();
+    expect(() => Object.defineProperty(FinanceApprovalGate.prototype, "isProduction", { value: true })).toThrow();
+    expect(isProductionFinanceApprovalGate(testingGate)).toBe(false);
+    expect(isProductionFinanceApprovalGate(productionGate)).toBe(true);
+    expect(isTrustedFinanceApprovalGate(new Proxy(productionGate, {}))).toBe(false);
+    expect(isProductionFinanceApprovalGate(new Proxy(productionGate, {}))).toBe(false);
   });
 });

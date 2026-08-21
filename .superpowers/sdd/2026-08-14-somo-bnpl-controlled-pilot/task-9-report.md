@@ -72,3 +72,14 @@ The real-PG suite now also includes concurrent same-window publishes (one winner
 - Final focused non-PG counts: domain 4/4, API 6/6, customer 7/7, staff 6/6.
 - Final no-emit TypeScript and package builds passed for domain, db, api, customer-web, and staff-web. API/db/customer/staff lint passed; the pre-existing domain-wide lint command still reports unrelated `schedule.ts` unused-import/prefer-const errors, while the changed fixture files lint clean. Staff's package script references a non-existent `test` directory, so its equivalent `eslint src` check passed.
 - `git diff --check` passed with only Git LF/CRLF warnings. Real-PG products/HTTP and fresh/repeat/populated migration execution was not possible here because `TEST_DATABASE_URL` is absent; controller verification is required before deployment.
+
+## Reviewer-hardening round 3 — sealed approval gate and computed status
+
+| Boundary | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Domain gate attestation | `vitest run src/financing/fixtures.test.ts` failed 1/5: a frozen-mode override test could define the former public `isProduction` marker. | Same focused file passes 5/5 after private WeakMap mode attestation, frozen gate instances/prototype, and proxy/override rejection. |
+| API fee/status boundary | Focused DTO/status command failed 6 tests: malformed/null/unapproved fees were accepted/coerced, missing gate status defaulted closed, and `ruleGateStatus` was not exported. | Same command passes 7/7. Rule/offer DTOs reject invalid fee policies and missing computed status; status closes legacy-null, array, and unapproved fees and opens the valid synthetic test rule. |
+| HTTP/customer regression | — | Staff focused financing/product/approval tests pass 10/10; customer financing/offer tests pass 7/7. |
+| Static verification | API no-emit check initially exposed only test tuple typing errors, fixed before production verification. | Domain and API `tsc -p tsconfig.json --noEmit` pass; product validation tests pass 5/5; `git diff --check` passes. |
+
+Production build validation now reads the module-private attested mode instead of an overridable property. Publishing reloads the persisted rule and attaches its computed gate status to the return value, replay response, and command/outbox payload. No schema, dependency, or commercial fixture changes were made; real-PostgreSQL and migration checks remain controller-owned because `TEST_DATABASE_URL` is absent in this worktree.

@@ -105,7 +105,7 @@ export function createProductService(options: {
         input.disclosureContent,
         input.disclosureHash,
       );
-      if (input.permittedFees !== undefined && Object.keys(input.permittedFees).length > 0) {
+      if (input.permittedFees !== undefined && !isApprovedFeePolicy(input.permittedFees)) {
         throw new AppError(400, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
       }
       if (
@@ -196,7 +196,7 @@ export function createProductService(options: {
         if (existing.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
         const rule = await financingRepo(options.database).findRule(input.ruleId);
         if (rule === null) throw new AppError(404, "RULE_NOT_FOUND", "Rule not found.");
-        return rule;
+        return withGateStatus(rule, fixtureGate);
       }
       try {
         return await withTransaction(options.database, async (tx) => {
@@ -218,7 +218,7 @@ export function createProductService(options: {
             draft.disclosureHash ?? undefined,
             403,
           );
-          if (Object.keys(draft.permittedFees).length > 0) {
+          if (!isApprovedFeePolicy(draft.permittedFees)) {
             throw new AppError(403, "FEES_NOT_APPROVED", "Fees require an approved fee schedule.");
           }
           const fixtures = draft.repaymentFrequencies.flatMap((frequency) =>
@@ -250,7 +250,7 @@ export function createProductService(options: {
             if (typeof replayId !== "string") throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is invalid.");
             const replay = await repo.findRule(replayId);
             if (replay === null) throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved rule is missing.");
-            return replay;
+            return withGateStatus(replay, fixtureGate);
           }
           const published = await repo.publishRule({
             ruleId: input.ruleId,
@@ -258,16 +258,19 @@ export function createProductService(options: {
             effectiveFrom,
             ...(effectiveUntil === undefined ? {} : { effectiveUntil }),
           });
-          const response = serializeRule(published);
+          const reloaded = await repo.findRule(published.id);
+          if (reloaded === null) throw new AppError(409, "RULE_PUBLISH_RELOAD_FAILED", "The published rule could not be reloaded.");
+          const publishedWithGate = withGateStatus(reloaded, fixtureGate);
+          const response = serializeRule(publishedWithGate);
           await repo.updateCommandResponse(scope, input.idempotencyKey, response);
           await appendAuditEvent(tx, {
             aggregateType: "financing_rule_version",
-            aggregateId: published.id,
+            aggregateId: publishedWithGate.id,
             action: "FINANCING_RULE_PUBLISHED",
             actorStaffUserId: input.actor.staffUserId,
             requestId: input.requestId,
             data: {
-              versionNumber: published.versionNumber,
+              versionNumber: publishedWithGate.versionNumber,
               fixtureHashes: fixtures.map((fixture) => fixture.canonicalHash),
             },
             occurredAt: new Date(),
@@ -280,7 +283,7 @@ export function createProductService(options: {
             payload: response,
             occurredAt: new Date(),
           });
-          return published;
+          return publishedWithGate;
         });
       } catch (error) {
         const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
@@ -288,7 +291,7 @@ export function createProductService(options: {
           const ruleId = raced.response["id"];
           if (typeof ruleId === "string") {
             const replay = await financingRepo(options.database).findRule(ruleId);
-            if (replay !== null) return replay;
+            if (replay !== null) return withGateStatus(replay, fixtureGate);
           }
         }
         throw mapDatabaseError(error, "RULE_PUBLISH_FAILED");
@@ -312,11 +315,11 @@ export function createProductService(options: {
   };
 }
 
-function ruleGateStatus(
+export function ruleGateStatus(
   rule: FinancingRuleRecord,
   gate: FinanceApprovalGate,
 ): "OPEN" | "CLOSED" {
-  if (!rule.licencePermitted || rule.fixtureHashes.length === 0) return "CLOSED";
+  if (!rule.licencePermitted || rule.fixtureHashes.length === 0 || !isApprovedFeePolicy(rule.permittedFees)) return "CLOSED";
   try {
     validateDisclosure(
       rule.disclosureVersion ?? "",
@@ -401,6 +404,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isApprovedFeePolicy(value: unknown): value is Record<string, unknown> {
+  try {
+    return isRecord(value) && Object.getPrototypeOf(value) === Object.prototype && Object.keys(value).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+function withGateStatus(rule: FinancingRuleRecord, gate: FinanceApprovalGate): FinancingRuleRecord {
+  return { ...rule, gateStatus: ruleGateStatus(rule, gate) };
+}
+
 function hashPayload(value: unknown): string {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
@@ -419,6 +434,7 @@ function serializeRule(rule: FinancingRuleRecord): Record<string, unknown> {
     method: rule.calculationMethod,
     fixtureHashes: rule.fixtureHashes,
     effectiveFrom: rule.effectiveFrom?.toISOString() ?? null,
+    gateStatus: rule.gateStatus,
   };
 }
 

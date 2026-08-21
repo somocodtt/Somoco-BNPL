@@ -44,10 +44,10 @@ export function canonicalizeJson(value: unknown): string {
 
 const GATE_CONSTRUCTOR_TOKEN = Symbol("finance-approval-gate");
 const GATE_BRANDS = new WeakSet<FinanceApprovalGate>();
+const GATE_MODES = new WeakMap<FinanceApprovalGate, boolean>();
 
 export class FinanceApprovalGate {
   readonly #fixtures = new Map<string, WorkedExampleFixture>();
-  readonly #production: boolean;
 
   private constructor(
     fixtures: readonly WorkedExampleFixture[],
@@ -57,9 +57,10 @@ export class FinanceApprovalGate {
     if (token !== GATE_CONSTRUCTOR_TOKEN) {
       throw new Error("FINANCE_GATE_BRAND_INVALID");
     }
-    this.#production = production;
     GATE_BRANDS.add(this);
+    GATE_MODES.set(this, production);
     for (const fixture of fixtures) this.#register(fixture);
+    Object.freeze(this);
   }
 
   static production(
@@ -85,10 +86,6 @@ export class FinanceApprovalGate {
     return this.#fixtures.size;
   }
 
-  get isProduction(): boolean {
-    return this.#production;
-  }
-
   find(key: FixtureKey): WorkedExampleFixture | null {
     return this.#fixtures.get(fixtureKey(key)) ?? null;
   }
@@ -109,17 +106,23 @@ export class FinanceApprovalGate {
     if (hashWorkedExample(unsigned) !== canonicalHash) {
       throw new Error("FIXTURE_HASH_INVALID");
     }
-    if (this.#production && fixture.synthetic) {
+    if (GATE_MODES.get(this) === true && fixture.synthetic) {
       throw new Error("SYNTHETIC_FIXTURE_FORBIDDEN");
     }
     this.#fixtures.set(fixtureKey(fixture), deepFreeze(deepClone(fixture)));
   }
 }
 
+Object.freeze(FinanceApprovalGate.prototype);
+
 export function isTrustedFinanceApprovalGate(
   value: unknown,
 ): value is FinanceApprovalGate {
   return typeof value === "object" && value !== null && GATE_BRANDS.has(value as FinanceApprovalGate);
+}
+
+export function isProductionFinanceApprovalGate(value: unknown): value is FinanceApprovalGate {
+  return isTrustedFinanceApprovalGate(value) && GATE_MODES.get(value) === true;
 }
 
 export function validateFixture(fixture: WorkedExampleFixture): void {
