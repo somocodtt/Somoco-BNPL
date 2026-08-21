@@ -46,11 +46,9 @@ export function createReceiptService(options: {
         tx: DatabaseTransaction,
       ): Promise<PaymentReceipt> => {
         const repo = paymentRepo(tx);
-        const existing = await repo.findReceipt(input.payment.id);
-        if (existing !== null) return existing;
         const issuedAt = input.now ?? new Date();
         const receiptId = randomUUID();
-        const receipt = await repo.issueReceipt({
+        const issued = await repo.issueReceiptIfAbsent({
           id: receiptId,
           paymentTransactionId: input.payment.id,
           ...(input.payment.contractId === null
@@ -63,6 +61,8 @@ export function createReceiptService(options: {
           issuedAt,
           securePath: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(receiptId)}`,
         });
+        if (!issued.inserted) return issued.receipt;
+        const receipt = issued.receipt;
         await enqueueOutbox(tx, {
           id: randomUUID(),
           topic: "payments.receipt_sms_requested",
@@ -74,7 +74,7 @@ export function createReceiptService(options: {
             phoneE164: input.payment.payerReference,
             template: "PAYMENT_RECEIPT",
             variables: {
-              receiptLink: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(receiptId)}`,
+              receiptLink: `${accountLinkBaseUrl}/receipts/${encodeURIComponent(receipt.id)}`,
               ussdInstructions,
             },
           },

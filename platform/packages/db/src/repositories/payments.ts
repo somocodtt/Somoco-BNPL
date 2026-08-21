@@ -57,6 +57,32 @@ export function paymentRepo(db: DatabaseTransaction) {
       await persistWriteEffects(db, effects);
       return inserted;
     },
+    async insertIfAbsent(
+      input: NewPaymentTransaction,
+      effects: WriteEffects,
+    ): Promise<{ payment: PaymentTransaction; inserted: boolean }> {
+      const [inserted] = await executor
+        .insert(paymentTransaction)
+        .values(input)
+        .onConflictDoNothing({
+          target: [
+            paymentTransaction.provider,
+            paymentTransaction.providerTransactionId,
+          ],
+        })
+        .returning();
+      if (inserted !== undefined) {
+        await persistWriteEffects(db, effects);
+        return { payment: inserted, inserted: true };
+      }
+      const existing = await this.findByProviderTransaction(
+        input.provider,
+        input.providerTransactionId,
+      );
+      if (existing === null)
+        throw new Error("PAYMENT_TRANSACTION_DEDUPLICATION_FAILED");
+      return { payment: existing, inserted: false };
+    },
     async findByProviderTransaction(
       provider: string,
       providerTransactionId: string,
@@ -498,19 +524,24 @@ export function paymentRepo(db: DatabaseTransaction) {
         .limit(1);
       return row ?? null;
     },
-    async issueReceipt(
+    async issueReceiptIfAbsent(
       input: typeof paymentReceipt.$inferInsert,
-    ): Promise<PaymentReceipt> {
+    ): Promise<{ receipt: PaymentReceipt; inserted: boolean }> {
       const [inserted] = await executor
         .insert(paymentReceipt)
         .values(input)
         .onConflictDoNothing({ target: paymentReceipt.paymentTransactionId })
         .returning();
-      if (inserted !== undefined) return inserted;
+      if (inserted !== undefined) return { receipt: inserted, inserted: true };
       const existing = await this.findReceipt(input.paymentTransactionId);
       if (existing === null)
         throw new Error("PAYMENT_RECEIPT_DEDUPLICATION_FAILED");
-      return existing;
+      return { receipt: existing, inserted: false };
+    },
+    async issueReceipt(
+      input: typeof paymentReceipt.$inferInsert,
+    ): Promise<PaymentReceipt> {
+      return (await this.issueReceiptIfAbsent(input)).receipt;
     },
     async createAdjustment(
       input: typeof paymentAdjustment.$inferInsert,

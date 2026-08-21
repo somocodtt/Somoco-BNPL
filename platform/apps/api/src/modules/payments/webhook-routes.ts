@@ -212,12 +212,14 @@ export async function registerPaymentRoutes(
     "/v1/staff/payments/settlements/compare",
     { preHandler: staffMutation, schema: settlementComparisonSchema },
     async (request, reply) => {
-      assertFinanceRead(requireStaffPrincipal(request));
+      const actor = requireStaffPrincipal(request);
+      assertFinanceRead(actor);
       return reply.send(
         await composition.reconciliation.compareSettlement({
           settlementReference: request.body.settlementReference,
           provider: "SOMOCO_PAYMENTS",
           providerTotalMinorUnits: BigInt(request.body.providerTotalMinorUnits),
+          actor,
         }),
       );
     },

@@ -15,6 +15,7 @@ import {
   product,
   vehicleModel,
 } from "../../../packages/db/src/schema/products.js";
+import { paymentTransaction } from "../../../packages/db/src/schema/payments.js";
 import { person } from "../../../packages/db/src/schema/privacy.js";
 import {
   staffRoleAssignment,
@@ -30,14 +31,19 @@ import { sql } from "../../../packages/db/node_modules/drizzle-orm/index.js";
 import { buildApp } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
 import { resetTestDatabase } from "../../../packages/testkit/src/index.js";
+import { createPaymentWebhookService } from "../src/modules/payments/webhook-service.js";
 import {
-  createPaymentWebhookService,
+  allocationPolicyWorkedExample,
+  createAllocationPolicyApproval,
+  createLedgerService,
   type AllocationPolicy,
-} from "../src/modules/payments/webhook-service.js";
-import { createLedgerService } from "../src/modules/payments/ledger-service.js";
+} from "../src/modules/payments/ledger-service.js";
 import { createReconciliationService } from "../src/modules/payments/reconciliation-service.js";
 import { createReceiptService } from "../src/modules/payments/receipt-service.js";
-import type { CustomerPrincipal } from "../src/modules/access/policy.js";
+import type {
+  CustomerPrincipal,
+  StaffPrincipal,
+} from "../src/modules/access/policy.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (databaseUrl === undefined) throw new Error("TEST_DATABASE_URL is required");
@@ -86,22 +92,11 @@ function verifierFor(
 }
 
 function policy(): AllocationPolicy {
-  return {
-    version: "finance-policy-v1",
-    policyHash: "a".repeat(64),
-    workedExampleHash: "b".repeat(64),
+  return createAllocationPolicyApproval({
     financeApprovedBy: "finance-approver-1",
     complianceApprovedBy: "compliance-approver-1",
-    approvedBy: "finance-approver-1",
     approvedAt: "2026-08-01T00:00:00.000Z",
-    decide: ({ amountMinorUnits }) => ({
-      outcome: amountMinorUnits === 10_000n ? "MATCHED" : "QUARANTINED",
-      allocations: [],
-      ...(amountMinorUnits === 10_000n
-        ? {}
-        : { reason: "AMOUNT_REQUIRES_RECONCILIATION" }),
-    }),
-  };
+  });
 }
 
 describe("Somoco payment boundary", () => {
@@ -230,19 +225,19 @@ describe("Somoco payment boundary", () => {
   });
 
   it("rolls back inbox and payment work together when posting fails", async () => {
-    const contractReference = (await insertContractGraph(database)).reference;
+    const graph = await insertContractGraph(database);
+    await getInternalDatabase(database).execute(sql`
+      update contract
+         set outstanding_balance_minor_units = 5000
+       where id = ${graph.contractId}
+    `);
     const service = createPaymentWebhookService({
       database,
       verifier: verifierFor(async () => ({
         ...event,
-        customerReference: contractReference,
+        customerReference: graph.reference,
       })),
-      policy: {
-        ...policy(),
-        decide: () => {
-          throw new Error("POSTING_FAILURE");
-        },
-      },
+      policy: policy(),
     });
     await expect(
       service.receive({
@@ -250,7 +245,7 @@ describe("Somoco payment boundary", () => {
         signature: "sig",
         requestTimestamp: "2026-08-21T12:00:00.000Z",
       }),
-    ).rejects.toThrow("POSTING_FAILURE");
+    ).rejects.toThrow("CONTRACT_BALANCE_EXCEEDED");
     expect(
       (
         await getInternalDatabase(database).execute<{ count: number }>(
@@ -265,6 +260,138 @@ describe("Somoco payment boundary", () => {
         )
       ).rows[0]?.count,
     ).toBe(0);
+  });
+
+  it("rejects a persisted allocation worked example whose canonical hash no longer matches", async () => {
+    const graph = await insertContractGraph(database);
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set worked_example = '{"tampered":true}'::jsonb
+       where version = 'finance-policy-v1'
+    `);
+    const matchedPolicy = policy();
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        customerReference: graph.reference,
+      })),
+      policy: matchedPolicy,
+    });
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("tampered-policy")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("ALLOCATION_POLICY_NOT_APPROVED");
+  });
+
+  it("rejects caller-supplied executable allocation behavior", async () => {
+    const graph = await insertContractGraph(database);
+    const injected = {
+      ...policy(),
+      decide: () => ({ outcome: "MATCHED", allocations: [] }),
+    } as unknown as AllocationPolicy;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        customerReference: graph.reference,
+      })),
+      policy: injected,
+    });
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("injected-policy")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toThrow("ALLOCATION_POLICY_INVALID");
+  });
+
+  it("returns one stable result for concurrent events sharing a provider transaction id", async () => {
+    const graph = await insertContractGraph(database);
+    let sequence = 0;
+    const matchedPolicy = policy();
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => {
+        sequence += 1;
+        return {
+          ...event,
+          eventId: `evt-same-provider-${sequence}`,
+          providerTransactionId: "txn-same-provider",
+          customerReference: graph.reference,
+        };
+      }),
+      policy: matchedPolicy,
+    });
+    const results = await Promise.all([
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("same-provider-1")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("same-provider-2")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results[0]?.paymentTransactionId).toBe(
+      results[1]?.paymentTransactionId,
+    );
+    expect(results[0]?.outcome).toBe("POSTED");
+    expect(results[1]?.outcome).toBe("POSTED");
+    expect(results.map((result) => result.duplicate).sort()).toEqual([
+      false,
+      true,
+    ]);
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ count: number }>(
+          sql`select count(*)::int as count from payment_transaction`,
+        )
+      ).rows[0]?.count,
+    ).toBe(1);
+  });
+
+  it("acknowledges a posted replay even after the allocation policy is revoked", async () => {
+    const graph = await insertContractGraph(database);
+    const matchedPolicy = policy();
+    let replay = false;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: replay ? "evt-revoked-replay" : event.eventId,
+        customerReference: graph.reference,
+      })),
+      policy: matchedPolicy,
+    });
+    const first = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("revoked-first")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    await getInternalDatabase(database).execute(sql`
+      update payment_allocation_policy
+         set status = 'REVOKED'
+       where version = 'finance-policy-v1'
+    `);
+    replay = true;
+    const repeated = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("revoked-replay")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    expect(repeated).toMatchObject({
+      accepted: true,
+      outcome: "POSTED",
+      paymentTransactionId: first.paymentTransactionId,
+    });
   });
 
   it("requires an approved allocation policy and exposes immutable ledger/reconciliation services", async () => {
@@ -287,13 +414,7 @@ describe("Somoco payment boundary", () => {
 
   it("posts one exact matched payment, issues one receipt, and reconciles the deposit gate", async () => {
     const graph = await insertContractGraph(database);
-    const matchedPolicy: AllocationPolicy = {
-      ...policy(),
-      decide: ({ amountMinorUnits, installments }) => ({
-        outcome: "MATCHED",
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
-    };
+    const matchedPolicy = policy();
     const service = createPaymentWebhookService({
       database,
       verifier: verifierFor(async () => ({
@@ -341,15 +462,9 @@ describe("Somoco payment boundary", () => {
         ...event,
         customerReference: graph.reference,
         eventId: "evt-quarantine-1",
+        amount: { currency: "GHS", minorUnits: "5000" },
       })),
-      policy: {
-        ...policy(),
-        decide: () => ({
-          outcome: "QUARANTINED",
-          allocations: [],
-          reason: "AMOUNT_REQUIRES_RECONCILIATION",
-        }),
-      },
+      policy: policy(),
     });
     const result = await service.receive({
       rawBody: new Uint8Array(Buffer.from("quarantine")),
@@ -379,13 +494,7 @@ describe("Somoco payment boundary", () => {
 
   it("links reversal compensation to the original immutable ledger entry", async () => {
     const graph = await insertContractGraph(database);
-    const matchedPolicy: AllocationPolicy = {
-      ...policy(),
-      decide: ({ amountMinorUnits, installments }) => ({
-        outcome: "MATCHED",
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
-    };
+    const matchedPolicy = policy();
     let reversal = false;
     const service = createPaymentWebhookService({
       database,
@@ -512,12 +621,20 @@ describe("Somoco payment boundary", () => {
   });
 
   it("persists matched and variance settlement cases", async () => {
+    const staffUserId = await insertStaff(database, "FINANCE_OFFICER");
+    const actor: StaffPrincipal = {
+      kind: "staff",
+      staffUserId,
+      roles: ["FINANCE_OFFICER"],
+      sessionId: randomUUID(),
+    };
     const reconciliation = createReconciliationService({ database });
     await expect(
       reconciliation.compareSettlement({
         settlementReference: "settle-empty",
         provider: "SOMOCO_PAYMENTS",
         providerTotalMinorUnits: 0n,
+        actor,
       }),
     ).resolves.toMatchObject({ status: "MATCHED", varianceMinorUnits: "0" });
     await expect(
@@ -525,6 +642,7 @@ describe("Somoco payment boundary", () => {
         settlementReference: "settle-variance",
         provider: "SOMOCO_PAYMENTS",
         providerTotalMinorUnits: 1000n,
+        actor,
       }),
     ).resolves.toMatchObject({
       status: "VARIANCE",
@@ -535,6 +653,7 @@ describe("Somoco payment boundary", () => {
       settlementReference: "settle-variance",
       provider: "SOMOCO_PAYMENTS",
       providerTotalMinorUnits: 1000n,
+      actor,
     });
     expect(repeated).toEqual(
       expect.objectContaining({
@@ -548,6 +667,7 @@ describe("Somoco payment boundary", () => {
           settlementReference: "settle-variance",
           provider: "SOMOCO_PAYMENTS",
           providerTotalMinorUnits: 1000n,
+          actor,
         })
       ).id,
     );
@@ -564,14 +684,7 @@ describe("Somoco payment boundary", () => {
     const graph = await insertContractGraph(database);
     const unpersisted = {
       ...policy(),
-      version: "unpersisted-policy-v9",
-      decide: ({
-        amountMinorUnits,
-        installments,
-      }: Parameters<AllocationPolicy["decide"]>[0]) => ({
-        outcome: "MATCHED" as const,
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
+      approvedAt: "2026-08-02T00:00:00.000Z",
     } as AllocationPolicy;
     const service = createPaymentWebhookService({
       database,
@@ -593,13 +706,7 @@ describe("Somoco payment boundary", () => {
 
   it("serializes concurrent payment postings on the contract and installment rows", async () => {
     const graph = await insertContractGraph(database);
-    const matchedPolicy: AllocationPolicy = {
-      ...policy(),
-      decide: ({ amountMinorUnits, installments }) => ({
-        outcome: "MATCHED",
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
-    };
+    const matchedPolicy = policy();
     let sequence = 0;
     const service = createPaymentWebhookService({
       database,
@@ -610,7 +717,7 @@ describe("Somoco payment boundary", () => {
           eventId: `evt-concurrent-${sequence}`,
           providerTransactionId: `txn-concurrent-${sequence}`,
           customerReference: graph.reference,
-          amount: { currency: "GHS", minorUnits: "60000" },
+          amount: { currency: "GHS", minorUnits: "100000" },
         };
       }),
       policy: matchedPolicy,
@@ -629,10 +736,16 @@ describe("Somoco payment boundary", () => {
     ]);
     expect(
       results.filter((result) => result.status === "fulfilled"),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
     expect(
       results.filter((result) => result.status === "rejected"),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
+    expect(
+      results
+        .filter((result) => result.status === "fulfilled")
+        .map((result) => result.value.outcome)
+        .sort(),
+    ).toEqual(["POSTED", "QUARANTINED"]);
     expect(
       (
         await getInternalDatabase(database).execute<{
@@ -643,18 +756,12 @@ describe("Somoco payment boundary", () => {
           sql`select c.outstanding_balance_minor_units::text as balance, i.paid_minor_units::text as paid, (select count(*)::int from ledger_entry l where l.contract_id = c.id and l.entry_type = 'REPAYMENT') as entries from contract c join installment i on i.contract_id = c.id where c.id = ${graph.contractId}`,
         )
       ).rows[0],
-    ).toEqual({ balance: "40000", paid: "60000", entries: 1 });
+    ).toEqual({ balance: "0", paid: "100000", entries: 1 });
   });
 
   it("fails closed when the canonical payment channel is missing or invalid", async () => {
     const graph = await insertContractGraph(database);
-    const matchedPolicy: AllocationPolicy = {
-      ...policy(),
-      decide: ({ amountMinorUnits, installments }) => ({
-        outcome: "MATCHED",
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
-    };
+    const matchedPolicy = policy();
     const invalidChannel = {
       ...event,
       eventId: "evt-invalid-channel",
@@ -704,13 +811,7 @@ describe("Somoco payment boundary", () => {
 
   it("returns an authenticated receipt detail only to its customer", async () => {
     const graph = await insertContractGraph(database);
-    const matchedPolicy: AllocationPolicy = {
-      ...policy(),
-      decide: ({ amountMinorUnits, installments }) => ({
-        outcome: "MATCHED",
-        allocations: [{ installmentId: installments[0]!.id, amountMinorUnits }],
-      }),
-    };
+    const matchedPolicy = policy();
     const service = createPaymentWebhookService({
       database,
       verifier: verifierFor(async () => ({
@@ -761,6 +862,86 @@ describe("Somoco payment boundary", () => {
     ).resolves.toBeNull();
   });
 
+  it("issues one persisted receipt and one receipt notification under concurrency", async () => {
+    const graph = await insertContractGraph(database);
+    const paymentId = randomUUID();
+    const payment = await getInternalDatabase(database)
+      .insert(paymentTransaction)
+      .values({
+        id: paymentId,
+        provider: "SOMOCO_PAYMENTS",
+        channel: "USSD",
+        providerTransactionId: `txn-receipt-concurrent-${paymentId}`,
+        eventId: `evt-receipt-concurrent-${paymentId}`,
+        eventType: "PAYMENT_SUCCEEDED",
+        contractId: graph.contractId,
+        payerReference: "+233201234567",
+        currency: "GHS",
+        amountMinorUnits: 10_000n,
+        status: "POSTED",
+        providerPayload: { channel: "USSD" },
+        occurredAt: new Date(event.occurredAt),
+      })
+      .returning()
+      .then(([row]) => row!);
+    const receipts = createReceiptService({
+      database,
+      accountLinkBaseUrl: "https://customer.somo.example/account",
+      ussdInstructions: "Dial *123# and select Somoco Payments.",
+    });
+    const [first, second] = await Promise.all([
+      receipts.issue({ payment }),
+      receipts.issue({ payment }),
+    ]);
+    expect(first.id).toBe(second.id);
+    expect(first.securePath).toContain(`/receipts/${first.id}`);
+    expect(second.securePath).toContain(`/receipts/${first.id}`);
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ count: number }>(
+          sql`select count(*)::int as count from outbox_message where topic = 'payments.receipt_sms_requested' and aggregate_id = ${first.id}`,
+        )
+      ).rows[0]?.count,
+    ).toBe(1);
+  });
+
+  it("attributes settlement comparison audit to its authenticated finance actor", async () => {
+    const staffUserId = await insertStaff(database, "FINANCE_OFFICER");
+    const actor: StaffPrincipal = {
+      kind: "staff",
+      staffUserId,
+      roles: ["FINANCE_OFFICER"],
+      sessionId: randomUUID(),
+    };
+    const reconciliation = createReconciliationService({ database });
+    const result = await reconciliation.compareSettlement({
+      settlementReference: "settle-actor",
+      provider: "SOMOCO_PAYMENTS",
+      providerTotalMinorUnits: 0n,
+      actor,
+    });
+    const audit = await getInternalDatabase(database).execute<{
+      actor_staff_user_id: string | null;
+    }>(sql`
+      select actor_staff_user_id
+        from audit_event
+       where aggregate_type = 'payment_settlement_batch'
+         and aggregate_id = ${result.id}
+    `);
+    expect(audit.rows[0]?.actor_staff_user_id).toBe(staffUserId);
+    await expect(
+      reconciliation.compareSettlement({
+        settlementReference: "settle-unauthorized",
+        provider: "SOMOCO_PAYMENTS",
+        providerTotalMinorUnits: 0n,
+        actor: {
+          ...actor,
+          roles: ["CUSTOMER_SUPPORT"],
+        },
+      }),
+    ).rejects.toThrow("FORBIDDEN");
+  });
+
   it("requires database reversal linkage and rejects unlinked reversal entries", async () => {
     const graph = await insertContractGraph(database);
     const internal = getInternalDatabase(database);
@@ -793,10 +974,7 @@ async function seedAllocationPolicy(
        finance_approved_by, compliance_approved_by, approved_at, status)
     values
       (${approval.version}, ${approval.policyHash}, ${approval.workedExampleHash}, ${JSON.stringify(
-        {
-          version: approval.version,
-          workedExample: "finance-approved-test-example",
-        },
+        allocationPolicyWorkedExample,
       )}::jsonb, ${approval.financeApprovedBy}, ${approval.complianceApprovedBy}, ${approval.approvedAt}, 'APPROVED')
   `);
 }

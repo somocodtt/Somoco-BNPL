@@ -5,6 +5,7 @@ import {
   withTransaction,
   type Database,
   type DatabaseTransaction,
+  type PaymentAllocationPolicy,
   type PaymentTransaction,
 } from "@somo/db";
 import type { StaffPrincipal } from "../access/policy.js";
@@ -22,23 +23,58 @@ export interface AllocationDecision {
 
 export interface AllocationPolicy {
   readonly version: string;
+  /** Package-owned executable policy representation; callers cannot inject behavior. */
+  readonly executionKey: typeof ALLOCATION_POLICY_EXECUTION_KEY;
   readonly policyHash: string;
   readonly workedExampleHash: string;
   readonly financeApprovedBy: string;
   readonly complianceApprovedBy: string;
   readonly approvedBy: string;
   readonly approvedAt: string;
-  decide(input: {
-    amountMinorUnits: bigint;
-    contractId: string;
-    installments: readonly {
-      id: string;
-      installmentNumber: number;
-      amountMinorUnits: bigint;
-      paidMinorUnits: bigint;
-      dueDate: string;
-    }[];
-  }): AllocationDecision;
+}
+
+export const ALLOCATION_POLICY_VERSION = "finance-policy-v1" as const;
+export const ALLOCATION_POLICY_EXECUTION_KEY =
+  "SOMOCO_DEPOSIT_OR_INSTALLMENT_V1" as const;
+
+export const allocationPolicyWorkedExample = Object.freeze({
+  version: ALLOCATION_POLICY_VERSION,
+  executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
+  rules: Object.freeze([
+    "match an exact contract deposit",
+    "match one exact remaining installment",
+    "quarantine all other amounts for Finance reconciliation",
+  ]),
+});
+
+const allocationPolicyRepresentation = Object.freeze({
+  version: ALLOCATION_POLICY_VERSION,
+  executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
+  behavior: "package-owned",
+});
+
+export const ALLOCATION_POLICY_WORKED_EXAMPLE_HASH = sha256(
+  canonicalJson(allocationPolicyWorkedExample),
+);
+export const ALLOCATION_POLICY_HASH = sha256(
+  canonicalJson(allocationPolicyRepresentation),
+);
+
+export function createAllocationPolicyApproval(input: {
+  financeApprovedBy: string;
+  complianceApprovedBy: string;
+  approvedAt: string;
+}): AllocationPolicy {
+  return Object.freeze({
+    version: ALLOCATION_POLICY_VERSION,
+    executionKey: ALLOCATION_POLICY_EXECUTION_KEY,
+    policyHash: ALLOCATION_POLICY_HASH,
+    workedExampleHash: ALLOCATION_POLICY_WORKED_EXAMPLE_HASH,
+    financeApprovedBy: input.financeApprovedBy,
+    complianceApprovedBy: input.complianceApprovedBy,
+    approvedBy: input.financeApprovedBy,
+    approvedAt: input.approvedAt,
+  });
 }
 
 export interface LedgerPostInput {
@@ -98,14 +134,7 @@ export function createLedgerService(options: {
 }): LedgerService {
   return {
     async post(input) {
-      if (input.policy === undefined) {
-        throw new AppError(
-          409,
-          "ALLOCATION_POLICY_REQUIRED",
-          "Finance must approve a payment allocation policy before posting.",
-        );
-      }
-      validatePolicy(input.policy);
+      if (input.policy !== undefined) validatePolicy(input.policy);
       if (input.amountMinorUnits <= 0n) {
         throw new AppError(
           400,
@@ -117,51 +146,31 @@ export function createLedgerService(options: {
         tx: DatabaseTransaction,
       ): Promise<LedgerPostResult> => {
         const repo = paymentRepo(tx);
-        const approvedPolicy = await repo.findApprovedAllocationPolicy(
-          input.policy!.version,
+        const duplicate = await repo.findByProviderTransaction(
+          "SOMOCO_PAYMENTS",
+          input.providerTransactionId,
         );
-        if (
-          approvedPolicy === null ||
-          approvedPolicy.policyHash !== input.policy!.policyHash ||
-          approvedPolicy.workedExampleHash !==
-            input.policy!.workedExampleHash ||
-          approvedPolicy.financeApprovedBy !==
-            input.policy!.financeApprovedBy ||
-          approvedPolicy.complianceApprovedBy !==
-            input.policy!.complianceApprovedBy
-        ) {
+        if (duplicate !== null) return duplicateResult(repo, duplicate);
+        if (input.policy === undefined)
+          throw new AppError(
+            409,
+            "ALLOCATION_POLICY_REQUIRED",
+            "Finance must approve a payment allocation policy before posting.",
+          );
+        const approvedPolicy = await repo.findApprovedAllocationPolicy(
+          input.policy.version,
+        );
+        if (!isPersistedPolicyApproved(approvedPolicy, input.policy))
           throw new AppError(
             409,
             "ALLOCATION_POLICY_NOT_APPROVED",
             "The persisted Finance and Compliance allocation policy approval is required.",
           );
-        }
-        const duplicate = await repo.findByProviderTransaction(
-          "SOMOCO_PAYMENTS",
-          input.providerTransactionId,
-        );
-        if (duplicate !== null) {
-          const duplicateLedger = await repo.findLedgerForPayment(duplicate.id);
-          return {
-            paymentTransaction: duplicate,
-            outcome:
-              duplicate.status === "REVERSED"
-                ? "REVERSED"
-                : duplicate.status === "REFUNDED"
-                  ? "REFUNDED"
-                  : duplicateLedger.length > 0
-                    ? "POSTED"
-                    : "QUARANTINED",
-            ledgerEntryIds: duplicateLedger.map((entry) => entry.id),
-            depositReconciled: false,
-            reason: "DUPLICATE_PROVIDER_TRANSACTION",
-          };
-        }
         const context = await repo.findContractByReference(
           input.contractReference,
         );
         const paymentId = randomUUID();
-        const payment = await repo.insert(
+        const insertedPayment = await repo.insertIfAbsent(
           {
             id: paymentId,
             provider: "SOMOCO_PAYMENTS",
@@ -207,6 +216,9 @@ export function createLedgerService(options: {
             },
           },
         );
+        if (!insertedPayment.inserted)
+          return duplicateResult(repo, insertedPayment.payment);
+        const payment = insertedPayment.payment;
         if (context === null) {
           await repo.createReconciliationCase({
             paymentTransactionId: payment.id,
@@ -221,9 +233,9 @@ export function createLedgerService(options: {
           };
         }
         const installments = await repo.listInstallments(context.contractId);
-        const decision = input.policy!.decide({
+        const decision = decideAllocationPolicy({
           amountMinorUnits: input.amountMinorUnits,
-          contractId: context.contractId,
+          depositMinorUnits: context.depositMinorUnits,
           installments,
         });
         if (
@@ -614,21 +626,115 @@ export function createLedgerService(options: {
 }
 
 function validatePolicy(policy: AllocationPolicy): void {
+  const legacyBehavior = (policy as unknown as { decide?: unknown }).decide;
   if (
-    policy.version.trim().length === 0 ||
-    !/^[0-9a-f]{64}$/.test(policy.policyHash) ||
-    !/^[0-9a-f]{64}$/.test(policy.workedExampleHash) ||
+    policy.version !== ALLOCATION_POLICY_VERSION ||
+    policy.executionKey !== ALLOCATION_POLICY_EXECUTION_KEY ||
+    policy.policyHash !== ALLOCATION_POLICY_HASH ||
+    policy.workedExampleHash !== ALLOCATION_POLICY_WORKED_EXAMPLE_HASH ||
     policy.financeApprovedBy.trim().length === 0 ||
     policy.complianceApprovedBy.trim().length === 0 ||
     policy.financeApprovedBy === policy.complianceApprovedBy ||
-    policy.approvedBy.trim().length === 0 ||
-    !Number.isFinite(Date.parse(policy.approvedAt))
+    policy.approvedBy !== policy.financeApprovedBy ||
+    !Number.isFinite(Date.parse(policy.approvedAt)) ||
+    typeof legacyBehavior === "function"
   )
     throw new AppError(
       409,
       "ALLOCATION_POLICY_INVALID",
       "The allocation policy approval evidence is invalid.",
     );
+}
+
+function isPersistedPolicyApproved(
+  approved: PaymentAllocationPolicy | null,
+  input: AllocationPolicy,
+): approved is PaymentAllocationPolicy {
+  if (approved === null) return false;
+  if (
+    approved.version !== input.version ||
+    approved.policyHash !== input.policyHash ||
+    approved.policyHash !== ALLOCATION_POLICY_HASH ||
+    approved.workedExampleHash !== input.workedExampleHash ||
+    approved.workedExampleHash !== ALLOCATION_POLICY_WORKED_EXAMPLE_HASH ||
+    approved.financeApprovedBy !== input.financeApprovedBy ||
+    approved.complianceApprovedBy !== input.complianceApprovedBy ||
+    approved.approvedAt.toISOString() !== input.approvedAt
+  )
+    return false;
+  const canonicalWorkedExample = canonicalJson(approved.workedExample);
+  return (
+    sha256(canonicalWorkedExample) === approved.workedExampleHash &&
+    canonicalWorkedExample === canonicalJson(allocationPolicyWorkedExample)
+  );
+}
+
+async function duplicateResult(
+  repo: ReturnType<typeof paymentRepo>,
+  duplicate: PaymentTransaction,
+): Promise<LedgerPostResult> {
+  const duplicateLedger = await repo.findLedgerForPayment(duplicate.id);
+  const receipt = await repo.findReceipt(duplicate.id);
+  return {
+    paymentTransaction: duplicate,
+    outcome:
+      duplicate.status === "REVERSED"
+        ? "REVERSED"
+        : duplicate.status === "REFUNDED"
+          ? "REFUNDED"
+          : duplicateLedger.length > 0
+            ? "POSTED"
+            : "QUARANTINED",
+    ledgerEntryIds: duplicateLedger.map((entry) => entry.id),
+    ...(receipt === null ? {} : { receiptId: receipt.id }),
+    depositReconciled: false,
+    reason: "DUPLICATE_PROVIDER_TRANSACTION",
+  };
+}
+
+function decideAllocationPolicy(input: {
+  amountMinorUnits: bigint;
+  depositMinorUnits: bigint;
+  installments: readonly {
+    id: string;
+    amountMinorUnits: bigint;
+    paidMinorUnits: bigint;
+  }[];
+}): AllocationDecision {
+  const installment = input.installments.find(
+    (candidate) => candidate.paidMinorUnits < candidate.amountMinorUnits,
+  );
+  if (installment === undefined)
+    return {
+      outcome: "QUARANTINED",
+      allocations: [],
+      reason: "AMOUNT_REQUIRES_RECONCILIATION",
+    };
+  const remaining = installment.amountMinorUnits - installment.paidMinorUnits;
+  if (
+    input.amountMinorUnits !== input.depositMinorUnits &&
+    input.amountMinorUnits !== remaining
+  )
+    return {
+      outcome: "QUARANTINED",
+      allocations: [],
+      reason: "AMOUNT_REQUIRES_RECONCILIATION",
+    };
+  if (input.amountMinorUnits > remaining)
+    return {
+      outcome: "QUARANTINED",
+      allocations: [],
+      reason: "AMOUNT_REQUIRES_RECONCILIATION",
+    };
+  return {
+    outcome: "MATCHED",
+    allocations: [
+      {
+        installmentId: installment.id,
+        amountMinorUnits: input.amountMinorUnits,
+      },
+    ],
+  };
 }
 
 function inferChannel(
@@ -645,6 +751,17 @@ function inferChannel(
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
 }
 
 async function issueReceipt(

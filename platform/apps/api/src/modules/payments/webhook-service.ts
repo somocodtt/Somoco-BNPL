@@ -104,7 +104,7 @@ export function createPaymentWebhookService(options: {
         });
         const acknowledgement: PaymentWebhookAcknowledgement = {
           accepted: true,
-          duplicate: false,
+          duplicate: result.reason === "DUPLICATE_PROVIDER_TRANSACTION",
           eventId: event.eventId,
           outcome: result.outcome,
           paymentTransactionId: result.paymentTransaction.id,

@@ -62,3 +62,28 @@ The repository supplies the provider-neutral Somoco payment verifier and product
 ### Fix-round review note
 
 - The exact base-to-head review covers the raw transport boundary, payment repository locking/idempotency, policy provenance, receipt authorization/linking, staff finance routes/UI, canonical payment channel, migration constraints, and production USSD fail-closed composition. No simulator, cash, automatic immobilization, guessed SAP behavior, or provider credential was added.
+
+## Fix round 2 — sealed policy and replay races (base `f8d464de7c660162623567cf9ac4bb187bbd469`)
+
+### TDD evidence
+
+- RED accepted: API was 23/27 with four focused failures for canonical worked-example tampering, revoked-policy replay, concurrent receipt notifications, and actor attribution; the DB suite was 32/33 because the runtime role still had policy-table mutation privileges.
+- GREEN: the focused real-PostgreSQL API suite passes 28/28 and the database/migration suite passes 33/33.
+- Allocation execution is now selected only by the package-owned `SOMOCO_DEPOSIT_OR_INSTALLMENT_V1` representation and sealed hashes. Persisted worked-example JSON is canonicalized and hash-verified; policy version, representation hash, worked-example hash, Finance/Compliance approvers, and approval timestamp must all match. Caller-supplied executable behavior is rejected.
+- Provider-transaction insertion uses conflict-safe idempotency and returns the original posted result, receipt identifier, and duplicate marker for concurrent events and revoked-policy replays without surfacing a unique-constraint error.
+- Concurrent receipt issuance returns the persisted receipt row and enqueues one receipt SMS outbox message only for the transaction that inserted it; the persisted receipt ID is used in the link.
+- Settlement comparison requires an authenticated finance actor and records that staff user on the settlement audit event; unauthorized roles fail closed.
+
+### Database and migration evidence
+
+- Migration `0018_sealed_payment_policy.sql` grants `somo_runtime` SELECT-only access to `payment_allocation_policy` and revokes INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, and TRIGGER privileges. Fresh migration and repeat migration tests pass at 19 migrations.
+- The populated migration path applies 0018 after 0017 without changing legacy financial values; the runtime privilege check passes on the resulting schema.
+
+### Fix-round verification gates
+
+- API, customer-web, staff-web, worker, contracts, integrations, database, and testkit TypeScript checks pass; database public-API typecheck also passes.
+- Targeted API and database lint pass. Prettier checks pass for all changed TypeScript/JSON files, and `git diff --check` passes.
+
+### Fix-round review note
+
+- The exact base-to-head review covers canonical policy provenance and grants, transaction conflict handling, revoked replay ordering, receipt persistence/outbox idempotency, settlement actor authorization/audit attribution, and migration repeatability. No provider credentials, simulator behavior, cash path, or automatic immobilization was introduced.

@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(18);
+    expect(before.rows[0]?.count).toBe(19);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -315,6 +315,27 @@ describe("PostgreSQL persistence", () => {
       audit_delete: false,
       ledger_update: false,
       ledger_delete: false,
+    });
+  });
+
+  it("makes the approved payment allocation policy read-only to the runtime role", async () => {
+    const privileges = await db.execute<{
+      policy_select: boolean;
+      policy_insert: boolean;
+      policy_update: boolean;
+      policy_delete: boolean;
+    }>(sql`
+      select
+        has_table_privilege('somo_runtime', 'payment_allocation_policy', 'SELECT') as policy_select,
+        has_table_privilege('somo_runtime', 'payment_allocation_policy', 'INSERT') as policy_insert,
+        has_table_privilege('somo_runtime', 'payment_allocation_policy', 'UPDATE') as policy_update,
+        has_table_privilege('somo_runtime', 'payment_allocation_policy', 'DELETE') as policy_delete
+    `);
+    expect(privileges.rows[0]).toEqual({
+      policy_select: true,
+      policy_insert: false,
+      policy_update: false,
+      policy_delete: false,
     });
   });
 
@@ -658,6 +679,7 @@ describe("populated legacy schema migration", () => {
       "0015_asset_privacy_controls.sql",
       "0016_payment_ledger_reconciliation.sql",
       "0017_wooden_selene.sql",
+      "0018_sealed_payment_policy.sql",
     ]) {
       await applyMigrationFile(pool, migration);
     }

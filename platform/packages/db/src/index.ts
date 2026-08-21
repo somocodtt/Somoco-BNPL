@@ -148,6 +148,7 @@ export {
   type PaymentReceipt,
   type ReconciliationCase,
   type PaymentAdjustment,
+  type PaymentAllocationPolicy,
   type PaymentSettlementBatch,
 } from "./repositories/payments.js";
 export { withTransaction, type DatabaseTransaction } from "./transaction.js";

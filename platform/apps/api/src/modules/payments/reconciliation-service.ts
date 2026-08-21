@@ -22,6 +22,7 @@ export interface ReconciliationService {
     settlementReference: string;
     providerTotalMinorUnits: bigint;
     provider: "SOMOCO_PAYMENTS";
+    actor: StaffPrincipal;
     receivedAt?: Date;
   }): Promise<SettlementComparison>;
   listInbox(): Promise<readonly Record<string, unknown>[]>;
@@ -40,6 +41,17 @@ export function createReconciliationService(options: {
 }): ReconciliationService {
   return {
     async compareSettlement(input) {
+      if (
+        input.actor.kind !== "staff" ||
+        (!input.actor.roles.includes("FINANCE_OFFICER") &&
+          !input.actor.roles.includes("CFO") &&
+          !input.actor.roles.includes("COMPLIANCE_AUDITOR"))
+      )
+        throw new AppError(
+          403,
+          "FORBIDDEN",
+          "Finance reconciliation authority is required.",
+        );
       if (input.providerTotalMinorUnits < 0n)
         throw new AppError(
           400,
@@ -107,7 +119,7 @@ export function createReconciliationService(options: {
             status === "MATCHED"
               ? "PAYMENT_SETTLEMENT_MATCHED"
               : "PAYMENT_SETTLEMENT_VARIANCE",
-          actorStaffUserId: null,
+          actorStaffUserId: input.actor.staffUserId,
           actorPersonId: null,
           requestId: null,
           data: {
