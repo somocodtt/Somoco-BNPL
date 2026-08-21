@@ -88,7 +88,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(15);
+    expect(before.rows[0]?.count).toBe(16);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -989,7 +989,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0014", async () => {
+  it("upgrades populated 0009 financing rows safely through 0015", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1063,6 +1063,7 @@ describe("populated legacy schema migration", () => {
     await applyMigrationFile(pool, "0012_financing_disclosures.sql");
     await applyMigrationFile(pool, "0013_asset_contract_handover.sql");
     await applyMigrationFile(pool, "0014_asset_hardening.sql");
+    await applyMigrationFile(pool, "0015_asset_privacy_controls.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;

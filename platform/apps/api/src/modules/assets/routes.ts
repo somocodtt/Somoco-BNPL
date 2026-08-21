@@ -341,9 +341,7 @@ export async function registerAssetRoutes(
   app.post<{
     Params: { vehicleUnitId: string };
     Body: {
-      provider: string;
-      providerDeviceId: string;
-      deepLink: string;
+      trackerId: string;
       expectedVehicleVersion: number;
       idempotencyKey: string;
     };
@@ -356,16 +354,12 @@ export async function registerAssetRoutes(
           type: "object",
           additionalProperties: false,
           required: [
-            "provider",
-            "providerDeviceId",
-            "deepLink",
+            "trackerId",
             "expectedVehicleVersion",
             "idempotencyKey",
           ],
           properties: {
-            provider: { type: "string", minLength: 1 },
-            providerDeviceId: { type: "string", minLength: 1 },
-            deepLink: { type: "string", format: "uri" },
+            trackerId: { type: "string", minLength: 1, maxLength: 256 },
             expectedVehicleVersion: { type: "integer", minimum: 1 },
             idempotencyKey: idempotency,
           },

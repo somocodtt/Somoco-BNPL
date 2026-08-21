@@ -18,6 +18,7 @@ import {
   type NiaPort,
   type ObjectStoragePort,
   type SmsPort,
+  type TrackerPort,
 } from "@somo/integrations";
 import { validateProductionIdentityComposition } from "./production-composition.js";
 import { registerDocumentRoutes } from "./modules/documents/routes.js";
@@ -91,6 +92,7 @@ export interface BuildAppOptions {
     requiredDocumentTypes: readonly string[];
   };
   financing?: { fixtureGate?: FinanceApprovalGate };
+  tracker?: TrackerPort;
   contracts?: {
     template?: ContractTemplateAttestation;
     headOffice?: { id: string; location: string };
@@ -181,7 +183,11 @@ export async function buildApp(
       ? {}
       : { fixtureGate: options.financing.fixtureGate }),
   });
-  const assetService = createAssetService({ database });
+  const assetService = createAssetService({
+    database,
+    environment: config.environment === "production" ? "production" : "test",
+    ...(options.tracker === undefined ? {} : { tracker: options.tracker }),
+  });
   const configuredHeadOffice =
     options.contracts?.headOffice ??
     (config.mainHeadOfficeId === undefined ||

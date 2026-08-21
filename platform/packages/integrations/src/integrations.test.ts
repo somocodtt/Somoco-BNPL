@@ -319,6 +319,33 @@ describe("production document adapters", () => {
     ).toThrow("PRODUCTION_CONNECTOR_METHOD_INVALID");
   });
 
+  it("constructs only the provider-neutral read-only tracker connector", async () => {
+    const api = (await import("./index.js")) as Record<string, unknown>;
+    const createBoundary = api[
+      "createProductionConnectorBoundary"
+    ] as () => ProductionConnectorBoundary;
+    const boundary = createBoundary();
+    const tracker = boundary.register({
+      kind: "TRACKER",
+      provenance: externalProvenance("ghana-tracker"),
+      adapter: {
+        async getLastKnown() {
+          return {
+            latitude: "5.6",
+            longitude: "-0.1",
+            recordedAt: checkedAt,
+            deviceStatus: "ONLINE" as const,
+          };
+        },
+        immobilize: async () => undefined,
+      },
+    });
+
+    expect(boundary.require(tracker, "TRACKER")).toBe(tracker);
+    expect(Object.keys(tracker)).toEqual(["getLastKnown"]);
+    expect("immobilize" in tracker).toBe(false);
+  });
+
   it("does not let direct or wrapped simulators cross the external connector boundary", async () => {
     const api = (await import("@somo/integrations")) as Record<string, unknown>;
     const createBoundary = api[

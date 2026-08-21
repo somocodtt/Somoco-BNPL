@@ -225,7 +225,7 @@ export const trackerAssociation = pgTable(
       .references(() => vehicleUnit.id, { onDelete: "restrict" }),
     provider: text("provider").notNull(),
     providerDeviceId: text("provider_device_id").notNull(),
-    deepLink: text("deep_link").notNull(),
+    deepLink: text("deep_link"),
     associatedAt: timestamp("associated_at", { withTimezone: true }).notNull(),
     endedAt: timestamp("ended_at", { withTimezone: true }),
   },

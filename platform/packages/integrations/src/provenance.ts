@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { NiaPort } from "./nia.js";
 import type { SmsPort } from "./sms.js";
+import type { TrackerPort } from "./tracker.js";
 
 const simulatorAdapters = new WeakSet<object>();
 const productionCapabilities = new WeakMap<
@@ -9,7 +10,11 @@ const productionCapabilities = new WeakMap<
 >();
 
 export type ProductionAdapterCapability =
-  "SMS" | "NIA" | "OBJECT_STORAGE" | "MALWARE_SCANNER";
+  | "SMS"
+  | "NIA"
+  | "OBJECT_STORAGE"
+  | "MALWARE_SCANNER"
+  | "TRACKER";
 
 export interface ExternalConnectorProvenance {
   packageName: string;
@@ -28,7 +33,15 @@ export interface ProductionConnectorBoundary {
     provenance: ExternalConnectorProvenance;
     adapter: NiaPort;
   }): NiaPort;
-  require<T extends object>(adapter: T, kind: "SMS" | "NIA"): T;
+  register(input: {
+    kind: "TRACKER";
+    provenance: ExternalConnectorProvenance;
+    adapter: TrackerPort;
+  }): TrackerPort;
+  require<T extends object>(
+    adapter: T,
+    kind: "SMS" | "NIA" | "TRACKER",
+  ): T;
 }
 
 const simulatorUse = new AsyncLocalStorage<{ used: boolean }>();
@@ -90,27 +103,32 @@ export function requireProductionConnector<T extends object>(
 }
 
 export function createProductionConnectorBoundary(): ProductionConnectorBoundary {
-  const registered = new WeakMap<object, "SMS" | "NIA">();
+  const registered = new WeakMap<object, "SMS" | "NIA" | "TRACKER">();
   function register(input: {
-    kind: "SMS" | "NIA";
+    kind: "SMS" | "NIA" | "TRACKER";
     provenance: ExternalConnectorProvenance;
-    adapter: SmsPort | NiaPort;
-  }): SmsPort | NiaPort {
+    adapter: SmsPort | NiaPort | TrackerPort;
+  }): SmsPort | NiaPort | TrackerPort {
     validateExternalConnectorProvenance(input.provenance);
     if (isSimulatorAdapter(input.adapter)) {
       throw new Error("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
     }
     const connector =
       input.kind === "SMS"
-        ? createExternalSmsConnector(input.adapter)
-        : createExternalNiaConnector(input.adapter);
+        ? createExternalSmsConnector(input.adapter as SmsPort)
+        : input.kind === "NIA"
+          ? createExternalNiaConnector(input.adapter as NiaPort)
+          : createExternalTrackerConnector(input.adapter as TrackerPort);
     markProductionAdapter(connector, input.kind);
     registered.set(connector, input.kind);
     return connector;
   }
   return Object.freeze({
     register: register as ProductionConnectorBoundary["register"],
-    require<T extends object>(adapter: T, kind: "SMS" | "NIA"): T {
+    require<T extends object>(
+      adapter: T,
+      kind: "SMS" | "NIA" | "TRACKER",
+    ): T {
       if (registered.get(adapter) !== kind) {
         throw new Error("PRODUCTION_CONNECTOR_REGISTRATION_REQUIRED");
       }
@@ -138,6 +156,17 @@ function createExternalNiaConnector(adapter: SmsPort | NiaPort): NiaPort {
   return Object.freeze({
     verify: (input: Parameters<NiaPort["verify"]>[0]) =>
       runExternalConnectorOperation(() => verify(input)),
+  });
+}
+
+function createExternalTrackerConnector(adapter: TrackerPort): TrackerPort {
+  if (typeof adapter.getLastKnown !== "function") {
+    throw new Error("PRODUCTION_CONNECTOR_METHOD_INVALID");
+  }
+  const getLastKnown = adapter.getLastKnown.bind(adapter);
+  return Object.freeze({
+    getLastKnown: (input: Parameters<TrackerPort["getLastKnown"]>[0]) =>
+      runExternalConnectorOperation(() => getLastKnown(input)),
   });
 }
 

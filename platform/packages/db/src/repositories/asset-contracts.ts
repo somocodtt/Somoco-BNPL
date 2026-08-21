@@ -99,8 +99,8 @@ export interface ExecutionRow extends Record<string, unknown> {
   id: string;
   contract_id: string;
   version_number: number;
-  applicant_signature: string;
-  guarantor_signature: string;
+  applicant_person_id: string | null;
+  guarantor_person_id: string | null;
   staff_witness_id: string;
   execution_date: Date | string;
   head_office_location: string;
@@ -118,7 +118,7 @@ export interface HandoverRow extends Record<string, unknown> {
   customer_acknowledged_by_person_id: string | null;
   head_office_id: string | null;
   condition: Record<string, unknown>;
-  accessories: string[];
+  accessories: Record<string, unknown>;
   head_office_location: string;
   handed_over_by: string;
   handed_over_at: Date | string;
@@ -623,6 +623,25 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       return row;
     },
 
+    async updateVehicleTrackerIdentifier(
+      id: string,
+      expectedVersion: number,
+      trackerIdentifier: string,
+      now: Date,
+    ): Promise<VehicleRow> {
+      const result = await executor.execute<VehicleRow>(sql`
+        update vehicle_unit
+           set tracker_identifier = ${trackerIdentifier}, version = version + 1,
+               updated_at = ${now}
+         where id = ${id}::uuid and version = ${expectedVersion}
+        returning id, vehicle_model_id, vin, chassis_number, engine_motor_identifier,
+                  condition, accessories, tracker_identifier, registration_number, status, version
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("VEHICLE_VERSION_CONFLICT");
+      return row;
+    },
+
     async findCurrentInsuranceRegistration(vehicleUnitId: string): Promise<{
       registration_valid_from: string | null;
       registration_valid_to: string | null;
@@ -691,16 +710,14 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
     async insertTracker(input: {
       id: string;
       vehicleUnitId: string;
-      provider: string;
-      providerDeviceId: string;
-      deepLink: string;
+      trackerId: string;
       associatedAt: Date;
     }): Promise<void> {
       await executor.execute(sql`
         insert into tracker_association
           (id, vehicle_unit_id, provider, provider_device_id, deep_link, associated_at)
-        values (${input.id}::uuid, ${input.vehicleUnitId}::uuid, ${input.provider},
-                ${input.providerDeviceId}, ${input.deepLink}, ${input.associatedAt})
+        values (${input.id}::uuid, ${input.vehicleUnitId}::uuid, 'ATTESTED_TRACKER_PORT',
+                ${input.trackerId}, null, ${input.associatedAt})
       `);
     },
 
@@ -709,14 +726,14 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       tracker_identifier: string | null;
       provider: string;
       provider_device_id: string;
-      deep_link: string;
+      deep_link: string | null;
     } | null> {
       const result = await executor.execute<{
         association_id: string;
         tracker_identifier: string | null;
         provider: string;
         provider_device_id: string;
-        deep_link: string;
+        deep_link: string | null;
       }>(sql`
         select tracker.id as association_id, vehicle.tracker_identifier,
                tracker.provider, tracker.provider_device_id, tracker.deep_link
@@ -933,8 +950,8 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       id: string;
       contractId: string;
       versionNumber: number;
-      applicantSignature: string;
-      guarantorSignature: string;
+      applicantPersonId: string;
+      guarantorPersonId: string;
       staffWitnessId: string;
       executionDate: Date;
       headOfficeId: string;
@@ -945,15 +962,18 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
     }): Promise<ExecutionRow> {
       const result = await executor.execute<ExecutionRow>(sql`
         insert into contract_execution
-          (id, contract_id, version_number, applicant_signature, guarantor_signature,
-           staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
+          (id, contract_id, version_number, applicant_person_id, guarantor_person_id,
+           staff_witness_id, execution_date,
+           head_office_id, head_office_location, executed_document_id,
            executed_document_hash, authorization_reason)
         values (${input.id}::uuid, ${input.contractId}::uuid, ${input.versionNumber},
-                ${input.applicantSignature}, ${input.guarantorSignature}, ${input.staffWitnessId}::uuid,
+                ${input.applicantPersonId}::uuid, ${input.guarantorPersonId}::uuid,
+                ${input.staffWitnessId}::uuid,
                 ${input.executionDate}, ${input.headOfficeId}, ${input.headOfficeLocation}, ${input.executedDocumentId}::uuid,
                 ${input.executedDocumentHash}, ${input.authorizationReason ?? null})
-        returning id, contract_id, version_number, applicant_signature, guarantor_signature,
-                  staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
+        returning id, contract_id, version_number, applicant_person_id, guarantor_person_id,
+                  staff_witness_id, execution_date,
+                  head_office_id, head_office_location, executed_document_id,
                   executed_document_hash, authorization_reason
       `);
       const row = result.rows[0];
@@ -964,8 +984,9 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
 
     async latestExecution(contractId: string): Promise<ExecutionRow | null> {
       const result = await executor.execute<ExecutionRow>(sql`
-        select id, contract_id, version_number, applicant_signature, guarantor_signature,
-               staff_witness_id, execution_date, head_office_id, head_office_location, executed_document_id,
+        select id, contract_id, version_number, applicant_person_id, guarantor_person_id,
+               staff_witness_id, execution_date,
+               head_office_id, head_office_location, executed_document_id,
                executed_document_hash, authorization_reason
           from contract_execution where contract_id = ${contractId}::uuid
          order by version_number desc limit 1
@@ -981,8 +1002,8 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       customerAcknowledgedAt: Date;
       customerAcknowledgedByPersonId: string;
       headOfficeId: string;
-      condition: Record<string, unknown>;
-      accessories: readonly string[];
+      condition: unknown;
+      accessories: unknown;
       headOfficeLocation: string;
       handedOverBy: string;
       handedOverAt: Date;

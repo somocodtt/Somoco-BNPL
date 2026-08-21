@@ -40,9 +40,13 @@ export async function registerContractRoutes(
   app.get<{ Params: { applicationId: string } }>(
     "/v1/staff/applications/:applicationId/contract",
     { schema: { params: applicationParams }, preHandler: authenticateStaff },
-    async (request, reply) => {
-      return reply.send(await contracts.get(request.params.applicationId));
-    },
+    async (request, reply) =>
+      reply.send(
+        await contracts.get(
+          request.params.applicationId,
+          requireStaffPrincipal(request),
+        ),
+      ),
   );
 
   app.post<{
@@ -85,8 +89,8 @@ export async function registerContractRoutes(
     Params: { contractId: string };
     Body: {
       expectedVersion: number;
-      applicantSignature: string;
-      guarantorSignature: string;
+      applicantPersonId: string;
+      guarantorPersonId: string;
       staffWitnessId: string;
       executionDate: string;
       headOfficeId: string;
@@ -106,8 +110,8 @@ export async function registerContractRoutes(
           additionalProperties: false,
           required: [
             "expectedVersion",
-            "applicantSignature",
-            "guarantorSignature",
+            "applicantPersonId",
+            "guarantorPersonId",
             "staffWitnessId",
             "executionDate",
             "headOfficeId",
@@ -118,16 +122,8 @@ export async function registerContractRoutes(
           ],
           properties: {
             expectedVersion: { type: "integer", minimum: 1 },
-            applicantSignature: {
-              type: "string",
-              minLength: 1,
-              maxLength: 4000,
-            },
-            guarantorSignature: {
-              type: "string",
-              minLength: 1,
-              maxLength: 4000,
-            },
+            applicantPersonId: uuid,
+            guarantorPersonId: uuid,
             staffWitnessId: uuid,
             executionDate: { type: "string", format: "date-time" },
             headOfficeId: { type: "string", minLength: 1, maxLength: 256 },
@@ -169,8 +165,8 @@ export async function registerContractRoutes(
       customerAcknowledged: boolean;
       customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
-      condition: Record<string, unknown>;
-      accessories: string[];
+      condition: { description: string; checkResult: string };
+      accessories: { items: string[]; none?: boolean };
       headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
@@ -204,8 +200,27 @@ export async function registerContractRoutes(
             customerAcknowledged: { type: "boolean", const: true },
             customerAcknowledgementId: uuid,
             customerAcknowledgedByPersonId: uuid,
-            condition: { type: "object" },
-            accessories: { type: "array", items: { type: "string" } },
+            condition: {
+              type: "object",
+              additionalProperties: false,
+              required: ["description", "checkResult"],
+              properties: {
+                description: { type: "string", minLength: 1, maxLength: 4000 },
+                checkResult: { type: "string", minLength: 1, maxLength: 128 },
+              },
+            },
+            accessories: {
+              type: "object",
+              additionalProperties: false,
+              required: ["items"],
+              properties: {
+                items: {
+                  type: "array",
+                  items: { type: "string", minLength: 1, maxLength: 256 },
+                },
+                none: { type: "boolean" },
+              },
+            },
             headOfficeLocation: {
               type: "string",
               minLength: 1,

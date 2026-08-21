@@ -14,6 +14,16 @@ import { AppError } from "../../plugins/errors.js";
 import type { AssetService } from "../assets/service.js";
 import type { ContractRecord, ContractService } from "./service.js";
 
+export interface HandoverConditionEvidence {
+  description: string;
+  checkResult: string;
+}
+
+export interface HandoverAccessoriesEvidence {
+  items: readonly string[];
+  none?: boolean;
+}
+
 export interface HandoverService {
   acknowledge(input: {
     contractId: string;
@@ -36,8 +46,8 @@ export interface HandoverService {
     customerAcknowledged: boolean;
     customerAcknowledgementId: string;
     customerAcknowledgedByPersonId?: string;
-    condition: Record<string, unknown>;
-    accessories: readonly string[];
+    condition: HandoverConditionEvidence;
+    accessories: HandoverAccessoriesEvidence;
     headOfficeId: string;
     headOfficeLocation: string;
     handedOverAt: string;
@@ -231,6 +241,7 @@ export function createHandoverService(options: {
           "CUSTOMER_ACKNOWLEDGEMENT_REQUIRED",
           "An applicant-authenticated acknowledgement is required at handover.",
         );
+      validateHandoverEvidence(input.condition, input.accessories);
       const handedOverAt = parseDate(
         input.handedOverAt,
         "HANDOVER_DATE_INVALID",
@@ -473,6 +484,40 @@ export const REQUIRED_HANDOVER_ITEM_IDS = [
   "condition_recorded",
   "accessories_recorded",
 ] as const;
+
+function validateHandoverEvidence(
+  condition: HandoverConditionEvidence,
+  accessories: HandoverAccessoriesEvidence,
+): void {
+  if (
+    typeof condition !== "object" ||
+    condition === null ||
+    typeof condition.description !== "string" ||
+    condition.description.trim().length === 0 ||
+    typeof condition.checkResult !== "string" ||
+    condition.checkResult.trim().length === 0
+  )
+    throw new AppError(
+      400,
+      "HANDOVER_CONDITION_INVALID",
+      "A nonempty condition description and check result are required.",
+    );
+  if (
+    typeof accessories !== "object" ||
+    accessories === null ||
+    !Array.isArray(accessories.items) ||
+    accessories.items.some(
+      (item) => typeof item !== "string" || item.trim().length === 0,
+    ) ||
+    (accessories.items.length === 0 && accessories.none !== true) ||
+    (accessories.items.length > 0 && accessories.none === true)
+  )
+    throw new AppError(
+      400,
+      "HANDOVER_ACCESSORIES_INVALID",
+      "Accessories must explicitly list items or affirm that none were supplied.",
+    );
+}
 
 function isCompleteChecklist(value: Record<string, unknown>): boolean {
   if (!Array.isArray(value.items) || value.items.length !== REQUIRED_HANDOVER_ITEM_IDS.length)

@@ -88,6 +88,47 @@ export interface StaffAssignmentSummary {
 
 export interface StaffAssetApi {
   listInventory(): Promise<StaffAssetSummary[]>;
+  recordRegistration(
+    vehicleUnitId: string,
+    input: {
+      registrationNumber: string;
+      validFrom: string;
+      validTo: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ): Promise<{
+    vehicleUnitId: string;
+    registrationNumber: string;
+    validTo: string;
+    version: number;
+    renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+  }>;
+  recordInsurance(
+    vehicleUnitId: string,
+    input: {
+      policyNumber: string;
+      provider: string;
+      validFrom: string;
+      validTo: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ): Promise<{
+    vehicleUnitId: string;
+    policyNumber: string;
+    validTo: string;
+    version: number;
+    renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+  }>;
+  associateTracker(
+    vehicleUnitId: string,
+    input: {
+      trackerId: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ): Promise<{ vehicleUnitId: string; version: number }>;
   assignVehicle(
     applicationId: string,
     input: {
@@ -139,8 +180,8 @@ export interface StaffContractApi {
     contractId: string,
     input: {
       expectedVersion: number;
-      applicantSignature: string;
-      guarantorSignature: string;
+      applicantPersonId: string;
+      guarantorPersonId: string;
       staffWitnessId: string;
       executionDate: string;
       headOfficeId: string;
@@ -160,8 +201,8 @@ export interface StaffContractApi {
       customerAcknowledged: true;
       customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
-      condition: Record<string, unknown>;
-      accessories: readonly string[];
+      condition: { description: string; checkResult: string };
+      accessories: { items: readonly string[]; none?: boolean };
       headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
@@ -252,6 +293,74 @@ export class FetchStaffApi implements StaffApi, ProductApi {
     return body.map(mapAssetSummary);
   }
 
+  async recordRegistration(
+    vehicleUnitId: string,
+    input: {
+      registrationNumber: string;
+      validFrom: string;
+      validTo: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ) {
+    const body = await this.request(
+      `/v1/staff/assets/${encodeURIComponent(vehicleUnitId)}/registration`,
+      { method: "POST", body: input },
+    );
+    return mapCoverageResponse(body, "registration") as {
+      vehicleUnitId: string;
+      registrationNumber: string;
+      validTo: string;
+      version: number;
+      renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+    };
+  }
+
+  async recordInsurance(
+    vehicleUnitId: string,
+    input: {
+      policyNumber: string;
+      provider: string;
+      validFrom: string;
+      validTo: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ) {
+    const body = await this.request(
+      `/v1/staff/assets/${encodeURIComponent(vehicleUnitId)}/insurance`,
+      { method: "POST", body: input },
+    );
+    return mapCoverageResponse(body, "insurance") as {
+      vehicleUnitId: string;
+      policyNumber: string;
+      validTo: string;
+      version: number;
+      renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+    };
+  }
+
+  async associateTracker(
+    vehicleUnitId: string,
+    input: {
+      trackerId: string;
+      expectedVehicleVersion: number;
+      idempotencyKey: string;
+    },
+  ) {
+    const body = await this.request(
+      `/v1/staff/assets/${encodeURIComponent(vehicleUnitId)}/tracker`,
+      { method: "POST", body: input },
+    );
+    if (
+      !isRecord(body) ||
+      typeof body.vehicleUnitId !== "string" ||
+      typeof body.version !== "number"
+    )
+      throw malformedStaff("MALFORMED_TRACKER_RESPONSE");
+    return { vehicleUnitId: body.vehicleUnitId, version: body.version };
+  }
+
   async assignVehicle(
     applicationId: string,
     input: {
@@ -295,8 +404,8 @@ export class FetchStaffApi implements StaffApi, ProductApi {
     contractId: string,
     input: {
       expectedVersion: number;
-      applicantSignature: string;
-      guarantorSignature: string;
+      applicantPersonId: string;
+      guarantorPersonId: string;
       staffWitnessId: string;
       executionDate: string;
       headOfficeId: string;
@@ -323,8 +432,8 @@ export class FetchStaffApi implements StaffApi, ProductApi {
       customerAcknowledged: true;
       customerAcknowledgementId: string;
       customerAcknowledgedByPersonId?: string;
-      condition: Record<string, unknown>;
-      accessories: readonly string[];
+      condition: { description: string; checkResult: string };
+      accessories: { items: readonly string[]; none?: boolean };
       headOfficeId: string;
       headOfficeLocation: string;
       handedOverAt: string;
@@ -458,6 +567,40 @@ function mapAssetSummary(value: unknown): StaffAssetSummary {
     ),
     status: requiredString(value.status, "MALFORMED_ASSET_LIST"),
     version: requiredInteger(value.version, "MALFORMED_ASSET_LIST"),
+  };
+}
+
+function mapCoverageResponse(
+  value: unknown,
+  kind: "registration" | "insurance",
+): {
+  vehicleUnitId: string;
+  registrationNumber?: string;
+  policyNumber?: string;
+  validTo: string;
+  version: number;
+  renewalWarningState: "RENEWAL_REVIEW_REQUIRED";
+} {
+  if (
+    !isRecord(value) ||
+    typeof value.vehicleUnitId !== "string" ||
+    typeof value.validTo !== "string" ||
+    typeof value.version !== "number" ||
+    value.renewalWarningState !== "RENEWAL_REVIEW_REQUIRED"
+  )
+    throw malformedStaff(`MALFORMED_${kind.toUpperCase()}_RESPONSE`);
+  if (kind === "registration" && typeof value.registrationNumber !== "string")
+    throw malformedStaff("MALFORMED_REGISTRATION_RESPONSE");
+  if (kind === "insurance" && typeof value.policyNumber !== "string")
+    throw malformedStaff("MALFORMED_INSURANCE_RESPONSE");
+  return {
+    vehicleUnitId: value.vehicleUnitId,
+    ...(kind === "registration"
+      ? { registrationNumber: value.registrationNumber as string }
+      : { policyNumber: value.policyNumber as string }),
+    validTo: value.validTo,
+    version: value.version,
+    renewalWarningState: "RENEWAL_REVIEW_REQUIRED",
   };
 }
 

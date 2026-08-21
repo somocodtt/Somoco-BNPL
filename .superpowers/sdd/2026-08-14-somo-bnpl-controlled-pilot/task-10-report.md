@@ -53,3 +53,23 @@ No dependency was installed, added, or relinked. All checks used direct linked b
 | Diff hygiene | `git diff --check` passed |
 
 The unfiltered DB integration file still contains eight pre-existing financing fixture failures because its legacy fixture inserts `DECLINING_BALANCE`, which the current `financing_rule_method_allowed` constraint rejects; the migration and Task 10 DB checks above pass sequentially against PostgreSQL.
+
+## Fix round 2 — asset handover privacy gaps
+
+- Tracker association no longer accepts or stores an arbitrary HTTPS deep link as authority. It stores only the tracker ID, requires the provider-neutral read-only `TrackerPort`, and recovery calls `getLastKnown` through a production-attested connector. Production rejects simulator/unattested adapters; connector wrappers expose no action-capable methods; recovery responses contain only location coordinates/timestamp and are audited. General inventory continues to strip tracker IDs.
+- Staff contract reads are role-checked server-side: inventory and compliance-auditor roles may read the internal staff DTO, while unrelated authenticated staff are denied. Customer contract DTOs remain a separate public shape.
+- Physical execution no longer accepts typed/drawn/e-signature values. It records applicant and confirmed-guarantor person IDs, an authenticated staff witness, and the clean accepted executed PDF evidence/hash. New execution rows leave legacy signature-value columns empty; migration 0015 makes those legacy columns nullable and adds person FKs.
+- Handover condition evidence requires a nonempty description and check result. Accessories require an explicit item list or `none: true`; UI state does not fabricate `{}`/`[]`. Registration and insurance UI/API controls send valid-from/until, optimistic versions, and durable idempotency keys, then show computed current/expired renewal state.
+
+### Fix-round 2 verification
+
+| Boundary | Result |
+| --- | --- |
+| Integrations tracker boundary | 2/2 selected tests passed; action-capable methods are stripped and simulator/unattested production adapters reject |
+| API real-PG | 11/11 passed |
+| HTTP role/privacy boundary | 4/4 passed |
+| Staff UI + adapter | 9/9 passed |
+| Customer UI focused regression | 7/7 passed |
+| TypeScript no-emit | DB, integrations, API, staff web, and customer web passed |
+| Migration fresh/repeat + populated upgrade through 0015 | 12/12 selected DB integration tests passed |
+| Diff hygiene | `git diff --check` passed |

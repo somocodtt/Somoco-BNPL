@@ -151,8 +151,8 @@ export const contractExecution = pgTable(
       .notNull()
       .references(() => contract.id, { onDelete: "restrict" }),
     versionNumber: integer("version_number").notNull(),
-    applicantSignature: text("applicant_signature").notNull(),
-    guarantorSignature: text("guarantor_signature").notNull(),
+    applicantSignature: text("applicant_signature"),
+    guarantorSignature: text("guarantor_signature"),
     staffWitnessId: uuid("staff_witness_id")
       .notNull()
       .references(() => staffUser.id, { onDelete: "restrict" }),
@@ -161,6 +161,12 @@ export const contractExecution = pgTable(
     }).notNull(),
     headOfficeId: text("head_office_id"),
     headOfficeLocation: text("head_office_location").notNull(),
+    applicantPersonId: uuid("applicant_person_id").references(() => person.id, {
+      onDelete: "restrict",
+    }),
+    guarantorPersonId: uuid("guarantor_person_id").references(() => person.id, {
+      onDelete: "restrict",
+    }),
     executedDocumentId: uuid("executed_document_id")
       .notNull()
       .references(() => document.id, { onDelete: "restrict" }),
@@ -182,10 +188,6 @@ export const contractExecution = pgTable(
     check(
       "contract_execution_document_hash_sha256",
       sql`${table.executedDocumentHash} ~ '^[0-9a-f]{64}$'`,
-    ),
-    check(
-      "contract_execution_signatures_nonempty",
-      sql`length(btrim(${table.applicantSignature})) > 0 and length(btrim(${table.guarantorSignature})) > 0`,
     ),
   ],
 );
@@ -288,7 +290,10 @@ export const handoverRecord = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default({}),
-    accessories: jsonb("accessories").$type<string[]>().notNull().default([]),
+    accessories: jsonb("accessories")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
     headOfficeLocation: text("head_office_location")
       .notNull()
       .default("Somoco head office"),

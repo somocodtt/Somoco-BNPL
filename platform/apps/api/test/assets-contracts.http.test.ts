@@ -149,11 +149,57 @@ describe("asset and contract HTTP boundary", () => {
       method: "POST",
       url: `/v1/staff/assets/${vehicleUnitId}/tracker`,
       payload: {
-        provider: "Synthetic Tracker",
-        providerDeviceId: "device-1",
-        deepLink: "https://tracker.example.test/device-1",
+        trackerId: "tracker-1",
       },
     });
     expect(tracker.statusCode).toBe(400);
+  });
+
+  it("limits staff contract reads to inventory and compliance roles", async () => {
+    const passwordHash = await argon2.hash("correct horse battery staple", {
+      type: argon2.argon2id,
+      memoryCost: 19_456,
+      timeCost: 2,
+      parallelism: 1,
+    });
+    const support = await createStaffUser(database, {
+      email: `support-${randomUUID()}@example.test`,
+      passwordHash,
+      roles: ["CUSTOMER_SUPPORT"],
+    });
+    const auditor = await createStaffUser(database, {
+      email: `auditor-${randomUUID()}@example.test`,
+      passwordHash,
+      roles: ["COMPLIANCE_AUDITOR"],
+    });
+    async function login(email: string) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/staff/sessions",
+        payload: {
+          email,
+          password: "correct horse battery staple",
+          mfaAssertion: "valid",
+        },
+      });
+      return String(
+        (Array.isArray(response.headers["set-cookie"])
+          ? response.headers["set-cookie"]
+          : [response.headers["set-cookie"]])[0],
+      ).split(";", 1)[0];
+    }
+    const supportRead = await app.inject({
+      method: "GET",
+      url: `/v1/staff/applications/${randomUUID()}/contract`,
+      headers: { cookie: await login(support.email) },
+    });
+    expect(supportRead.statusCode).toBe(403);
+    const auditorRead = await app.inject({
+      method: "GET",
+      url: `/v1/staff/applications/${randomUUID()}/contract`,
+      headers: { cookie: await login(auditor.email) },
+    });
+    expect(auditorRead.statusCode).toBe(200);
+    expect(auditorRead.json()).toBeNull();
   });
 });

@@ -12,6 +12,7 @@ import {
   queryTestSql,
   resetTestDatabase,
 } from "../../../packages/testkit/src/index.js";
+import { createTrackerSimulator } from "@somo/integrations/simulators";
 import type {
   CustomerPrincipal,
   StaffPrincipal,
@@ -58,7 +59,23 @@ beforeAll(() => {
 beforeEach(async () => {
   await resetTestDatabase(databaseUrl!);
   await migrateDatabase(database);
-  assets = createAssetService({ database });
+  assets = createAssetService({
+    database,
+    tracker: createTrackerSimulator({
+      environment: "test",
+      fixtures: [
+        {
+          trackerId: "TRACKER-TASK10-0007",
+          result: {
+            latitude: "5.603717",
+            longitude: "-0.186964",
+            recordedAt: "2026-08-20T12:00:00.000Z",
+            deviceStatus: "ONLINE",
+          },
+        },
+      ],
+    }),
+  });
   contracts = createContractService({
     database,
     template: createSyntheticContractTemplateForTesting(),
@@ -78,6 +95,23 @@ afterAll(async () => {
 });
 
 describe("asset, contract, and handover controls against PostgreSQL", () => {
+  it("rejects simulator and unattested tracker adapters in production", () => {
+    expect(() =>
+      createAssetService({
+        database,
+        environment: "production",
+        tracker: createTrackerSimulator({ environment: "test", fixtures: [] }),
+      }),
+    ).toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
+    expect(() =>
+      createAssetService({
+        database,
+        environment: "production",
+        tracker: { async getLastKnown() { return null; } },
+      }),
+    ).toThrow("PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED");
+  });
+
   it("rejects duplicate or incomplete vehicle identifiers", async () => {
     const graph = await seedGraph();
     const actor = await seedStaff("inventory", "INVENTORY_OFFICER");
@@ -238,9 +272,7 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
     );
     await assets.associateTracker({
       vehicleUnitId: vehicle.id,
-      provider: "Synthetic Tracker",
-      providerDeviceId: `DEVICE-${vehicle.id.slice(0, 8)}`,
-      deepLink: "https://tracker.example.test/device/7",
+      trackerId: "TRACKER-TASK10-0007",
       expectedVehicleVersion: vehicle.version,
       actor: inventory.actor,
       requestId: randomUUID(),
@@ -260,7 +292,12 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       actor: recovery.actor,
       requestId: randomUUID(),
     });
-    expect(access.deepLink).toContain("tracker.example.test");
+    expect(access).toMatchObject({
+      latitude: "5.603717",
+      longitude: "-0.186964",
+      recordedAt: "2026-08-20T12:00:00.000Z",
+    });
+    expect(access).not.toHaveProperty("deepLink");
     const audit = await queryTestSql<{ data: Record<string, unknown> }>(
       databaseUrl!,
       "select data from audit_event where aggregate_type = 'vehicle_unit' and aggregate_id = $1 and action = 'TRACKER_LOCATION_ACCESS' order by recorded_at desc limit 1",
@@ -345,8 +382,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       contracts.recordPhysicalExecution({
         contractId: contract.id,
         expectedVersion: contract.version,
-        applicantSignature: "signed-applicant",
-        guarantorSignature: "signed-guarantor",
+        applicantPersonId: graph.applicantId,
+        guarantorPersonId: graph.guarantorId,
         staffWitnessId: actor.actor.staffUserId,
         executionDate: new Date().toISOString(),
         headOfficeId: testHeadOffice.id,
@@ -389,8 +426,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
     const executed = await contracts.recordPhysicalExecution({
       contractId: contract.id,
       expectedVersion: contract.version,
-      applicantSignature: "signed-applicant",
-      guarantorSignature: "signed-guarantor",
+      applicantPersonId: graph.applicantId,
+      guarantorPersonId: graph.guarantorId,
       staffWitnessId: actor.actor.staffUserId,
       executionDate: new Date().toISOString(),
       headOfficeId: testHeadOffice.id,
@@ -433,8 +470,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         checklist: { keys: true },
         customerAcknowledged: true,
         customerAcknowledgementId: randomUUID(),
-        condition: { exterior: "new" },
-        accessories: ["helmet"],
+        condition: { description: "Factory-new condition", checkResult: "PASS" },
+        accessories: { items: ["helmet"], none: false },
         headOfficeId: testHeadOffice.id,
         headOfficeLocation: testHeadOffice.location,
         handedOverAt: new Date().toISOString(),
@@ -450,8 +487,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       checklist,
       customerAcknowledged: true,
       customerAcknowledgementId: customerAcknowledgement.id,
-      condition: { exterior: "new" },
-      accessories: ["helmet"],
+      condition: { description: "Factory-new condition", checkResult: "PASS" },
+      accessories: { items: ["helmet"], none: false },
       headOfficeId: testHeadOffice.id,
       headOfficeLocation: testHeadOffice.location,
       handedOverAt: new Date().toISOString(),
@@ -496,8 +533,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         checklist: { complete: true },
         customerAcknowledged: true,
         customerAcknowledgementId: randomUUID(),
-        condition: {},
-        accessories: [],
+        condition: { description: "Handover condition recorded", checkResult: "PASS" },
+        accessories: { items: [], none: true },
         headOfficeId: testHeadOffice.id,
         headOfficeLocation: testHeadOffice.location,
         handedOverAt: new Date().toISOString(),
@@ -546,8 +583,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         customerAcknowledged: true,
         customerAcknowledgementId: acknowledgement.id,
         customerAcknowledgedByPersonId: prepared.graph.guarantorId,
-        condition: {},
-        accessories: [],
+        condition: { description: "Handover condition recorded", checkResult: "PASS" },
+        accessories: { items: [], none: true },
         headOfficeId: testHeadOffice.id,
         headOfficeLocation: testHeadOffice.location,
         handedOverAt: new Date().toISOString(),
@@ -556,6 +593,64 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
         requestId: randomUUID(),
       }),
     ).rejects.toMatchObject({ code: "CUSTOMER_ACKNOWLEDGEMENT_INVALID" });
+  });
+
+  it("binds physical signatories to the application and requires structured handover evidence", async () => {
+    const prepared = await prepareExecutedContract({ label: "privacy-gates" });
+    await expect(
+      contracts.recordPhysicalExecution({
+        contractId: prepared.executed.id,
+        expectedVersion: prepared.executed.version,
+        applicantPersonId: prepared.graph.guarantorId,
+        guarantorPersonId: prepared.graph.guarantorId,
+        staffWitnessId: prepared.actor.actor.staffUserId,
+        executionDate: new Date().toISOString(),
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
+        executedDocumentId: randomUUID(),
+        executedDocumentHash: "b".repeat(64),
+        authorizationReason: "Recorded signatory correction",
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "SIGNATORY_BINDING_INVALID" });
+
+    const checklist = {
+      items: [
+        { itemId: "identity_verified", result: "PASS" },
+        { itemId: "keys_received", result: "PASS" },
+        { itemId: "condition_recorded", result: "PASS" },
+        { itemId: "accessories_recorded", result: "PASS" },
+      ],
+    };
+    const customer = await seedCustomerPrincipal(prepared.graph.applicantId);
+    const acknowledgement = await handover.acknowledge({
+      contractId: prepared.executed.id,
+      checklistVersion: "handover-v1",
+      checklist,
+      actor: customer,
+      idempotencyKey: randomUUID(),
+      requestId: randomUUID(),
+    });
+    await expect(
+      handover.complete({
+        contractId: prepared.executed.id,
+        expectedVersion: prepared.executed.version,
+        checklistVersion: "handover-v1",
+        checklist,
+        customerAcknowledged: true,
+        customerAcknowledgementId: acknowledgement.id,
+        condition: {} as never,
+        accessories: { items: [], none: true },
+        headOfficeId: testHeadOffice.id,
+        headOfficeLocation: testHeadOffice.location,
+        handedOverAt: new Date().toISOString(),
+        actor: prepared.actor.actor,
+        idempotencyKey: randomUUID(),
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ code: "HANDOVER_CONDITION_INVALID" });
   });
 
   it("denies reassignment after a contract binds the assigned vehicle", async () => {
@@ -607,8 +702,8 @@ describe("asset, contract, and handover controls against PostgreSQL", () => {
       checklist,
       customerAcknowledged: true,
       customerAcknowledgementId: acknowledgement.id,
-      condition: {},
-      accessories: [],
+      condition: { description: "Factory-new condition", checkResult: "PASS" },
+      accessories: { items: [], none: true },
       headOfficeId: testHeadOffice.id,
       headOfficeLocation: testHeadOffice.location,
       handedOverAt: new Date().toISOString(),
@@ -862,8 +957,8 @@ async function prepareExecutedContract(input: {
   const executed = await contracts.recordPhysicalExecution({
     contractId: contract.id,
     expectedVersion: contract.version,
-    applicantSignature: "signed-applicant",
-    guarantorSignature: "signed-guarantor",
+    applicantPersonId: graph.applicantId,
+    guarantorPersonId: graph.guarantorId,
     staffWitnessId: actor.actor.staffUserId,
     executionDate: new Date().toISOString(),
     headOfficeId: testHeadOffice.id,

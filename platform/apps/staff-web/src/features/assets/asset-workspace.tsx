@@ -24,6 +24,18 @@ export function AssetWorkspace({
   );
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const [registrationNumber, setRegistrationNumber] = useState("");
+  const [registrationValidFrom, setRegistrationValidFrom] = useState("");
+  const [registrationValidTo, setRegistrationValidTo] = useState("");
+  const [insurancePolicyNumber, setInsurancePolicyNumber] = useState("");
+  const [insuranceProvider, setInsuranceProvider] = useState("");
+  const [insuranceValidFrom, setInsuranceValidFrom] = useState("");
+  const [insuranceValidTo, setInsuranceValidTo] = useState("");
+  const [trackerId, setTrackerId] = useState("");
+  const [coverageState, setCoverageState] = useState<{
+    registration?: { validTo: string; state: string };
+    insurance?: { validTo: string; state: string };
+  }>({});
 
   useEffect(() => {
     let active = true;
@@ -166,6 +178,140 @@ export function AssetWorkspace({
       {contractsApi !== undefined ? (
         <ContractWorkspace api={contractsApi} />
       ) : null}
+      <section className="panel" aria-labelledby="asset-evidence-title">
+        <h2 id="asset-evidence-title">Registration, insurance, and tracker evidence</h2>
+        <p>
+          These writes require the selected vehicle version and an idempotency
+          key. Tracker association accepts only an attested location-only
+          capability; tracker IDs are not shown in inventory.
+        </p>
+        <form
+          aria-label="Vehicle registration evidence"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!vehicleUnitId.trim()) {
+              setActionError("Select a vehicle before recording evidence.");
+              return;
+            }
+            void api
+              .recordRegistration(vehicleUnitId.trim(), {
+                registrationNumber,
+                validFrom: registrationValidFrom,
+                validTo: registrationValidTo,
+                expectedVehicleVersion: Number(expectedVersion),
+                idempotencyKey: crypto.randomUUID(),
+              })
+              .then((result) => {
+                setCoverageState((current) => ({
+                  ...current,
+                  registration: {
+                    validTo: result.validTo,
+                    state: coverageStatus(result.validTo),
+                  },
+                }));
+                setExpectedVersion(String(result.version));
+                setNotice("Registration evidence recorded");
+              })
+              .catch((error: unknown) => setActionError(assetActionMessage(error)));
+          }}
+        >
+          <label>
+            Registration number
+            <input value={registrationNumber} onChange={(event) => setRegistrationNumber(event.target.value)} />
+          </label>
+          <label>
+            Registration valid from
+            <input type="date" value={registrationValidFrom} onChange={(event) => setRegistrationValidFrom(event.target.value)} />
+          </label>
+          <label>
+            Registration valid until
+            <input type="date" value={registrationValidTo} onChange={(event) => setRegistrationValidTo(event.target.value)} />
+          </label>
+          <button type="submit">Record registration</button>
+        </form>
+        {coverageState.registration ? (
+          <p role="status">Registration {coverageState.registration.state}; valid until {coverageState.registration.validTo}</p>
+        ) : null}
+        <form
+          aria-label="Vehicle insurance evidence"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!vehicleUnitId.trim()) {
+              setActionError("Select a vehicle before recording evidence.");
+              return;
+            }
+            void api
+              .recordInsurance(vehicleUnitId.trim(), {
+                policyNumber: insurancePolicyNumber,
+                provider: insuranceProvider,
+                validFrom: insuranceValidFrom,
+                validTo: insuranceValidTo,
+                expectedVehicleVersion: Number(expectedVersion),
+                idempotencyKey: crypto.randomUUID(),
+              })
+              .then((result) => {
+                setCoverageState((current) => ({
+                  ...current,
+                  insurance: {
+                    validTo: result.validTo,
+                    state: coverageStatus(result.validTo),
+                  },
+                }));
+                setExpectedVersion(String(result.version));
+                setNotice("Insurance evidence recorded");
+              })
+              .catch((error: unknown) => setActionError(assetActionMessage(error)));
+          }}
+        >
+          <label>
+            Insurance policy number
+            <input value={insurancePolicyNumber} onChange={(event) => setInsurancePolicyNumber(event.target.value)} />
+          </label>
+          <label>
+            Insurance provider
+            <input value={insuranceProvider} onChange={(event) => setInsuranceProvider(event.target.value)} />
+          </label>
+          <label>
+            Insurance valid from
+            <input type="date" value={insuranceValidFrom} onChange={(event) => setInsuranceValidFrom(event.target.value)} />
+          </label>
+          <label>
+            Insurance valid until
+            <input type="date" value={insuranceValidTo} onChange={(event) => setInsuranceValidTo(event.target.value)} />
+          </label>
+          <button type="submit">Record insurance</button>
+        </form>
+        {coverageState.insurance ? (
+          <p role="status">Insurance {coverageState.insurance.state}; valid until {coverageState.insurance.validTo}</p>
+        ) : null}
+        <form
+          aria-label="Attested tracker association"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!vehicleUnitId.trim()) {
+              setActionError("Select a vehicle before associating a tracker.");
+              return;
+            }
+            void api
+              .associateTracker(vehicleUnitId.trim(), {
+                trackerId,
+                expectedVehicleVersion: Number(expectedVersion),
+                idempotencyKey: crypto.randomUUID(),
+              })
+              .then((result) => {
+                setExpectedVersion(String(result.version));
+                setNotice("Attested location-only tracker association recorded");
+              })
+              .catch((error: unknown) => setActionError(assetActionMessage(error)));
+          }}
+        >
+          <label>
+            Attested tracker ID
+            <input value={trackerId} onChange={(event) => setTrackerId(event.target.value)} />
+          </label>
+          <button type="submit">Associate tracker</button>
+        </form>
+      </section>
     </main>
   );
 }
@@ -178,8 +324,8 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
   >(undefined);
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
-  const [applicantSignature, setApplicantSignature] = useState("");
-  const [guarantorSignature, setGuarantorSignature] = useState("");
+  const [applicantPersonId, setApplicantPersonId] = useState("");
+  const [guarantorPersonId, setGuarantorPersonId] = useState("");
   const [staffWitnessId, setStaffWitnessId] = useState("");
   const [executedDocumentId, setExecutedDocumentId] = useState("");
   const [executedDocumentHash, setExecutedDocumentHash] = useState("");
@@ -193,6 +339,10 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
     condition_recorded: false,
     accessories_recorded: false,
   });
+  const [conditionDescription, setConditionDescription] = useState("");
+  const [conditionCheckResult, setConditionCheckResult] = useState("");
+  const [accessoryItems, setAccessoryItems] = useState("");
+  const [noAccessories, setNoAccessories] = useState(false);
 
   async function loadContract() {
     setContract(undefined);
@@ -245,8 +395,8 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
       setContract(
         await api.recordExecution(contract.id, {
           expectedVersion: contract.version,
-          applicantSignature,
-          guarantorSignature,
+          applicantPersonId,
+          guarantorPersonId,
           staffWitnessId,
           executionDate: new Date().toISOString(),
           headOfficeId,
@@ -278,8 +428,19 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
           checklist: { items },
           customerAcknowledged: true,
           customerAcknowledgementId,
-          condition: {},
-          accessories: [],
+          condition: {
+            description: conditionDescription,
+            checkResult: conditionCheckResult,
+          },
+          accessories: {
+            items: noAccessories
+              ? []
+              : accessoryItems
+                  .split(",")
+                  .map((item) => item.trim())
+                  .filter(Boolean),
+            none: noAccessories,
+          },
           headOfficeId,
           headOfficeLocation,
           handedOverAt: new Date().toISOString(),
@@ -355,22 +516,23 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
               }}
             >
               <p>
-                Physical applicant and guarantor signatures, a staff witness,
-                and a clean executed PDF are required at the configured head
-                office.
+                Record the applicant and confirmed guarantor person IDs as
+                witnessed signatories. Typed, drawn, or e-signature values are
+                not accepted; a staff witness and clean executed PDF are
+                required at the configured head office.
               </p>
               <label>
-                Applicant signature
+                Applicant person ID
                 <input
-                  value={applicantSignature}
-                  onChange={(event) => setApplicantSignature(event.target.value)}
+                  value={applicantPersonId}
+                  onChange={(event) => setApplicantPersonId(event.target.value)}
                 />
               </label>
               <label>
-                Guarantor signature
+                Guarantor person ID
                 <input
-                  value={guarantorSignature}
-                  onChange={(event) => setGuarantorSignature(event.target.value)}
+                  value={guarantorPersonId}
+                  onChange={(event) => setGuarantorPersonId(event.target.value)}
                 />
               </label>
               <label>
@@ -451,6 +613,36 @@ export function ContractWorkspace({ api }: { api: StaffContractApi }) {
                   </label>
                 ))}
               </fieldset>
+              <label>
+                Condition description
+                <textarea
+                  value={conditionDescription}
+                  onChange={(event) => setConditionDescription(event.target.value)}
+                />
+              </label>
+              <label>
+                Condition check result
+                <input
+                  value={conditionCheckResult}
+                  onChange={(event) => setConditionCheckResult(event.target.value)}
+                />
+              </label>
+              <label>
+                Accessories (comma-separated, if any)
+                <input
+                  value={accessoryItems}
+                  disabled={noAccessories}
+                  onChange={(event) => setAccessoryItems(event.target.value)}
+                />
+              </label>
+              <label>
+                No accessories supplied
+                <input
+                  type="checkbox"
+                  checked={noAccessories}
+                  onChange={(event) => setNoAccessories(event.target.checked)}
+                />
+              </label>
               <button type="submit">Record physical handover</button>
             </form>
           ) : null}
@@ -483,7 +675,16 @@ function assetActionMessage(error: unknown): string {
     return "Assignment blocked: vehicle model does not match the application.";
   if (code === "STALE_VERSION")
     return "The vehicle changed before assignment. Refresh inventory and try again.";
+  if (code === "TRACKER_CAPABILITY_UNAVAILABLE")
+    return "Tracker association is blocked until an attested location-only capability is configured.";
   return "The vehicle assignment could not be recorded.";
+}
+
+function coverageStatus(validTo: string): "CURRENT" | "EXPIRED" {
+  const expiresAt = Date.parse(`${validTo}T23:59:59.999Z`);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now()
+    ? "CURRENT"
+    : "EXPIRED";
 }
 
 function contractActionMessage(error: unknown): string {

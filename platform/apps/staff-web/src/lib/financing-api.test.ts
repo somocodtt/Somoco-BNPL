@@ -110,6 +110,59 @@ describe("staff financing API adapter", () => {
       code: "MALFORMED_RULE_LIST",
     });
   });
+
+  it("sends versioned registration, insurance, and attested tracker writes", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          vehicleUnitId: "vehicle-1",
+          registrationNumber: "REG-1",
+          validTo: "2027-01-01",
+          version: 2,
+          renewalWarningState: "RENEWAL_REVIEW_REQUIRED",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          vehicleUnitId: "vehicle-1",
+          policyNumber: "POLICY-1",
+          validTo: "2027-01-01",
+          version: 3,
+          renewalWarningState: "RENEWAL_REVIEW_REQUIRED",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ vehicleUnitId: "vehicle-1", version: 4 }),
+      );
+    const api = new FetchStaffApi("", fetcher);
+    await api.recordRegistration("vehicle-1", {
+      registrationNumber: "REG-1",
+      validFrom: "2026-01-01",
+      validTo: "2027-01-01",
+      expectedVehicleVersion: 1,
+      idempotencyKey: "registration-key-1",
+    });
+    await api.recordInsurance("vehicle-1", {
+      policyNumber: "POLICY-1",
+      provider: "Insurer",
+      validFrom: "2026-01-01",
+      validTo: "2027-01-01",
+      expectedVehicleVersion: 2,
+      idempotencyKey: "insurance-key-1",
+    });
+    await api.associateTracker("vehicle-1", {
+      trackerId: "tracker-1",
+      expectedVehicleVersion: 3,
+      idempotencyKey: "tracker-key-1",
+    });
+    expect(fetcher).toHaveBeenLastCalledWith(
+      "/v1/staff/assets/vehicle-1/tracker",
+      expect.objectContaining({
+        body: expect.stringContaining('"trackerId":"tracker-1"'),
+      }),
+    );
+  });
 });
 
 function jsonResponse(body: unknown): Response {

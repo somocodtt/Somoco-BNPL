@@ -8,6 +8,10 @@ import {
   type Database,
   type VehicleRow,
 } from "@somo/db";
+import {
+  requireProductionConnector,
+  type TrackerPort,
+} from "@somo/integrations";
 import type { StaffPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 
@@ -40,7 +44,9 @@ export interface AssignmentRecord extends Record<string, unknown> {
 
 export interface TrackerAccessRecord {
   vehicleUnitId: string;
-  deepLink: string;
+  latitude: string;
+  longitude: string;
+  recordedAt: string;
   accessedAt: string;
 }
 
@@ -95,9 +101,7 @@ export interface AssetService {
   }>;
   associateTracker(input: {
     vehicleUnitId: string;
-    provider: string;
-    providerDeviceId: string;
-    deepLink: string;
+    trackerId: string;
     expectedVehicleVersion: number;
     idempotencyKey: string;
     actor: StaffPrincipal;
@@ -144,7 +148,22 @@ export interface AssetService {
 
 export function createAssetService(options: {
   database: Database;
+  tracker?: TrackerPort;
+  environment?: "test" | "production";
 }): AssetService {
+  const environment = options.environment ?? "test";
+  const trackerPort = options.tracker;
+  if (environment === "production" && trackerPort !== undefined) {
+    try {
+      requireProductionConnector(trackerPort, "TRACKER");
+    } catch (error) {
+      throw new Error(
+        error instanceof Error
+          ? error.message
+          : "PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED",
+      );
+    }
+  }
   return {
     async registerVehicle(input) {
       requireRole(input.actor, "INVENTORY_OFFICER");
@@ -502,32 +521,22 @@ export function createAssetService(options: {
 
     async associateTracker(input) {
       requireRole(input.actor, "INVENTORY_OFFICER");
-      const provider = requiredIdentifier(
-        input.provider,
-        "TRACKER_PROVIDER_REQUIRED",
-      );
-      const providerDeviceId = requiredIdentifier(
-        input.providerDeviceId,
+      const trackerId = requiredIdentifier(
+        input.trackerId,
         "TRACKER_IDENTIFIER_REQUIRED",
       );
-      const deepLink = requiredIdentifier(
-        input.deepLink,
-        "TRACKER_LINK_REQUIRED",
-      );
-      if (!/^https:\/\//.test(deepLink)) {
+      if (trackerPort === undefined) {
         throw new AppError(
-          400,
-          "TRACKER_LINK_INVALID",
-          "The tracker link is invalid.",
+          503,
+          "TRACKER_CAPABILITY_UNAVAILABLE",
+          "An attested read-only tracker capability is required.",
         );
       }
       validateExpectedVehicleVersion(input.expectedVehicleVersion);
       const payloadHash = hashPayload({
         vehicleUnitId: input.vehicleUnitId,
         expectedVehicleVersion: input.expectedVehicleVersion,
-        provider,
-        providerDeviceId,
-        deepLink,
+        trackerId,
       });
       const scope = `vehicle:${input.vehicleUnitId}:tracker-associate`;
       const existing = await assetContractRepo(options.database).findCommand(
@@ -568,14 +577,13 @@ export function createAssetService(options: {
           await repo.insertTracker({
             id: randomUUID(),
             vehicleUnitId: input.vehicleUnitId,
-            provider,
-            providerDeviceId,
-            deepLink,
+            trackerId,
             associatedAt: now,
           });
-          const updatedVehicle = await repo.bumpVehicleVersion(
+          const updatedVehicle = await repo.updateVehicleTrackerIdentifier(
             vehicle.id,
             input.expectedVehicleVersion,
+            trackerId,
             now,
           );
           const response = {
@@ -589,7 +597,7 @@ export function createAssetService(options: {
             action: "TRACKER_ASSOCIATED",
             actorStaffUserId: input.actor.staffUserId,
             requestId: input.requestId,
-            data: { provider, providerDeviceId },
+            data: { trackerId, trackerConfigured: true, locationOnly: true },
             occurredAt: now,
           });
           await enqueueOutbox(tx, {
@@ -1171,14 +1179,29 @@ export function createAssetService(options: {
 
     async getTrackerAccess(input) {
       requireRole(input.actor, "RECOVERY_OFFICER");
-      const tracker = await assetContractRepo(options.database).currentTracker(
+      if (trackerPort === undefined)
+        throw new AppError(
+          503,
+          "TRACKER_CAPABILITY_UNAVAILABLE",
+          "An attested read-only tracker capability is required.",
+        );
+      const association = await assetContractRepo(options.database).currentTracker(
         input.vehicleUnitId,
       );
-      if (tracker === null)
+      if (association === null || association.tracker_identifier === null)
         throw new AppError(
           404,
-          "TRACKER_NOT_FOUND",
-          "No active tracker association was found.",
+          "TRACKER_LOCATION_UNAVAILABLE",
+          "No last-known tracker location is available.",
+        );
+      const location = await trackerPort.getLastKnown({
+        trackerId: association.tracker_identifier,
+      });
+      if (location === null)
+        throw new AppError(
+          404,
+          "TRACKER_LOCATION_UNAVAILABLE",
+          "No last-known tracker location is available.",
         );
       const now = new Date();
       await withTransaction(options.database, async (tx) => {
@@ -1205,7 +1228,9 @@ export function createAssetService(options: {
       });
       return {
         vehicleUnitId: input.vehicleUnitId,
-        deepLink: tracker.deep_link,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        recordedAt: location.recordedAt,
         accessedAt: now.toISOString(),
       };
     },

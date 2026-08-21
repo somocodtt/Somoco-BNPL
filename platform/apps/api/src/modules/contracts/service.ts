@@ -109,8 +109,8 @@ export interface ContractService {
   recordPhysicalExecution(input: {
     contractId: string;
     expectedVersion: number;
-    applicantSignature: string;
-    guarantorSignature: string;
+    applicantPersonId: string;
+    guarantorPersonId: string;
     staffWitnessId: string;
     executionDate: string;
     headOfficeId: string;
@@ -133,7 +133,10 @@ export interface ContractService {
     applicationId: string,
     actor: CustomerPrincipal,
   ): Promise<CustomerContractView | null>;
-  get(applicationId: string): Promise<ContractRecord | null>;
+  get(
+    applicationId: string,
+    actor: StaffPrincipal,
+  ): Promise<ContractRecord | null>;
 }
 
 export function createContractService(options: {
@@ -402,14 +405,11 @@ export function createContractService(options: {
           "STAFF_WITNESS_REQUIRED",
           "The authenticated staff witness must record the execution.",
         );
-      if (
-        input.applicantSignature.trim().length === 0 ||
-        input.guarantorSignature.trim().length === 0
-      )
+      if (!isUuid(input.applicantPersonId) || !isUuid(input.guarantorPersonId))
         throw new AppError(
           400,
-          "SIGNATURES_REQUIRED",
-          "Applicant and guarantor signatures are required.",
+          "SIGNATORY_BINDING_INVALID",
+          "Applicant and guarantor person IDs are required.",
         );
       const executionDate = parseDate(
         input.executionDate,
@@ -436,8 +436,8 @@ export function createContractService(options: {
       const payloadHash = hashPayload({
         contractId: input.contractId,
         expectedVersion: input.expectedVersion,
-        applicantSignature: input.applicantSignature,
-        guarantorSignature: input.guarantorSignature,
+        applicantPersonId: input.applicantPersonId,
+        guarantorPersonId: input.guarantorPersonId,
         staffWitnessId: input.staffWitnessId,
         executionDate: executionDate.toISOString(),
         headOfficeId: executionHeadOffice.id,
@@ -487,6 +487,19 @@ export function createContractService(options: {
         const application = await repo.findApplication(contract.application_id);
         if (application === null)
           throw notFound("APPLICATION_NOT_FOUND", "Application not found.");
+        const confirmedGuarantorPersonId =
+          application.guarantor_person_id ??
+          (await repo.confirmedGuarantor(application.id));
+        if (
+          input.applicantPersonId !== application.applicant_person_id ||
+          confirmedGuarantorPersonId === null ||
+          input.guarantorPersonId !== confirmedGuarantorPersonId
+        )
+          throw new AppError(
+            403,
+            "SIGNATORY_BINDING_INVALID",
+            "The witnessed signatories must be the application applicant and confirmed guarantor.",
+          );
         const document = await repo.cleanDocument(
           input.executedDocumentId,
           hash,
@@ -505,8 +518,8 @@ export function createContractService(options: {
           id: randomUUID(),
           contractId: contract.id,
           versionNumber: (previous?.version_number ?? 0) + 1,
-          applicantSignature: input.applicantSignature.trim(),
-          guarantorSignature: input.guarantorSignature.trim(),
+          applicantPersonId: input.applicantPersonId,
+          guarantorPersonId: input.guarantorPersonId,
           staffWitnessId: input.staffWitnessId,
           executionDate,
           headOfficeId: executionHeadOffice.id,
@@ -789,7 +802,17 @@ export function createContractService(options: {
       };
     },
 
-    async get(applicationId) {
+    async get(applicationId, actor) {
+      if (
+        !actor.roles.some((role) =>
+          ["INVENTORY_OFFICER", "COMPLIANCE_AUDITOR"].includes(role),
+        )
+      )
+        throw new AppError(
+          403,
+          "FORBIDDEN",
+          "This contract read is not permitted for the staff role.",
+        );
       const contract = await assetContractRepo(
         options.database,
       ).findContractByApplication(applicationId);

@@ -17,6 +17,8 @@ describe("staff asset and contract workspace", () => {
     expect(
       screen.getByText(/MD approval, accepted locked offer/),
     ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Record registration" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Record insurance" })).toBeVisible();
   });
 
   it("surfaces API errors and binds assignment to the selected vehicle version", async () => {
@@ -57,6 +59,37 @@ describe("staff asset and contract workspace", () => {
     expect(
       await screen.findByText(/reconcile the locked deposit/),
     ).toBeVisible();
+  });
+
+  it("records coverage with optimistic versions and shows computed renewal state", async () => {
+    const user = userEvent.setup();
+    const api = fakeAssetApi();
+    api.listInventory.mockResolvedValueOnce([
+      {
+        id: "vehicle-1",
+        vehicleModelId: "model-1",
+        vin: "VIN-1",
+        chassisNumber: "CHASSIS-1",
+        engineMotorIdentifier: "ENGINE-1",
+        condition: {},
+        accessories: [],
+        trackerIdentifier: null,
+        registrationNumber: null,
+        status: "IN_STOCK",
+        version: 4,
+      },
+    ]);
+    render(<AssetWorkspace api={api} />);
+    await user.click(await screen.findByRole("button", { name: "Use this vehicle" }));
+    await user.type(screen.getByLabelText("Registration number"), "REG-1");
+    await user.type(screen.getByLabelText("Registration valid from"), "2026-01-01");
+    await user.type(screen.getByLabelText("Registration valid until"), "2027-01-01");
+    await user.click(screen.getByRole("button", { name: "Record registration" }));
+    expect(api.recordRegistration).toHaveBeenCalledWith(
+      "vehicle-1",
+      expect.objectContaining({ expectedVehicleVersion: 4 }),
+    );
+    expect(await screen.findByText(/Registration CURRENT/)).toBeVisible();
   });
 
   it("keeps production contract generation visibly fail-closed and exposes stale state", async () => {
@@ -109,8 +142,11 @@ describe("staff asset and contract workspace", () => {
     expect(screen.getByLabelText("Executed PDF SHA-256")).toBeVisible();
     expect(screen.getByLabelText("Main head-office ID")).toBeVisible();
     expect(
-      screen.getByText(/Physical applicant and guarantor signatures/),
+      screen.getByText(/applicant and confirmed guarantor person IDs/),
     ).toBeVisible();
+    expect(screen.getByLabelText("Applicant person ID")).toBeVisible();
+    expect(screen.getByLabelText("Guarantor person ID")).toBeVisible();
+    expect(screen.queryByLabelText("Applicant signature")).toBeNull();
   });
 });
 
@@ -120,6 +156,24 @@ function fakeAssetApi(): StaffAssetApi & {
 } {
   return {
     listInventory: vi.fn().mockResolvedValue([]),
+    recordRegistration: vi.fn().mockResolvedValue({
+      vehicleUnitId: "vehicle-1",
+      registrationNumber: "REG-1",
+      validTo: "2027-01-01",
+      version: 2,
+      renewalWarningState: "RENEWAL_REVIEW_REQUIRED",
+    }),
+    recordInsurance: vi.fn().mockResolvedValue({
+      vehicleUnitId: "vehicle-1",
+      policyNumber: "POLICY-1",
+      validTo: "2027-01-01",
+      version: 3,
+      renewalWarningState: "RENEWAL_REVIEW_REQUIRED",
+    }),
+    associateTracker: vi.fn().mockResolvedValue({
+      vehicleUnitId: "vehicle-1",
+      version: 4,
+    }),
     assignVehicle: vi.fn().mockResolvedValue({}),
   };
 }
