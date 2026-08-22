@@ -13,6 +13,7 @@ createRoot(document.getElementById("root")!).render(
       assetsApi={api}
       contractsApi={api}
       paymentsApi={api}
+      collectionsApi={api}
     />
   </StrictMode>,
 );

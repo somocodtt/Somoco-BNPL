@@ -496,6 +496,15 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         .orderBy(asc(recoveryAction.createdAt));
     },
 
+    async findRecoveryActionByKey(idempotencyKey: string) {
+      const [row] = await executor
+        .select()
+        .from(recoveryAction)
+        .where(eq(recoveryAction.idempotencyKey, idempotencyKey))
+        .limit(1);
+      return row ?? null;
+    },
+
     async updateRecoveryCase(
       id: string,
       values: Partial<typeof recoveryCase.$inferInsert>,
@@ -527,9 +536,18 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       const [row] = await executor
         .insert(recoveryAction)
         .values(input)
+        .onConflictDoNothing({
+          target: recoveryAction.idempotencyKey,
+          where: sql`${recoveryAction.idempotencyKey} is not null`,
+        })
         .returning();
-      if (row === undefined) throw new Error("RECOVERY_ACTION_CREATE_FAILED");
-      return row;
+      if (row !== undefined) return { row, inserted: true } as const;
+      const existing =
+        input.idempotencyKey === null || input.idempotencyKey === undefined
+          ? null
+          : await this.findRecoveryActionByKey(input.idempotencyKey);
+      if (existing === null) throw new Error("RECOVERY_ACTION_CREATE_FAILED");
+      return { row: existing, inserted: false } as const;
     },
 
     async insertRecoveryLocationLookup(
@@ -620,6 +638,41 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       return { row: existing, inserted: false } as const;
     },
 
+    async findSettlementEvidenceDocument(
+      contractId: string,
+      documentId: string,
+    ) {
+      const result = await executor.execute<{
+        document_id: string;
+        person_id: string;
+        object_key: string;
+        accepted_object_key: string;
+        accepted_object_version_id: string;
+        accepted_object_etag: string;
+        sha256: string;
+        status: string;
+        malware_scanned: boolean;
+      }>(sql`
+        select d.id as document_id,
+               d.person_id,
+               d.object_key,
+               d.accepted_object_key,
+               d.accepted_object_version_id,
+               d.accepted_object_etag,
+               d.sha256,
+               d.status,
+               d.malware_scanned
+          from contract c
+          join application a on a.id = c.application_id
+          join privacy.document d on d.person_id = a.applicant_person_id
+         where c.id = ${contractId}
+           and d.id = ${documentId}::uuid
+           and d.document_type = 'TRANSFER_EVIDENCE'
+         limit 1
+      `);
+      return result.rows[0] ?? null;
+    },
+
     async findSettlementEvidence(contractId: string) {
       const [row] = await executor
         .select()
@@ -630,6 +683,11 @@ export function collectionsRepo(tx: DatabaseTransaction) {
     },
 
     async settlementGate(contractId: string) {
+      await executor.execute(sql`
+        select pg_advisory_xact_lock(
+          hashtextextended('somo:settlement-reconciliation', 0)
+        )
+      `);
       const result = await executor.execute<{
         contract_status: string;
         balance: bigint | string;
@@ -661,6 +719,14 @@ export function collectionsRepo(tx: DatabaseTransaction) {
          for update
       `);
       return result.rows[0] ?? null;
+    },
+
+    async lockContractAggregate(contractId: string) {
+      await executor.execute(sql`
+        select pg_advisory_xact_lock(
+          hashtextextended(${contractId}::text, 9137)
+        )
+      `);
     },
 
     async findSettlementWorkflow(contractId: string, lock = false) {
@@ -768,6 +834,7 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         .values({ ...message, availableAt: message.occurredAt })
         .onConflictDoNothing({
           target: [outboxMessage.topic, outboxMessage.aggregateId],
+          where: sql`${outboxMessage.topic} in ('ContractSettled', 'OwnershipTransferred')`,
         })
         .returning({ id: outboxMessage.id });
       return row !== undefined;

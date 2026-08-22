@@ -38,6 +38,41 @@ describe("customer financing API adapter", () => {
     );
   });
 
+  it("loads authenticated account status and reminders through the typed collections client", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          sessionToken: "session-1",
+          expiresAt: "2026-08-21T00:00:00.000Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            contractId: "contract-1",
+            contractStatus: "ACTIVE",
+            outstandingBalanceMinorUnits: "10000",
+            nextDueDate: "2026-09-01",
+            overdueMinorUnits: "0",
+            consecutiveMissedPayments: 0,
+            totalUnpaidPayments: 0,
+            signals: [],
+            cashAccepted: false,
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(jsonResponse([]));
+    const api = new FetchCustomerApi("", fetcher);
+    await api.verifyOtp("+233200000001", "123456");
+    await expect(api.getAccountStatus()).resolves.toMatchObject([
+      { contractId: "contract-1", cashAccepted: false },
+    ]);
+    await expect(api.listReminders()).resolves.toEqual([]);
+    expect(fetcher.mock.calls[1]?.[0]).toBe("/v1/customer/account-status");
+    expect(fetcher.mock.calls[2]?.[0]).toBe("/v1/customer/reminders");
+  });
+
   it("maps the explicit offer DTO and sends versioned consent", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

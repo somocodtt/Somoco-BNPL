@@ -9,6 +9,10 @@ import {
 } from "../features/products/product-workspace.js";
 import { AssetWorkspace } from "../features/assets/asset-workspace.js";
 import { PaymentWorkspace } from "../features/payments/payment-workspace.js";
+import {
+  CollectionsWorkspace,
+  type StaffCollectionsApi,
+} from "../features/collections/collections-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
@@ -26,6 +30,7 @@ export function StaffRouter({
   assetsApi,
   contractsApi,
   paymentsApi,
+  collectionsApi,
 }: {
   api: StaffApi;
   initialSession?: StaffSession | null;
@@ -33,6 +38,7 @@ export function StaffRouter({
   assetsApi?: StaffAssetApi;
   contractsApi?: StaffContractApi;
   paymentsApi?: StaffPaymentsApi;
+  collectionsApi?: StaffCollectionsApi;
 }) {
   const [session, setSession] = useState<StaffSession | null>(initialSession);
   const [queue, setQueue] = useState<QueueApplication[] | null>(null);
@@ -43,6 +49,8 @@ export function StaffRouter({
   useEffect(() => {
     if (
       session === null ||
+      (collectionsApi !== undefined &&
+        canOperateCollectionsRole(session.roles)) ||
       (assetsApi !== undefined && session.roles.includes("INVENTORY_OFFICER"))
     ) {
       return;
@@ -74,6 +82,15 @@ export function StaffRouter({
   const canOperatePayments = session.roles.some((role) =>
     ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR", "MD"].includes(role),
   );
+  const canOperateCollections = canOperateCollectionsRole(session.roles);
+  if (collectionsApi !== undefined && canOperateCollections) {
+    return (
+      <CollectionsWorkspace
+        api={collectionsApi}
+        actorId={session.staffUserId}
+      />
+    );
+  }
   if (paymentsApi !== undefined && canOperatePayments) {
     return (
       <PaymentWorkspace
@@ -169,5 +186,18 @@ export function StaffRouter({
         ) : null}
       </section>
     </main>
+  );
+}
+
+function canOperateCollectionsRole(roles: readonly string[]): boolean {
+  return roles.some((role) =>
+    [
+      "RECOVERY_OFFICER",
+      "BSM",
+      "AGM",
+      "CFO",
+      "MD",
+      "COMPLIANCE_AUDITOR",
+    ].includes(role),
   );
 }

@@ -9,6 +9,10 @@ import {
 } from "../features/contract/contract-panel.js";
 import { PaymentPanel } from "../features/payments/payment-panel.js";
 import { ReceiptDetailPanel } from "../features/payments/receipt-detail-panel.js";
+import {
+  AccountStatusPanel,
+  type CustomerCollectionsApi,
+} from "../features/collections/account-status-panel.js";
 import type {
   ApplicantMutation,
   CustomerApi,
@@ -25,6 +29,7 @@ export function CustomerRouter({
   offerApi,
   contractApi,
   paymentsApi,
+  collectionsApi,
 }: {
   api: CustomerApi;
   initialSession?: CustomerSession | null;
@@ -32,6 +37,7 @@ export function CustomerRouter({
   offerApi?: OfferApi;
   contractApi?: ContractApi;
   paymentsApi?: CustomerPaymentsApi;
+  collectionsApi?: CustomerCollectionsApi;
 }) {
   const [session, setSession] = useState(initialSession);
   const [phoneE164, setPhoneE164] = useState(initialPhoneE164);
@@ -41,12 +47,20 @@ export function CustomerRouter({
   const [offlineNotice, setOfflineNotice] = useState("");
   const [sessionWarning, setSessionWarning] = useState(false);
   const [sessionMessage, setSessionMessage] = useState("");
+  const contractStatusRoute = readContractStatusRoute();
+  const collectionClient =
+    collectionsApi ?? (isCustomerCollectionsApi(api) ? api : undefined);
   const queue = useRef<SafeMutationQueue | null>(null);
   if (queue.current === null)
     queue.current = new SafeMutationQueue(localStorage);
 
   useEffect(() => {
-    if (session === null || invitationToken !== null) return;
+    if (
+      session === null ||
+      invitationToken !== null ||
+      contractStatusRoute !== null
+    )
+      return;
     let active = true;
     api.loadOnboarding().then(
       (loaded) => {
@@ -59,7 +73,7 @@ export function CustomerRouter({
     return () => {
       active = false;
     };
-  }, [api, invitationToken, session]);
+  }, [api, contractStatusRoute, invitationToken, session]);
 
   useEffect(() => {
     setSessionWarning(false);
@@ -143,6 +157,16 @@ export function CustomerRouter({
   const receiptId = readReceiptId();
   if (receiptId !== null && paymentsApi !== undefined) {
     return <ReceiptDetailPanel api={paymentsApi} receiptId={receiptId} />;
+  }
+  if (contractStatusRoute !== null && collectionClient !== undefined) {
+    return (
+      <main className="shell">
+        <AccountStatusPanel
+          api={collectionClient}
+          contractId={contractStatusRoute}
+        />
+      </main>
+    );
   }
   if (loadError)
     return (
@@ -332,4 +356,22 @@ function readReceiptId(): string | null {
     window.location.pathname,
   );
   return match?.[1] ?? null;
+}
+
+function readContractStatusRoute(): string | null {
+  const match = /^\/account\/contracts\/([0-9a-fA-F-]{36})\/status$/.exec(
+    window.location.pathname,
+  );
+  return match?.[1] ?? null;
+}
+
+function isCustomerCollectionsApi(
+  value: CustomerApi,
+): value is CustomerApi & CustomerCollectionsApi {
+  return (
+    typeof (value as Partial<CustomerCollectionsApi>).getAccountStatus ===
+      "function" &&
+    typeof (value as Partial<CustomerCollectionsApi>).listReminders ===
+      "function"
+  );
 }

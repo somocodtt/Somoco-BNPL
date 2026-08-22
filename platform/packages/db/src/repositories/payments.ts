@@ -460,6 +460,11 @@ export function paymentRepo(db: DatabaseTransaction) {
       dedupeKey?: string;
       resolution?: Record<string, unknown>;
     }): Promise<ReconciliationCase> {
+      await executor.execute(sql`
+        select pg_advisory_xact_lock(
+          hashtextextended('somo:settlement-reconciliation', 0)
+        )
+      `);
       const existing =
         input.paymentTransactionId === undefined
           ? undefined

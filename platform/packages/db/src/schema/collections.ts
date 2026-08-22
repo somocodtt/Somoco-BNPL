@@ -14,6 +14,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { staffUser } from "./access.js";
 import { contract, recoveryCase } from "./contracts.js";
+import { document } from "./privacy.js";
 
 export const arrearsEscalation = pgTable(
   "arrears_escalation",
@@ -107,6 +108,8 @@ export const recoveryAction = pgTable(
     recoveryCaseId: uuid("recovery_case_id")
       .notNull()
       .references(() => recoveryCase.id, { onDelete: "restrict" }),
+    idempotencyKey: text("idempotency_key"),
+    payloadHash: text("payload_hash"),
     actionType: text("action_type").notNull(),
     purpose: text("purpose").notNull(),
     requestedBy: uuid("requested_by")
@@ -123,6 +126,9 @@ export const recoveryAction = pgTable(
   },
   (table) => [
     index("recovery_action_case_idx").on(table.recoveryCaseId),
+    uniqueIndex("recovery_action_idempotency_unique")
+      .on(table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null`),
     check(
       "recovery_action_type_allowed",
       sql`${table.actionType} in ('MANUAL_RECOVERY', 'SEIZURE_EVIDENCE', 'VISIT', 'PROMISE_TO_PAY')`,
@@ -138,6 +144,10 @@ export const recoveryAction = pgTable(
     check(
       "recovery_action_evidence_hash_sha256",
       sql`${table.evidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "recovery_action_payload_hash_sha256",
+      sql`${table.payloadHash} is null or ${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
     ),
   ],
 );
@@ -217,8 +227,15 @@ export const settlementEvidence = pgTable(
     contractId: uuid("contract_id")
       .notNull()
       .references(() => contract.id, { onDelete: "restrict" }),
+    evidenceDocumentId: uuid("evidence_document_id").references(
+      () => document.id,
+      { onDelete: "restrict" },
+    ),
     evidenceDocumentReference: text("evidence_document_reference").notNull(),
     evidenceHash: text("evidence_hash").notNull(),
+    evidenceObjectKey: text("evidence_object_key"),
+    evidenceObjectVersionId: text("evidence_object_version_id"),
+    evidenceObjectEtag: text("evidence_object_etag"),
     verificationStatus: text("verification_status").notNull(),
     acceptedBy: uuid("accepted_by")
       .notNull()

@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(22);
+    expect(before.rows[0]?.count).toBe(23);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -624,6 +624,26 @@ describe("PostgreSQL persistence", () => {
         evidence: {},
       }),
     ).rejects.toMatchObject({ cause: { code: "23514" } });
+    const validAction = await db
+      .insert(recoveryAction)
+      .values({
+        recoveryCaseId,
+        actionType: "MANUAL_RECOVERY",
+        purpose: "TEST_ACTION",
+        requestedBy: staffId,
+        authorizedBy: checkerId,
+        evidenceHash: "c".repeat(64),
+        evidence: {},
+        idempotencyKey: `db-action-${randomUUID()}`,
+        payloadHash: "d".repeat(64),
+      })
+      .returning();
+    await expect(
+      db
+        .update(recoveryAction)
+        .set({ payloadHash: "e".repeat(64) })
+        .where(sql`${recoveryAction.id} = ${validAction[0]!.id}`),
+    ).rejects.toMatchObject({ cause: { code: "55000" } });
   });
 });
 
@@ -1222,7 +1242,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0021", async () => {
+  it("upgrades populated 0009 financing rows safely through 0022", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1303,6 +1323,7 @@ describe("populated legacy schema migration", () => {
     await applyMigrationFile(pool, "0019_external_payment_policy_evidence.sql");
     await applyMigrationFile(pool, "0020_flippant_bishop.sql");
     await applyMigrationFile(pool, "0021_high_siren.sql");
+    await applyMigrationFile(pool, "0022_condemned_deathbird.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;
@@ -1333,6 +1354,19 @@ describe("populated legacy schema migration", () => {
       disclosed_version: null,
       disclosure_hash: null,
       disclosure_content: null,
+    });
+    await expect(
+      pool.query(
+        `select column_name from information_schema.columns
+          where table_name = 'recovery_action'
+            and column_name in ('idempotency_key', 'payload_hash')
+         order by column_name`,
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        { column_name: "idempotency_key" },
+        { column_name: "payload_hash" },
+      ],
     });
     const preserved = await pool.query<{
       application_id: string;

@@ -25,9 +25,7 @@ export interface SettlementService {
   }): Promise<Record<string, unknown>>;
   recordEvidence(input: {
     contractId: string;
-    evidenceDocumentReference: string;
-    evidenceHash: string;
-    verificationStatus: "CLEAN";
+    evidenceDocumentId: string;
     actor: StaffPrincipal;
     requestId?: string;
   }): Promise<Record<string, unknown>>;
@@ -82,23 +80,11 @@ export function createSettlementService(options: {
           "FORBIDDEN",
           "Authorized transfer evidence acceptance is required.",
         );
-      if (input.verificationStatus !== "CLEAN")
-        throw new AppError(
-          409,
-          "TRANSFER_EVIDENCE_NOT_CLEAN",
-          "Only CLEAN transfer evidence can be accepted.",
-        );
-      if (!/^[0-9a-f]{64}$/.test(input.evidenceHash))
-        throw new AppError(
-          400,
-          "TRANSFER_EVIDENCE_HASH_INVALID",
-          "A SHA-256 evidence hash is required.",
-        );
-      if (input.evidenceDocumentReference.trim().length === 0)
+      if (!isUuid(input.evidenceDocumentId))
         throw new AppError(
           400,
           "TRANSFER_EVIDENCE_REQUIRED",
-          "Transfer evidence is required.",
+          "An accepted transfer evidence document is required.",
         );
       return withTransaction(options.database, async (tx) => {
         const repo = collectionsRepo(tx);
@@ -108,11 +94,37 @@ export function createSettlementService(options: {
             "CONTRACT_NOT_FOUND",
             "The contract was not found.",
           );
+        const document = await repo.findSettlementEvidenceDocument(
+          input.contractId,
+          input.evidenceDocumentId,
+        );
+        if (
+          document === null ||
+          document.status !== "ACCEPTED" ||
+          !document.malware_scanned ||
+          typeof document.sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(document.sha256) ||
+          typeof document.accepted_object_key !== "string" ||
+          document.accepted_object_key.length === 0 ||
+          typeof document.accepted_object_version_id !== "string" ||
+          document.accepted_object_version_id.length === 0 ||
+          typeof document.accepted_object_etag !== "string" ||
+          document.accepted_object_etag.length === 0
+        )
+          throw new AppError(
+            409,
+            "TRANSFER_EVIDENCE_NOT_CLEAN",
+            "Only an accepted clean transfer evidence document can be used.",
+          );
         const result = await repo.insertSettlementEvidence({
           id: randomUUID(),
           contractId: input.contractId,
-          evidenceDocumentReference: input.evidenceDocumentReference.trim(),
-          evidenceHash: input.evidenceHash,
+          evidenceDocumentId: document.document_id,
+          evidenceDocumentReference: document.accepted_object_key,
+          evidenceHash: document.sha256,
+          evidenceObjectKey: document.accepted_object_key,
+          evidenceObjectVersionId: document.accepted_object_version_id,
+          evidenceObjectEtag: document.accepted_object_etag,
           verificationStatus: "CLEAN",
           acceptedBy: input.actor.staffUserId,
           acceptedAt: new Date(),
@@ -127,8 +139,11 @@ export function createSettlementService(options: {
             requestId: input.requestId ?? null,
             data: {
               contractId: input.contractId,
-              evidenceDocumentReference: input.evidenceDocumentReference.trim(),
-              evidenceHash: input.evidenceHash,
+              evidenceDocumentId: document.document_id,
+              evidenceDocumentReference: document.accepted_object_key,
+              evidenceHash: document.sha256,
+              evidenceObjectVersionId: document.accepted_object_version_id,
+              evidenceObjectEtag: document.accepted_object_etag,
               verificationStatus: "CLEAN",
             },
             occurredAt: new Date(),
@@ -136,6 +151,7 @@ export function createSettlementService(options: {
         return {
           id: result.row.id,
           contractId: result.row.contractId,
+          evidenceDocumentId: result.row.evidenceDocumentId,
           evidenceDocumentReference: result.row.evidenceDocumentReference,
           evidenceHash: result.row.evidenceHash,
           verificationStatus: result.row.verificationStatus,
@@ -292,6 +308,7 @@ async function createApproval(
     );
   return withTransaction(database, async (tx) => {
     const repo = collectionsRepo(tx);
+    await repo.lockContractAggregate(input.contractId);
     if ((await repo.findContractContext(input.contractId)) === null)
       throw new AppError(
         404,
@@ -422,6 +439,42 @@ async function settleContract(
         "SETTLEMENT_GATES_INCOMPLETE",
         "Finance, business, and clean evidence gates are required.",
       );
+    const finalGate = await repo.settlementGate(input.contractId);
+    if (finalGate === null)
+      throw new AppError(
+        404,
+        "CONTRACT_NOT_FOUND",
+        "The contract was not found.",
+      );
+    if (
+      finalGate.contract_status !== "ACTIVE" ||
+      BigInt(finalGate.balance) !== 0n
+    )
+      throw new AppError(
+        409,
+        "CONTRACT_BALANCE_OUTSTANDING",
+        "The contractual balance must be zero before settlement.",
+      );
+    assertGate(finalGate);
+    const finalApprovals = await repo.findSettlementApprovals(input.contractId);
+    const finalFinance = finalApprovals.find(
+      (item) => item.approvalType === "FINANCE_RECONCILIATION",
+    );
+    const finalBusiness = finalApprovals.find(
+      (item) => item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER",
+    );
+    const finalEvidence = await repo.findSettlementEvidence(input.contractId);
+    if (
+      finalFinance === undefined ||
+      finalBusiness === undefined ||
+      finalEvidence === null ||
+      finalEvidence.verificationStatus !== "CLEAN"
+    )
+      throw new AppError(
+        409,
+        "SETTLEMENT_GATES_INCOMPLETE",
+        "Finance, business, and clean evidence gates are required.",
+      );
     const now = new Date();
     const workflowRow =
       workflow ?? (await repo.createSettlementWorkflow(input.contractId));
@@ -443,9 +496,9 @@ async function settleContract(
     }
     await repo.updateSettlementWorkflow(workflowRow.id, {
       status: "SETTLED",
-      financeApprovalId: finance.id,
-      businessApprovalId: business.id,
-      evidenceId: evidence.id,
+      financeApprovalId: finalFinance.id,
+      businessApprovalId: finalBusiness.id,
+      evidenceId: finalEvidence.id,
       settledAt: now,
       version: workflowRow.version + 1,
     });
@@ -457,9 +510,9 @@ async function settleContract(
       payload: {
         contractId: input.contractId,
         ownershipHolder: "SOMOCO",
-        financeApprovalId: finance.id,
-        businessApprovalId: business.id,
-        evidenceId: evidence.id,
+        financeApprovalId: finalFinance.id,
+        businessApprovalId: finalBusiness.id,
+        evidenceId: finalEvidence.id,
       },
       occurredAt: now,
     });
@@ -471,9 +524,9 @@ async function settleContract(
       actorPersonId: null,
       requestId: input.requestId ?? null,
       data: {
-        financeApprovalId: finance.id,
-        businessApprovalId: business.id,
-        evidenceId: evidence.id,
+        financeApprovalId: finalFinance.id,
+        businessApprovalId: finalBusiness.id,
+        evidenceId: finalEvidence.id,
         ownershipHolder: "SOMOCO",
       },
       occurredAt: now,
@@ -515,4 +568,10 @@ function requireFinanceApproval(actor: StaffPrincipal): void {
       "FORBIDDEN",
       "Finance reconciliation approval is required.",
     );
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  );
 }

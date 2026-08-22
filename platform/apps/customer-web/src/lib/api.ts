@@ -3,6 +3,11 @@ import type {
   CustomerContractStatus,
   CustomerContractView,
 } from "../features/contract/contract-panel.js";
+import type {
+  CustomerAccountStatus,
+  CustomerCollectionsApi,
+  CustomerReminder,
+} from "../features/collections/account-status-panel.js";
 
 export interface CustomerSession {
   sessionToken: string;
@@ -178,7 +183,12 @@ export interface CustomerPaymentsApi {
 import type { CustomerOffer, OfferApi } from "../features/offer/offer-panel.js";
 
 export class FetchCustomerApi
-  implements CustomerApi, CustomerPaymentsApi, OfferApi, ContractApi
+  implements
+    CustomerApi,
+    CustomerPaymentsApi,
+    CustomerCollectionsApi,
+    OfferApi,
+    ContractApi
 {
   #sessionToken: string | null = null;
   #offerVersions = new Map<string, number>();
@@ -403,6 +413,26 @@ export class FetchCustomerApi
     );
   }
 
+  async getAccountStatus(): Promise<readonly CustomerAccountStatus[]> {
+    const body = await this.request<unknown>("/v1/customer/account-status");
+    if (!Array.isArray(body) || body.some((item) => !isRecord(item)))
+      throw new CustomerApiError(
+        "MALFORMED_ACCOUNT_STATUS",
+        "The customer account status response is invalid.",
+      );
+    return body.map(mapAccountStatus);
+  }
+
+  async listReminders(): Promise<readonly CustomerReminder[]> {
+    const body = await this.request<unknown>("/v1/customer/reminders");
+    if (!Array.isArray(body) || body.some((item) => !isRecord(item)))
+      throw new CustomerApiError(
+        "MALFORMED_REMINDER_LIST",
+        "The customer reminder response is invalid.",
+      );
+    return body.map(mapReminder);
+  }
+
   async getContract(
     applicationId: string,
   ): Promise<CustomerContractView | null> {
@@ -615,6 +645,68 @@ function malformedContract(): never {
     "MALFORMED_CONTRACT_DTO",
     "The customer contract response is invalid.",
   );
+}
+
+function mapAccountStatus(value: unknown): CustomerAccountStatus {
+  if (!isRecord(value))
+    throw new CustomerApiError(
+      "MALFORMED_ACCOUNT_STATUS",
+      "The customer account status response is invalid.",
+    );
+  if (
+    typeof value.contractId !== "string" ||
+    typeof value.contractStatus !== "string" ||
+    typeof value.outstandingBalanceMinorUnits !== "string" ||
+    !/^\d+$/.test(value.outstandingBalanceMinorUnits) ||
+    (value.nextDueDate !== null && typeof value.nextDueDate !== "string") ||
+    typeof value.overdueMinorUnits !== "string" ||
+    !/^\d+$/.test(value.overdueMinorUnits) ||
+    typeof value.consecutiveMissedPayments !== "number" ||
+    typeof value.totalUnpaidPayments !== "number" ||
+    !Array.isArray(value.signals) ||
+    value.signals.some((signal) => typeof signal !== "string") ||
+    value.cashAccepted !== false
+  )
+    throw new CustomerApiError(
+      "MALFORMED_ACCOUNT_STATUS",
+      "The customer account status response is invalid.",
+    );
+  return {
+    contractId: value.contractId,
+    contractStatus: value.contractStatus,
+    outstandingBalanceMinorUnits: value.outstandingBalanceMinorUnits,
+    nextDueDate: value.nextDueDate as string | null,
+    overdueMinorUnits: value.overdueMinorUnits,
+    consecutiveMissedPayments: value.consecutiveMissedPayments,
+    totalUnpaidPayments: value.totalUnpaidPayments,
+    signals: value.signals,
+    cashAccepted: false,
+    paymentInstructions:
+      typeof value.paymentInstructions === "string"
+        ? value.paymentInstructions
+        : null,
+    paymentLink:
+      typeof value.paymentLink === "string" ? value.paymentLink : null,
+  };
+}
+
+function mapReminder(value: Record<string, unknown>): CustomerReminder {
+  if (
+    typeof value.id !== "string" ||
+    typeof value.status !== "string" ||
+    typeof value.createdAt !== "string"
+  )
+    throw new CustomerApiError(
+      "MALFORMED_REMINDER_LIST",
+      "The customer reminder response is invalid.",
+    );
+  return {
+    id: value.id,
+    status: value.status,
+    createdAt: value.createdAt,
+    ...(typeof value.message === "string" ? { message: value.message } : {}),
+    ...(typeof value.template === "string" ? { template: value.template } : {}),
+  };
 }
 
 function nullableContractString(value: unknown): string | null {

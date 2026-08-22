@@ -53,6 +53,49 @@ describe("staff financing API adapter", () => {
     );
   });
 
+  it("uses the authenticated typed collections client for queues and audited actions", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          csrfToken: "csrf-1",
+          staffUserId: "staff-1",
+          roles: ["RECOVERY_OFFICER"],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({ status: "APPROVED" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ locationOnly: true, latitude: 5.6, longitude: -0.2 }),
+      );
+    const api = new FetchStaffApi("", fetcher);
+    await api.login({
+      email: "staff@example.test",
+      password: "password",
+      mfaAssertion: "valid",
+    });
+    await api.listArrears();
+    await api.listCases();
+    await api.decideRecoveryCase("case-1", {
+      decision: "APPROVED",
+      purpose: "review",
+      reason: "approved",
+      idempotencyKey: "decision-key-1",
+    });
+    await api.getRecoveryLocation("case-1", "review");
+    expect(fetcher.mock.calls[1]?.[0]).toBe("/v1/staff/collections/arrears");
+    expect(fetcher.mock.calls[2]?.[0]).toBe("/v1/staff/collections/cases");
+    expect(fetcher.mock.calls[3]?.[0]).toBe(
+      "/v1/staff/collections/cases/case-1/decision",
+    );
+    expect(fetcher.mock.calls[3]?.[1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ "x-csrf-token": "csrf-1" }),
+      }),
+    );
+  });
+
   it("loads rule/exception lists and sends effective dates and decision reasons", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

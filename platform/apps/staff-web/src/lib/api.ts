@@ -253,6 +253,7 @@ import type {
   ProductRuleSummary,
   StaffExceptionSummary,
 } from "../features/products/product-workspace.js";
+import type { StaffCollectionsApi } from "../features/collections/collections-workspace.js";
 
 export class ProblemError extends Error {
   constructor(
@@ -264,7 +265,9 @@ export class ProblemError extends Error {
   }
 }
 
-export class FetchStaffApi implements StaffApi, ProductApi, StaffPaymentsApi {
+export class FetchStaffApi
+  implements StaffApi, ProductApi, StaffPaymentsApi, StaffCollectionsApi
+{
   private csrfToken = "";
 
   constructor(
@@ -297,6 +300,51 @@ export class FetchStaffApi implements StaffApi, ProductApi, StaffPaymentsApi {
     return (await this.request(
       `/v1/staff/applications/${encodeURIComponent(applicationId)}`,
     )) as ApplicationDetail;
+  }
+
+  async listArrears(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/collections/arrears"),
+      "MALFORMED_COLLECTIONS_ARREARS",
+    );
+  }
+
+  async listCases(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/collections/cases"),
+      "MALFORMED_COLLECTIONS_CASES",
+    );
+  }
+
+  async decideRecoveryCase(
+    recoveryCaseId: string,
+    input: {
+      decision: "APPROVED" | "DENIED";
+      purpose: string;
+      reason: string;
+      idempotencyKey: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    const result = await this.request(
+      `/v1/staff/collections/cases/${encodeURIComponent(recoveryCaseId)}/decision`,
+      { method: "POST", body: input },
+    );
+    if (!isRecord(result))
+      throw malformedStaff("MALFORMED_COLLECTION_DECISION");
+    return result;
+  }
+
+  async getRecoveryLocation(
+    recoveryCaseId: string,
+    purpose: string,
+  ): Promise<Record<string, unknown>> {
+    const query = new URLSearchParams({ purpose });
+    const result = await this.request(
+      `/v1/staff/collections/cases/${encodeURIComponent(recoveryCaseId)}/location?${query.toString()}`,
+    );
+    if (!isRecord(result))
+      throw malformedStaff("MALFORMED_COLLECTION_LOCATION");
+    return result;
   }
 
   async decide(applicationId: string, input: DecisionInput) {

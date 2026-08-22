@@ -133,6 +133,7 @@ export async function registerCollectionsRoutes(
       requestedBy: string;
       evidence: Record<string, unknown>;
       evidenceHash: string;
+      idempotencyKey: string;
     };
   }>(
     "/v1/staff/collections/cases/:recoveryCaseId/actions",
@@ -149,6 +150,7 @@ export async function registerCollectionsRoutes(
             "requestedBy",
             "evidence",
             "evidenceHash",
+            "idempotencyKey",
           ],
           properties: {
             actionType: {
@@ -164,6 +166,7 @@ export async function registerCollectionsRoutes(
             requestedBy: uuid,
             evidence: { type: "object" },
             evidenceHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            idempotencyKey: idempotency,
           },
         },
       },
@@ -270,6 +273,8 @@ export async function registerCollectionsRoutes(
             ...(request.body.missedInstallments === undefined
               ? {}
               : { missedInstallments: request.body.missedInstallments }),
+            actor: requireStaffPrincipal(request),
+            requestId: request.id,
           }),
         ),
     );
@@ -316,9 +321,7 @@ export async function registerCollectionsRoutes(
   app.post<{
     Params: { contractId: string };
     Body: {
-      evidenceDocumentReference: string;
-      evidenceHash: string;
-      verificationStatus: "CLEAN";
+      evidenceDocumentId: string;
     };
   }>(
     "/v1/staff/contracts/:contractId/settlement/evidence",
@@ -329,19 +332,9 @@ export async function registerCollectionsRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: [
-            "evidenceDocumentReference",
-            "evidenceHash",
-            "verificationStatus",
-          ],
+          required: ["evidenceDocumentId"],
           properties: {
-            evidenceDocumentReference: {
-              type: "string",
-              minLength: 1,
-              maxLength: 512,
-            },
-            evidenceHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
-            verificationStatus: { type: "string", enum: ["CLEAN"] },
+            evidenceDocumentId: uuid,
           },
         },
       },

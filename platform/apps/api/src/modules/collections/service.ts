@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendAuditEvent,
   collectionsRepo,
@@ -45,6 +45,7 @@ export interface CollectionsService {
     requestedBy: string;
     evidence: Record<string, unknown>;
     evidenceHash: string;
+    idempotencyKey: string;
     authorizedBy: StaffPrincipal;
     requestId?: string;
   }): Promise<Record<string, unknown>>;
@@ -313,8 +314,31 @@ export function createCollectionsService(options: {
           "RECOVERY_EVIDENCE_HASH_INVALID",
           "A SHA-256 evidence hash is required.",
         );
+      validateIdempotencyKey(input.idempotencyKey);
       return withTransaction(options.database, async (tx) => {
         const repo = collectionsRepo(tx);
+        const payloadHash = hashRecoveryActionPayload(input);
+        const existing = await repo.findRecoveryActionByKey(
+          input.idempotencyKey,
+        );
+        if (existing !== null) {
+          if (
+            existing.recoveryCaseId !== input.recoveryCaseId ||
+            existing.payloadHash !== payloadHash
+          )
+            throw new AppError(
+              409,
+              "RECOVERY_IDEMPOTENCY_KEY_REUSED",
+              "The recovery action idempotency key is already bound to another action.",
+            );
+          return {
+            id: existing.id,
+            actionType: existing.actionType,
+            purpose: existing.purpose,
+            authorized: true,
+            replay: true,
+          };
+        }
         const row = await repo.findRecoveryCase(input.recoveryCaseId, true);
         if (row === null)
           throw new AppError(
@@ -354,9 +378,11 @@ export function createCollectionsService(options: {
             "An independent approved recovery decision is required.",
           );
         const now = new Date();
-        const action = await repo.insertRecoveryAction({
+        const actionResult = await repo.insertRecoveryAction({
           id: randomUUID(),
           recoveryCaseId: input.recoveryCaseId,
+          idempotencyKey: input.idempotencyKey,
+          payloadHash,
           actionType: input.actionType,
           purpose,
           requestedBy: input.requestedBy,
@@ -369,6 +395,24 @@ export function createCollectionsService(options: {
           },
           createdAt: now,
         });
+        if (!actionResult.inserted) {
+          if (
+            actionResult.row.recoveryCaseId !== input.recoveryCaseId ||
+            actionResult.row.payloadHash !== payloadHash
+          )
+            throw new AppError(
+              409,
+              "RECOVERY_IDEMPOTENCY_KEY_REUSED",
+              "The recovery action idempotency key is already bound to another action.",
+            );
+          return {
+            id: actionResult.row.id,
+            actionType: actionResult.row.actionType,
+            purpose: actionResult.row.purpose,
+            authorized: true,
+            replay: true,
+          };
+        }
         await appendAuditEvent(tx, {
           aggregateType: "recovery_case",
           aggregateId: input.recoveryCaseId,
@@ -377,7 +421,7 @@ export function createCollectionsService(options: {
           actorPersonId: null,
           requestId: input.requestId ?? null,
           data: {
-            actionId: action.id,
+            actionId: actionResult.row.id,
             actionType: input.actionType,
             purpose,
             platformCommand: false,
@@ -385,10 +429,11 @@ export function createCollectionsService(options: {
           occurredAt: now,
         });
         return {
-          id: action.id,
-          actionType: action.actionType,
+          id: actionResult.row.id,
+          actionType: actionResult.row.actionType,
           purpose,
           authorized: true,
+          replay: false,
         };
       });
     },
@@ -566,6 +611,37 @@ function validateIdempotencyKey(value: string): void {
       "RECOVERY_IDEMPOTENCY_INVALID",
       "A valid idempotency key is required.",
     );
+}
+
+function hashRecoveryActionPayload(input: {
+  recoveryCaseId: string;
+  actionType: string;
+  purpose: string;
+  requestedBy: string;
+  evidence: Record<string, unknown>;
+  evidenceHash: string;
+  authorizedBy: StaffPrincipal;
+}): string {
+  const canonical = JSON.stringify({
+    recoveryCaseId: input.recoveryCaseId,
+    actionType: input.actionType,
+    purpose: input.purpose,
+    requestedBy: input.requestedBy,
+    evidence: stableValue(input.evidence),
+    evidenceHash: input.evidenceHash,
+    authorizedBy: input.authorizedBy.staffUserId,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, stableValue(entry)]),
+  );
 }
 
 function isUuid(value: string): boolean {

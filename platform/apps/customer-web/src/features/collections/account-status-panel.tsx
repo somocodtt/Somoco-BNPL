@@ -27,7 +27,13 @@ export interface CustomerCollectionsApi {
   listReminders(): Promise<readonly CustomerReminder[]>;
 }
 
-export function AccountStatusPanel({ api }: { api: CustomerCollectionsApi }) {
+export function AccountStatusPanel({
+  api,
+  contractId,
+}: {
+  api: CustomerCollectionsApi;
+  contractId?: string;
+}) {
   const [accounts, setAccounts] = useState<
     readonly CustomerAccountStatus[] | null
   >(null);
@@ -44,7 +50,11 @@ export function AccountStatusPanel({ api }: { api: CustomerCollectionsApi }) {
     void Promise.all([api.getAccountStatus(), api.listReminders()]).then(
       ([loadedAccounts, loadedReminders]) => {
         if (!active) return;
-        setAccounts(loadedAccounts);
+        setAccounts(
+          contractId === undefined
+            ? loadedAccounts
+            : loadedAccounts.filter((item) => item.contractId === contractId),
+        );
         setReminders(loadedReminders);
       },
       () => {
@@ -54,7 +64,7 @@ export function AccountStatusPanel({ api }: { api: CustomerCollectionsApi }) {
     return () => {
       active = false;
     };
-  }, [api]);
+  }, [api, contractId]);
 
   if (error)
     return (

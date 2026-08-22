@@ -21,6 +21,8 @@ export interface NotificationService {
     overdueMinorUnits?: bigint;
     missedInstallments?: number;
     asOfDate: string;
+    actor: StaffPrincipal;
+    requestId?: string;
   }): Promise<{ id: string; status: "QUEUED"; idempotencyKey: string }>;
   listCustomerHistory(
     actor: CustomerPrincipal,
@@ -41,6 +43,25 @@ export function createNotificationService(options: {
   );
   return {
     async queueReminder(input) {
+      if (!hasCollectionsMutation(input.actor)) {
+        await withTransaction(options.database, async (tx) => {
+          await appendAuditEvent(tx, {
+            aggregateType: "contract",
+            aggregateId: input.contractId,
+            action: "REMINDER_DENIED",
+            actorStaffUserId: input.actor.staffUserId,
+            actorPersonId: null,
+            requestId: input.requestId ?? null,
+            data: { reason: "COLLECTIONS_ROLE_REQUIRED" },
+            occurredAt: new Date(),
+          });
+        });
+        throw new AppError(
+          403,
+          "FORBIDDEN",
+          "Collections reminder authority is required.",
+        );
+      }
       validateIdempotencyKey(input.idempotencyKey);
       validateDate(input.asOfDate, "REMINDER_DATE_INVALID");
       if (input.dueDate !== undefined)
@@ -89,6 +110,12 @@ export function createNotificationService(options: {
             404,
             "CONTRACT_NOT_FOUND",
             "The customer account was not found.",
+          );
+        if (context.status !== "ACTIVE" && context.status !== "RECOVERY")
+          throw new AppError(
+            409,
+            "CONTRACT_NOT_ELIGIBLE",
+            "Reminders can only be queued for an active customer account.",
           );
         const accountLink = `${accountLinkBaseUrl}/contracts/${encodeURIComponent(input.contractId)}/status`;
         const variables: Record<string, string> = {
@@ -154,9 +181,9 @@ export function createNotificationService(options: {
           aggregateType: "notification",
           aggregateId: inserted.id,
           action: "REMINDER_QUEUED",
-          actorStaffUserId: null,
+          actorStaffUserId: input.actor.staffUserId,
           actorPersonId: context.applicantPersonId,
-          requestId: null,
+          requestId: input.requestId ?? null,
           data: {
             contractId: input.contractId,
             template: input.template,
@@ -275,6 +302,19 @@ function hasCollectionsRead(actor: StaffPrincipal): boolean {
       "MD",
       "COMPLIANCE_AUDITOR",
       "CUSTOMER_SUPPORT",
+    ].includes(role),
+  );
+}
+
+function hasCollectionsMutation(actor: StaffPrincipal): boolean {
+  return actor.roles.some((role) =>
+    [
+      "RECOVERY_OFFICER",
+      "BSM",
+      "AGM",
+      "CFO",
+      "MD",
+      "COMPLIANCE_AUDITOR",
     ].includes(role),
   );
 }
