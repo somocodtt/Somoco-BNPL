@@ -324,6 +324,56 @@ describe("PostgreSQL persistence", () => {
     });
   });
 
+  it("keeps settlement evidence append-only and limits runtime privileges", async () => {
+    const graph = await insertFinancialGraph(db);
+    const staffId = randomUUID();
+    const evidenceId = randomUUID();
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash, status, version)
+      values (${staffId}, ${`${staffId}@example.test`}, 'hash', 'ACTIVE', 1)
+    `);
+    await db.insert(settlementEvidence).values({
+      id: evidenceId,
+      contractId: graph.contractId,
+      evidenceDocumentReference: "legacy/revoked.pdf",
+      evidenceHash: "a".repeat(64),
+      verificationStatus: "REVOKED",
+      acceptedBy: staffId,
+      acceptedAt: new Date(),
+    });
+
+    await expect(
+      db
+        .update(settlementEvidence)
+        .set({ evidenceDocumentReference: "tampered.pdf" })
+        .where(sql`${settlementEvidence.id} = ${evidenceId}`),
+    ).rejects.toMatchObject({ cause: { code: "55000" } });
+    await expect(
+      db
+        .delete(settlementEvidence)
+        .where(sql`${settlementEvidence.id} = ${evidenceId}`),
+    ).rejects.toMatchObject({ cause: { code: "55000" } });
+
+    const privileges = await db.execute<{
+      settlement_select: boolean;
+      settlement_insert: boolean;
+      settlement_update: boolean;
+      settlement_delete: boolean;
+    }>(sql`
+      select
+        has_table_privilege('somo_runtime', 'settlement_evidence', 'SELECT') as settlement_select,
+        has_table_privilege('somo_runtime', 'settlement_evidence', 'INSERT') as settlement_insert,
+        has_table_privilege('somo_runtime', 'settlement_evidence', 'UPDATE') as settlement_update,
+        has_table_privilege('somo_runtime', 'settlement_evidence', 'DELETE') as settlement_delete
+    `);
+    expect(privileges.rows[0]).toEqual({
+      settlement_select: true,
+      settlement_insert: true,
+      settlement_update: false,
+      settlement_delete: false,
+    });
+  });
+
   it("makes the approved payment allocation policy read-only to the runtime role", async () => {
     const privileges = await db.execute<{
       policy_select: boolean;

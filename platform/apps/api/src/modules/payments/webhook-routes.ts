@@ -306,11 +306,7 @@ function assertFinanceRead(
 function assertSettlementComparisonAccess(
   actor: ReturnType<typeof requireStaffPrincipal>,
 ): void {
-  if (
-    !actor.roles.some((role) =>
-      ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR"].includes(role),
-    )
-  )
+  if (!actor.roles.some((role) => ["FINANCE_OFFICER", "CFO"].includes(role)))
     throw new AppError(
       403,
       "FORBIDDEN",

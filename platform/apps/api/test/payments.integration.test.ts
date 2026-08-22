@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
+import argon2 from "argon2";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { createDatabase, migrateDatabase, type Database } from "@somo/db";
+import {
+  createDatabase,
+  createStaffUser,
+  migrateDatabase,
+  type Database,
+} from "@somo/db";
 import { getInternalDatabase } from "../../../packages/db/src/client.js";
 import { application } from "../../../packages/db/src/schema/applications.js";
 import {
@@ -15,7 +21,10 @@ import {
   product,
   vehicleModel,
 } from "../../../packages/db/src/schema/products.js";
-import { paymentTransaction } from "../../../packages/db/src/schema/payments.js";
+import {
+  paymentTransaction,
+  reconciliationCase,
+} from "../../../packages/db/src/schema/payments.js";
 import { person } from "../../../packages/db/src/schema/privacy.js";
 import {
   staffRoleAssignment,
@@ -45,6 +54,7 @@ import { createReceiptService } from "../src/modules/payments/receipt-service.js
 import type {
   CustomerPrincipal,
   StaffPrincipal,
+  StaffRole,
 } from "../src/modules/access/policy.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1345,6 +1355,30 @@ describe("Somoco payment boundary", () => {
         },
       }),
     ).rejects.toThrow("FORBIDDEN");
+    const auditor = {
+      ...actor,
+      roles: ["COMPLIANCE_AUDITOR"] as StaffRole[],
+    };
+    await expect(
+      reconciliation.compareSettlement({
+        settlementReference: "settle-auditor",
+        provider: "SOMOCO_PAYMENTS",
+        providerTotalMinorUnits: 0n,
+        actor: auditor,
+      }),
+    ).rejects.toThrow("FORBIDDEN");
+    const caseId = randomUUID();
+    await getInternalDatabase(database).insert(reconciliationCase).values({
+      id: caseId,
+      reason: "TEST_AUDITOR_RESOLVE",
+    });
+    await expect(
+      reconciliation.resolveCase({
+        caseId,
+        actor: auditor,
+        resolution: { note: "Auditor must remain read-only" },
+      }),
+    ).rejects.toThrow("FORBIDDEN");
   });
 
   it("requires database reversal linkage and rejects unlinked reversal entries", async () => {
@@ -1494,6 +1528,70 @@ async function insertStaff(
   return id;
 }
 
+async function insertHttpStaff(database: Database, role: StaffRole) {
+  return createStaffUser(database, {
+    email: `${role}-${randomUUID()}@example.test`,
+    passwordHash: await argon2.hash("correct horse battery staple", {
+      type: argon2.argon2id,
+      memoryCost: config.argon2MemoryCostKiB,
+      timeCost: config.argon2TimeCost,
+      parallelism: config.argon2Parallelism,
+    }),
+    roles: [role],
+  });
+}
+
+async function login(
+  app: Awaited<ReturnType<typeof buildApp>>,
+  email: string,
+): Promise<{ cookie: string; csrf: string }> {
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/staff/sessions",
+    payload: {
+      email,
+      password: "correct horse battery staple",
+      mfaAssertion: "valid",
+    },
+  });
+  const setCookies = (
+    Array.isArray(response.headers["set-cookie"])
+      ? response.headers["set-cookie"]
+      : [response.headers["set-cookie"]]
+  ).filter((value): value is string => typeof value === "string");
+  return {
+    cookie: setCookies.map((value) => value.split(";", 1)[0]).join("; "),
+    csrf: response.json<{ csrfToken: string }>().csrfToken,
+  };
+}
+
+async function buildPaymentHttpApp(database: Database) {
+  const sms: SmsPort = {
+    send: async () => ({
+      providerReference: randomUUID(),
+      acceptedAt: new Date().toISOString(),
+    }),
+  };
+  return buildApp({
+    config,
+    database,
+    logger: false,
+    mfaVerifier: {
+      kind: "test",
+      async verify({ assertion }) {
+        return assertion === "valid";
+      },
+    },
+    payments: {
+      verifier: verifierFor(async () => event),
+      allocationPolicy: policy(),
+      sms,
+      accountLinkBaseUrl: "https://customer.somo.example/account",
+      ussdInstructions: "Dial *123# and select Somoco Payments.",
+    },
+  });
+}
+
 describe("payment HTTP composition", () => {
   let database: Database;
   let closeDatabase: () => Promise<void>;
@@ -1603,6 +1701,69 @@ describe("payment HTTP composition", () => {
     });
     expect(cash.statusCode).toBe(404);
     await app.close();
+  });
+
+  it("keeps auditor read-only for settlement compare and reconciliation resolve", async () => {
+    const auditor = await insertHttpStaff(database, "COMPLIANCE_AUDITOR");
+    const finance = await insertHttpStaff(database, "FINANCE_OFFICER");
+    const caseId = randomUUID();
+    await getInternalDatabase(database).insert(reconciliationCase).values({
+      id: caseId,
+      reason: "HTTP_AUDITOR_RESOLVE",
+    });
+    const app = await buildPaymentHttpApp(database);
+    try {
+      const auditorLogin = await login(app, auditor.email);
+      const financeLogin = await login(app, finance.email);
+      const compareDenied = await app.inject({
+        method: "POST",
+        url: "/v1/staff/payments/settlements/compare",
+        headers: {
+          cookie: auditorLogin.cookie,
+          "x-csrf-token": auditorLogin.csrf,
+        },
+        payload: {
+          settlementReference: "http-auditor-compare",
+          providerTotalMinorUnits: "0",
+        },
+      });
+      expect(compareDenied.statusCode).toBe(403);
+      const resolveDenied = await app.inject({
+        method: "POST",
+        url: `/v1/staff/payments/reconciliation/${caseId}/resolve`,
+        headers: {
+          cookie: auditorLogin.cookie,
+          "x-csrf-token": auditorLogin.csrf,
+        },
+        payload: { resolution: { note: "auditor" } },
+      });
+      expect(resolveDenied.statusCode).toBe(403);
+      const compareAllowed = await app.inject({
+        method: "POST",
+        url: "/v1/staff/payments/settlements/compare",
+        headers: {
+          cookie: financeLogin.cookie,
+          "x-csrf-token": financeLogin.csrf,
+        },
+        payload: {
+          settlementReference: "http-finance-compare",
+          providerTotalMinorUnits: "0",
+        },
+      });
+      expect(compareAllowed.statusCode).toBe(200);
+      const resolveAllowed = await app.inject({
+        method: "POST",
+        url: `/v1/staff/payments/reconciliation/${caseId}/resolve`,
+        headers: {
+          cookie: financeLogin.cookie,
+          "x-csrf-token": financeLogin.csrf,
+        },
+        payload: { resolution: { note: "finance" } },
+      });
+      expect(resolveAllowed.statusCode).toBe(204);
+    } finally {
+      await app.close();
+    }
   });
 
   it("authenticates raw malformed bytes before JSON parsing", async () => {

@@ -44,8 +44,7 @@ export function createReconciliationService(options: {
       if (
         input.actor.kind !== "staff" ||
         (!input.actor.roles.includes("FINANCE_OFFICER") &&
-          !input.actor.roles.includes("CFO") &&
-          !input.actor.roles.includes("COMPLIANCE_AUDITOR"))
+          !input.actor.roles.includes("CFO"))
       )
         throw new AppError(
           403,
@@ -164,8 +163,7 @@ export function createReconciliationService(options: {
     async resolveCase(input) {
       if (
         !input.actor.roles.includes("FINANCE_OFFICER") &&
-        !input.actor.roles.includes("CFO") &&
-        !input.actor.roles.includes("COMPLIANCE_AUDITOR")
+        !input.actor.roles.includes("CFO")
       )
         throw new AppError(
           403,

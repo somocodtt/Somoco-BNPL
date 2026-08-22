@@ -359,6 +359,44 @@ describe("settlement transfer evidence", () => {
     });
   });
 
+  it("replays the same active evidence for concurrent identical commands", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const actorId = await seedStaff("MD");
+    const documentId = await seedCleanDocument(fixture.applicantId);
+    await executeTestSql(
+      databaseUrl,
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_reference, evidence_hash,
+         verification_status, accepted_by, accepted_at)
+       values ($1, $2, 'legacy/revoked.pdf', repeat('a', 64), 'REVOKED', $3, now())`,
+      [randomUUID(), fixture.contractId, actorId],
+    );
+    const settlement = createSettlementService({ database });
+    const [first, second] = await Promise.all([
+      settlement.recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId: documentId,
+        actor: principal(actorId, "MD"),
+      }),
+      settlement.recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId: documentId,
+        actor: principal(actorId, "MD"),
+      }),
+    ]);
+
+    expect(second.id).toBe(first.id);
+    expect(
+      await queryTestSql<{ clean_count: number; revoked_count: number }>(
+        databaseUrl,
+        `select count(*) filter (where verification_status = 'CLEAN')::int as clean_count,
+                count(*) filter (where verification_status = 'REVOKED')::int as revoked_count
+           from settlement_evidence where contract_id = $1`,
+        [fixture.contractId],
+      ),
+    ).toEqual({ clean_count: 1, revoked_count: 1 });
+  });
+
   it("does not allow a compliance auditor to mutate settlement state", async () => {
     const fixture = await seedContract("ACTIVE", 0);
     const auditorId = await seedStaff("COMPLIANCE_AUDITOR");
