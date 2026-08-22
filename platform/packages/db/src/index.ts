@@ -142,6 +142,11 @@ export {
 } from "./repositories/identity.js";
 export { ledgerRepo, type NewLedgerEntry } from "./repositories/ledger.js";
 export {
+  collectionsRepo,
+  type ArrearsInstallmentRow,
+  type CollectionContractContext,
+} from "./repositories/collections.js";
+export {
   paymentRepo,
   type NewPaymentTransaction,
   type PaymentTransaction,

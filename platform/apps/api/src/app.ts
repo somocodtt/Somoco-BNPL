@@ -69,6 +69,13 @@ import { createLedgerService } from "./modules/payments/ledger-service.js";
 import { createReconciliationService } from "./modules/payments/reconciliation-service.js";
 import { createReceiptService } from "./modules/payments/receipt-service.js";
 import type { PaymentWebhookVerifier } from "@somo/integrations";
+import { registerCollectionsRoutes } from "./modules/collections/routes.js";
+import { createCollectionsService } from "./modules/collections/service.js";
+import {
+  createNotificationService,
+  type NotificationService,
+} from "./modules/notifications/service.js";
+import { createSettlementService } from "./modules/contracts/settlement-service.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -311,11 +318,17 @@ export async function buildApp(
     handoverService,
     customerOtp,
   );
+  let notifications: NotificationService | undefined;
   if (options.payments !== undefined) {
     const ussdInstructions = options.payments.ussdInstructions;
     if (ussdInstructions === undefined || ussdInstructions.trim() === "")
       throw new Error("PAYMENT_USSD_INSTRUCTIONS_REQUIRED");
     const receipts = createReceiptService({
+      database,
+      accountLinkBaseUrl: options.payments.accountLinkBaseUrl,
+      ussdInstructions,
+    });
+    notifications = createNotificationService({
       database,
       accountLinkBaseUrl: options.payments.accountLinkBaseUrl,
       ussdInstructions,
@@ -351,6 +364,26 @@ export async function buildApp(
   } else if (config.environment === "production") {
     throw new Error("PRODUCTION_PAYMENT_COMPOSITION_REQUIRED");
   }
+  const collections = createCollectionsService({
+    database,
+    ...(options.tracker === undefined ? {} : { tracker: options.tracker }),
+    ...(options.payments === undefined
+      ? {}
+      : {
+          accountLinkBaseUrl: options.payments.accountLinkBaseUrl,
+          ussdInstructions: options.payments.ussdInstructions,
+        }),
+  });
+  const settlement = createSettlementService({ database });
+  await registerCollectionsRoutes(
+    app,
+    config,
+    accessService,
+    collections,
+    settlement,
+    notifications,
+    customerOtp,
+  );
   return app;
 }
 

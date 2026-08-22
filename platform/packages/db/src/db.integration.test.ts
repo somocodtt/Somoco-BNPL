@@ -37,6 +37,12 @@ import {
   ownershipTransfer,
   repaymentSchedule,
 } from "./schema/contracts.js";
+import {
+  arrearsEscalation,
+  recoveryAction,
+  recoveryDecision,
+  settlementEvidence,
+} from "./schema/collections.js";
 import { offer, offerVersion } from "./schema/offers.js";
 import { ledgerEntry, paymentTransaction } from "./schema/payments.js";
 import { person } from "./schema/privacy.js";
@@ -88,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(20);
+    expect(before.rows[0]?.count).toBe(22);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -541,6 +547,83 @@ describe("PostgreSQL persistence", () => {
           (${`foreign-link-${randomUUID()}`}, ${graph.contractId}, 'REFUND', 'DEBIT', 'GHS', 1, 1, ${randomUUID()}, now())
       `),
     ).rejects.toMatchObject({ cause: { code: "23503" } });
+  });
+
+  it("keeps arrears and recovery evidence append-only and settlement evidence clean-bound", async () => {
+    const graph = await insertFinancialGraph(db);
+    const staffId = randomUUID();
+    const checkerId = randomUUID();
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash, status, version)
+      values (${staffId}, ${`${staffId}@example.test`}, 'hash', 'ACTIVE', 1)
+    `);
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash, status, version)
+      values (${checkerId}, ${`${checkerId}@example.test`}, 'hash', 'ACTIVE', 1)
+    `);
+    const recoveryCaseId = randomUUID();
+    await db.execute(sql`
+      insert into recovery_case (id, contract_id, status, details, version, opened_at)
+      values (${recoveryCaseId}, ${graph.contractId}, 'OPEN', '{}'::jsonb, 1, now())
+    `);
+    const escalation = await db
+      .insert(arrearsEscalation)
+      .values({
+        contractId: graph.contractId,
+        asOfDate: "2026-08-21",
+        signal: "THREE_TOTAL_UNPAID",
+        overdueMinorUnits: 100n,
+        unpaidInstallments: 3,
+        consecutiveMissedInstallments: 1,
+      })
+      .returning();
+    await expect(
+      db
+        .update(arrearsEscalation)
+        .set({ unpaidInstallments: 4 })
+        .where(sql`${arrearsEscalation.id} = ${escalation[0]!.id}`),
+    ).rejects.toMatchObject({ cause: { code: "55000" } });
+    const decision = await db
+      .insert(recoveryDecision)
+      .values({
+        recoveryCaseId,
+        idempotencyKey: randomUUID(),
+        makerStaffUserId: staffId,
+        checkerStaffUserId: checkerId,
+        decision: "DENIED",
+        purpose: "TEST_REVIEW",
+        reason: "No authorized action",
+        decidedAt: new Date(),
+      })
+      .returning();
+    await expect(
+      db
+        .delete(recoveryDecision)
+        .where(sql`${recoveryDecision.id} = ${decision[0]!.id}`),
+    ).rejects.toMatchObject({ cause: { code: "55000" } });
+    const evidence = await db
+      .insert(settlementEvidence)
+      .values({
+        contractId: graph.contractId,
+        evidenceDocumentReference: "document-test-1",
+        evidenceHash: "a".repeat(64),
+        verificationStatus: "CLEAN",
+        acceptedBy: staffId,
+        acceptedAt: new Date(),
+      })
+      .returning();
+    expect(evidence[0]?.verificationStatus).toBe("CLEAN");
+    await expect(
+      db.insert(recoveryAction).values({
+        recoveryCaseId,
+        actionType: "MANUAL_RECOVERY",
+        purpose: "TEST_ACTION",
+        requestedBy: staffId,
+        authorizedBy: staffId,
+        evidenceHash: "b".repeat(64),
+        evidence: {},
+      }),
+    ).rejects.toMatchObject({ cause: { code: "23514" } });
   });
 });
 
@@ -1139,7 +1222,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0015", async () => {
+  it("upgrades populated 0009 financing rows safely through 0021", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1214,6 +1297,12 @@ describe("populated legacy schema migration", () => {
     await applyMigrationFile(pool, "0013_asset_contract_handover.sql");
     await applyMigrationFile(pool, "0014_asset_hardening.sql");
     await applyMigrationFile(pool, "0015_asset_privacy_controls.sql");
+    await applyMigrationFile(pool, "0016_payment_ledger_reconciliation.sql");
+    await applyMigrationFile(pool, "0017_wooden_selene.sql");
+    await applyMigrationFile(pool, "0018_sealed_payment_policy.sql");
+    await applyMigrationFile(pool, "0019_external_payment_policy_evidence.sql");
+    await applyMigrationFile(pool, "0020_flippant_bishop.sql");
+    await applyMigrationFile(pool, "0021_high_siren.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;
@@ -1244,6 +1333,24 @@ describe("populated legacy schema migration", () => {
       disclosed_version: null,
       disclosure_hash: null,
       disclosure_content: null,
+    });
+    const preserved = await pool.query<{
+      application_id: string;
+      status: string;
+      principal_minor_units: string;
+    }>(
+      `select application.id as application_id, application.status,
+              offer_version.principal_minor_units
+         from application
+         join offer on offer.application_id = application.id
+         join offer_version on offer_version.offer_id = offer.id
+        where application.id = $1`,
+      [applicationId],
+    );
+    expect(preserved.rows[0]).toEqual({
+      application_id: applicationId,
+      status: "APPROVED",
+      principal_minor_units: "100000",
     });
   });
 

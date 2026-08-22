@@ -451,6 +451,9 @@ export const recoveryCase = pgTable(
   },
   (table) => [
     index("recovery_case_contract_idx").on(table.contractId),
+    uniqueIndex("recovery_case_active_contract_unique")
+      .on(table.contractId)
+      .where(sql`${table.status} <> 'CLOSED'`),
     check(
       "recovery_case_status_allowed",
       sql`${table.status} in ('OPEN', 'IN_PROGRESS', 'CLOSED')`,

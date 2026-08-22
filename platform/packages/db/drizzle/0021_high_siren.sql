@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX "recovery_case_active_contract_unique" ON "recovery_case" USING btree ("contract_id") WHERE "recovery_case"."status" <> 'CLOSED';--> statement-breakpoint
+CREATE UNIQUE INDEX "recovery_decision_case_unique" ON "recovery_decision" USING btree ("recovery_case_id");

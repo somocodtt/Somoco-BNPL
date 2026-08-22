@@ -141,6 +141,20 @@
       "when": 1787400000001,
       "tag": "0019_external_payment_policy_evidence",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1787329877753,
+      "tag": "0020_flippant_bishop",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1787425007463,
+      "tag": "0021_high_siren",
+      "breakpoints": true
     }
   ]
 }

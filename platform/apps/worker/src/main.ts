@@ -184,9 +184,7 @@ export function validateWorkerHandlerRegistry(
   if (!invitationRegistration?.capabilities.has("SMS")) {
     throw new Error("WORKER_GUARANTOR_INVITATION_SMS_CAPABILITY_REQUIRED");
   }
-  if (
-    invitationRegistration.guarantorInvitationDeliveryPolicy === undefined
-  ) {
+  if (invitationRegistration.guarantorInvitationDeliveryPolicy === undefined) {
     throw new Error("WORKER_GUARANTOR_INVITATION_POLICY_REQUIRED");
   }
 }
@@ -293,6 +291,7 @@ function waitForPoll(
 export * from "./jobs/dispatch-outbox.js";
 export * from "./jobs/recompute-arrears.js";
 export * from "./jobs/send-notification.js";
+export * from "./jobs/send-reminders.js";
 export * from "./jobs/reconcile-payments.js";
 export * from "./database-outbox-store.js";
 
