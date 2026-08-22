@@ -129,6 +129,7 @@ export function createSettlementService(options: {
           acceptedBy: input.actor.staffUserId,
           acceptedAt: new Date(),
         });
+        await assertBoundSettlementEvidence(repo, input.contractId, result.row);
         if (result.inserted)
           await appendAuditEvent(tx, {
             aggregateType: "settlement_evidence",
@@ -188,13 +189,28 @@ export function createSettlementService(options: {
           input.contractId,
           true,
         );
-        if (workflow?.status === "TRANSFERRED")
+        if (workflow?.status === "TRANSFERRED") {
+          const replayEvidence = await repo.findSettlementEvidence(
+            input.contractId,
+          );
+          if (replayEvidence === null)
+            throw new AppError(
+              409,
+              "SETTLEMENT_GATES_INCOMPLETE",
+              "All settlement approvals and clean evidence are required.",
+            );
+          await assertBoundSettlementEvidence(
+            repo,
+            input.contractId,
+            replayEvidence,
+          );
           return {
             contractId: input.contractId,
             status: "TRANSFERRED",
             ownershipHolder: "CUSTOMER",
             replay: true,
           };
+        }
         if (workflow?.status !== "SETTLED")
           throw new AppError(
             409,
@@ -221,6 +237,7 @@ export function createSettlementService(options: {
             "SETTLEMENT_GATES_INCOMPLETE",
             "All settlement approvals and clean evidence are required.",
           );
+        await assertBoundSettlementEvidence(repo, input.contractId, evidence);
         const now = new Date();
         const transfer = await repo.completeOwnershipTransfer({
           contractId: input.contractId,
@@ -406,13 +423,28 @@ async function settleContract(
         "The contract was not found.",
       );
     const workflow = await repo.findSettlementWorkflow(input.contractId, true);
-    if (workflow?.status === "SETTLED" || workflow?.status === "TRANSFERRED")
+    if (workflow?.status === "SETTLED" || workflow?.status === "TRANSFERRED") {
+      const replayEvidence = await repo.findSettlementEvidence(
+        input.contractId,
+      );
+      if (replayEvidence === null)
+        throw new AppError(
+          409,
+          "SETTLEMENT_GATES_INCOMPLETE",
+          "Finance, business, and clean evidence gates are required.",
+        );
+      await assertBoundSettlementEvidence(
+        repo,
+        input.contractId,
+        replayEvidence,
+      );
       return {
         contractId: input.contractId,
         status: workflow.status,
         ownershipHolder: "SOMOCO",
         replay: true,
       };
+    }
     if (gate.contract_status !== "ACTIVE" || BigInt(gate.balance) !== 0n)
       throw new AppError(
         409,
@@ -439,6 +471,7 @@ async function settleContract(
         "SETTLEMENT_GATES_INCOMPLETE",
         "Finance, business, and clean evidence gates are required.",
       );
+    await assertBoundSettlementEvidence(repo, input.contractId, evidence);
     const finalGate = await repo.settlementGate(input.contractId);
     if (finalGate === null)
       throw new AppError(
@@ -475,6 +508,7 @@ async function settleContract(
         "SETTLEMENT_GATES_INCOMPLETE",
         "Finance, business, and clean evidence gates are required.",
       );
+    await assertBoundSettlementEvidence(repo, input.contractId, finalEvidence);
     const now = new Date();
     const workflowRow =
       workflow ?? (await repo.createSettlementWorkflow(input.contractId));
@@ -554,6 +588,52 @@ function assertGate(gate: {
       409,
       "SETTLEMENT_RECONCILIATION_INCOMPLETE",
       "All payment reconciliation, reversal, and unmatched gates must be clear.",
+    );
+}
+
+async function assertBoundSettlementEvidence(
+  repo: ReturnType<typeof collectionsRepo>,
+  contractId: string,
+  evidence: {
+    verificationStatus: string;
+    evidenceDocumentId: string | null;
+    evidenceDocumentReference: string;
+    evidenceHash: string;
+    evidenceObjectKey: string | null;
+    evidenceObjectVersionId: string | null;
+    evidenceObjectEtag: string | null;
+  },
+): Promise<void> {
+  if (
+    evidence.verificationStatus !== "CLEAN" ||
+    evidence.evidenceDocumentId === null ||
+    evidence.evidenceObjectKey === null ||
+    evidence.evidenceObjectVersionId === null ||
+    evidence.evidenceObjectEtag === null
+  )
+    throw new AppError(
+      409,
+      "TRANSFER_EVIDENCE_BINDING_CONFLICT",
+      "Settlement evidence must retain a bound clean document and immutable object identity.",
+    );
+  const document = await repo.findSettlementEvidenceDocument(
+    contractId,
+    evidence.evidenceDocumentId,
+  );
+  if (
+    document === null ||
+    document.status !== "ACCEPTED" ||
+    !document.malware_scanned ||
+    document.sha256 !== evidence.evidenceHash ||
+    document.accepted_object_key !== evidence.evidenceObjectKey ||
+    document.accepted_object_version_id !== evidence.evidenceObjectVersionId ||
+    document.accepted_object_etag !== evidence.evidenceObjectEtag ||
+    document.accepted_object_key !== evidence.evidenceDocumentReference
+  )
+    throw new AppError(
+      409,
+      "TRANSFER_EVIDENCE_BINDING_CONFLICT",
+      "Settlement evidence no longer matches the accepted customer document.",
     );
 }
 

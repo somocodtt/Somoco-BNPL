@@ -645,11 +645,11 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       const result = await executor.execute<{
         document_id: string;
         person_id: string;
-        object_key: string;
-        accepted_object_key: string;
-        accepted_object_version_id: string;
-        accepted_object_etag: string;
-        sha256: string;
+        object_key: string | null;
+        accepted_object_key: string | null;
+        accepted_object_version_id: string | null;
+        accepted_object_etag: string | null;
+        sha256: string | null;
         status: string;
         malware_scanned: boolean;
       }>(sql`

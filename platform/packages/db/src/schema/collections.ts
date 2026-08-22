@@ -249,7 +249,7 @@ export const settlementEvidence = pgTable(
     uniqueIndex("settlement_evidence_contract_unique").on(table.contractId),
     check(
       "settlement_evidence_status_allowed",
-      sql`${table.verificationStatus} = 'CLEAN'`,
+      sql`${table.verificationStatus} in ('CLEAN', 'REVOKED')`,
     ),
     check(
       "settlement_evidence_document_nonempty",
@@ -258,6 +258,18 @@ export const settlementEvidence = pgTable(
     check(
       "settlement_evidence_hash_sha256",
       sql`${table.evidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "settlement_evidence_clean_binding_complete",
+      sql`${table.verificationStatus} <> 'CLEAN' or (
+        ${table.evidenceDocumentId} is not null
+        and ${table.evidenceObjectKey} is not null
+        and length(btrim(${table.evidenceObjectKey})) > 0
+        and ${table.evidenceObjectVersionId} is not null
+        and length(btrim(${table.evidenceObjectVersionId})) > 0
+        and ${table.evidenceObjectEtag} is not null
+        and length(btrim(${table.evidenceObjectEtag})) > 0
+      )`,
     ),
   ],
 );

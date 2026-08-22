@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(23);
+    expect(before.rows[0]?.count).toBe(24);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -601,18 +601,16 @@ describe("PostgreSQL persistence", () => {
         .delete(recoveryDecision)
         .where(sql`${recoveryDecision.id} = ${decision[0]!.id}`),
     ).rejects.toMatchObject({ cause: { code: "55000" } });
-    const evidence = await db
-      .insert(settlementEvidence)
-      .values({
+    await expect(
+      db.insert(settlementEvidence).values({
         contractId: graph.contractId,
         evidenceDocumentReference: "document-test-1",
         evidenceHash: "a".repeat(64),
         verificationStatus: "CLEAN",
         acceptedBy: staffId,
         acceptedAt: new Date(),
-      })
-      .returning();
-    expect(evidence[0]?.verificationStatus).toBe("CLEAN");
+      }),
+    ).rejects.toMatchObject({ cause: { code: "23514" } });
     await expect(
       db.insert(recoveryAction).values({
         recoveryCaseId,
@@ -1242,7 +1240,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0022", async () => {
+  it("upgrades populated 0009 financing rows safely through 0023", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1324,6 +1322,7 @@ describe("populated legacy schema migration", () => {
     await applyMigrationFile(pool, "0020_flippant_bishop.sql");
     await applyMigrationFile(pool, "0021_high_siren.sql");
     await applyMigrationFile(pool, "0022_condemned_deathbird.sql");
+    await applyMigrationFile(pool, "0023_bound_settlement_evidence.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;
@@ -1386,6 +1385,70 @@ describe("populated legacy schema migration", () => {
       status: "APPROVED",
       principal_minor_units: "100000",
     });
+  });
+
+  it("quarantines populated unbound CLEAN evidence before enforcing new bindings", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+      "0009_whole_nightmare.sql",
+      "0010_controlled_financing.sql",
+      "0011_financing_binding.sql",
+      "0012_financing_disclosures.sql",
+      "0013_asset_contract_handover.sql",
+      "0014_asset_hardening.sql",
+      "0015_asset_privacy_controls.sql",
+      "0016_payment_ledger_reconciliation.sql",
+      "0017_wooden_selene.sql",
+      "0018_sealed_payment_policy.sql",
+      "0019_external_payment_policy_evidence.sql",
+      "0020_flippant_bishop.sql",
+      "0021_high_siren.sql",
+      "0022_condemned_deathbird.sql",
+    ])
+      await applyMigrationFile(pool, migration);
+
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "USSD",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const staffId = randomUUID();
+    await pool.query(
+      `insert into staff_user (id, email, password_hash) values ($1, $2, 'hash')`,
+      [staffId, `${staffId}@example.test`],
+    );
+    await pool.query(
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_reference, evidence_hash,
+         verification_status, accepted_by, accepted_at)
+       values ($1, $2, 'legacy/unbound.pdf', repeat('a', 64), 'CLEAN', $3, now())`,
+      [randomUUID(), legacy.contractId, staffId],
+    );
+
+    await applyMigrationFile(pool, "0023_bound_settlement_evidence.sql");
+    await expect(
+      pool.query(
+        `select verification_status from settlement_evidence where contract_id = $1`,
+        [legacy.contractId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ verification_status: "REVOKED" }] });
+    await expect(
+      pool.query(
+        `insert into settlement_evidence
+          (contract_id, evidence_document_reference, evidence_hash,
+           verification_status, accepted_by, accepted_at)
+         values ($1, 'bypass.pdf', repeat('b', 64), 'CLEAN', $2, now())`,
+        [legacy.contractId, staffId],
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
   });
 
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
@@ -1622,6 +1685,7 @@ interface LegacyGraphOptions {
   provider: string;
   channel?: "USSD" | "MOBILE_MONEY";
   registeredOwner: string;
+  calculationMethod?: "DECLINING_BALANCE" | "REDUCING_BALANCE";
 }
 
 async function insertLegacyFinancialGraph(
@@ -1667,8 +1731,8 @@ async function insertLegacyFinancialGraph(
         annual_rate_bps, allowed_tenures_months, repayment_frequencies,
         calculation_method)
      values ($1, $2, 1, 10000, 1200, '[12]'::jsonb,
-             '["MONTHLY"]'::jsonb, 'DECLINING_BALANCE')`,
-    [ruleId, productId],
+             '["MONTHLY"]'::jsonb, $3)`,
+    [ruleId, productId, options.calculationMethod ?? "DECLINING_BALANCE"],
   );
   await pool.query(`insert into offer (id, application_id) values ($1, $2)`, [
     offerId,
@@ -1706,37 +1770,83 @@ async function insertLegacyFinancialGraph(
      values ($1, $2, 1, 100000, '2026-09-01')`,
     [scheduleId, contractId],
   );
-  await pool.query(
-    `insert into installment
-       (id, repayment_schedule_id, installment_number, due_date,
-        amount_minor_units, paid_minor_units)
-     values ($1, $2, 1, '2026-09-01', 100000, 10000)`,
-    [installmentId, scheduleId],
-  );
-  await pool.query(
-    `insert into payment_transaction
-       (id, provider, provider_transaction_id, contract_id, payer_reference,
-        amount_minor_units, provider_payload, occurred_at)
-     values ($1, $2, $3, $4, '+233201234567', 10000, $5::jsonb,
-             '2026-08-14T12:00:00.000Z')`,
-    [
-      paymentTransactionId,
-      options.provider,
-      `TXN-${suffix}`,
-      contractId,
-      JSON.stringify(
-        options.channel === undefined ? {} : { channel: options.channel },
-      ),
-    ],
-  );
-  await pool.query(
-    `insert into ledger_entry
-       (id, contract_id, payment_transaction_id, installment_id, entry_type,
-        direction, amount_minor_units, balance_after_minor_units, occurred_at)
-     values ($1, $2, $3, $4, 'REPAYMENT', 'CREDIT', 10000, 90000,
-             '2026-08-14T12:00:00.000Z')`,
-    [ledgerEntryId, contractId, paymentTransactionId, installmentId],
-  );
+  if (options.calculationMethod === "REDUCING_BALANCE") {
+    await pool.query(
+      `insert into installment
+         (id, repayment_schedule_id, contract_id, installment_number, due_date,
+          amount_minor_units, paid_minor_units)
+       values ($1, $2, $3, 1, '2026-09-01', 100000, 10000)`,
+      [installmentId, scheduleId, contractId],
+    );
+  } else {
+    await pool.query(
+      `insert into installment
+         (id, repayment_schedule_id, installment_number, due_date,
+          amount_minor_units, paid_minor_units)
+       values ($1, $2, 1, '2026-09-01', 100000, 10000)`,
+      [installmentId, scheduleId],
+    );
+  }
+  if (options.calculationMethod === "REDUCING_BALANCE") {
+    await pool.query(
+      `insert into payment_transaction
+         (id, provider, channel, provider_transaction_id, contract_id,
+          payer_reference, amount_minor_units, provider_payload, occurred_at)
+       values ($1, $2, $3, $4, $5, '+233201234567', 10000, $6::jsonb,
+               '2026-08-14T12:00:00.000Z')`,
+      [
+        paymentTransactionId,
+        options.provider,
+        options.channel,
+        `TXN-${suffix}`,
+        contractId,
+        JSON.stringify({ channel: options.channel }),
+      ],
+    );
+  } else {
+    await pool.query(
+      `insert into payment_transaction
+         (id, provider, provider_transaction_id, contract_id, payer_reference,
+          amount_minor_units, provider_payload, occurred_at)
+       values ($1, $2, $3, $4, '+233201234567', 10000, $5::jsonb,
+               '2026-08-14T12:00:00.000Z')`,
+      [
+        paymentTransactionId,
+        options.provider,
+        `TXN-${suffix}`,
+        contractId,
+        JSON.stringify(
+          options.channel === undefined ? {} : { channel: options.channel },
+        ),
+      ],
+    );
+  }
+  if (options.calculationMethod === "REDUCING_BALANCE") {
+    await pool.query(
+      `insert into ledger_entry
+         (id, posting_key, contract_id, payment_transaction_id, installment_id,
+          entry_type, direction, amount_minor_units, balance_after_minor_units,
+          occurred_at)
+       values ($1, $2, $3, $4, $5, 'REPAYMENT', 'CREDIT', 10000, 90000,
+               '2026-08-14T12:00:00.000Z')`,
+      [
+        ledgerEntryId,
+        `legacy:ledger:${ledgerEntryId}`,
+        contractId,
+        paymentTransactionId,
+        installmentId,
+      ],
+    );
+  } else {
+    await pool.query(
+      `insert into ledger_entry
+         (id, contract_id, payment_transaction_id, installment_id, entry_type,
+          direction, amount_minor_units, balance_after_minor_units, occurred_at)
+       values ($1, $2, $3, $4, 'REPAYMENT', 'CREDIT', 10000, 90000,
+               '2026-08-14T12:00:00.000Z')`,
+      [ledgerEntryId, contractId, paymentTransactionId, installmentId],
+    );
+  }
   await pool.query(
     `insert into registration_record
        (vehicle_unit_id, registration_number, registered_owner, valid_from)

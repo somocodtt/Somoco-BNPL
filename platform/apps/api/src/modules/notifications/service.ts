@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendAuditEvent,
   collectionsRepo,
@@ -132,6 +132,21 @@ export function createNotificationService(options: {
             : { missedInstallments: String(input.missedInstallments) }),
         };
         rejectSensitiveVariables(variables);
+        const commandFingerprint = hashReminderCommand({
+          contractId: input.contractId,
+          template: input.template,
+          dueDate: input.dueDate ?? null,
+          overdueMinorUnits:
+            input.overdueMinorUnits === undefined
+              ? null
+              : input.overdueMinorUnits.toString(),
+          missedInstallments: input.missedInstallments ?? null,
+          asOfDate: input.asOfDate,
+          accountLink,
+          ussdInstructions,
+          cashPolicy: "Cash is not accepted.",
+          recipientReference: context.phoneE164,
+        });
         const notificationResult = await repo.insertNotification({
           channel: "SMS",
           recipientReference: context.phoneE164,
@@ -141,21 +156,18 @@ export function createNotificationService(options: {
             contractId: input.contractId,
             template: input.template,
             variables,
+            commandFingerprint,
           },
           status: "QUEUED",
         });
         const inserted = notificationResult.row;
         if (!notificationResult.inserted) {
           const existingPayload = inserted.payload;
-          const existingContractId =
-            typeof existingPayload === "object" &&
-            existingPayload !== null &&
-            !Array.isArray(existingPayload)
-              ? (existingPayload as Record<string, unknown>).contractId
-              : undefined;
           if (
-            existingContractId !== input.contractId ||
-            inserted.template !== input.template
+            reminderPayloadFingerprint(
+              existingPayload,
+              inserted.recipientReference,
+            ) !== commandFingerprint
           )
             throw new AppError(
               409,
@@ -308,13 +320,106 @@ function hasCollectionsRead(actor: StaffPrincipal): boolean {
 
 function hasCollectionsMutation(actor: StaffPrincipal): boolean {
   return actor.roles.some((role) =>
-    [
-      "RECOVERY_OFFICER",
-      "BSM",
-      "AGM",
-      "CFO",
-      "MD",
-      "COMPLIANCE_AUDITOR",
-    ].includes(role),
+    ["RECOVERY_OFFICER", "BSM", "AGM", "CFO", "MD"].includes(role),
+  );
+}
+
+type ReminderCommand = {
+  contractId: string;
+  template: ReminderTemplate;
+  dueDate: string | null;
+  overdueMinorUnits: string | null;
+  missedInstallments: number | null;
+  asOfDate: string;
+  accountLink: string;
+  ussdInstructions: string;
+  cashPolicy: "Cash is not accepted.";
+  recipientReference: string;
+};
+
+function hashReminderCommand(command: ReminderCommand): string {
+  return createHash("sha256")
+    .update(JSON.stringify(stableValue(command)))
+    .digest("hex");
+}
+
+function reminderPayloadFingerprint(
+  payload: Record<string, unknown>,
+  recipientReference: string,
+): string | null {
+  if (typeof payload.commandFingerprint === "string")
+    return /^[0-9a-f]{64}$/.test(payload.commandFingerprint)
+      ? payload.commandFingerprint
+      : null;
+  if (
+    typeof payload.contractId !== "string" ||
+    typeof payload.template !== "string" ||
+    !isReminderTemplate(payload.template) ||
+    typeof payload.variables !== "object" ||
+    payload.variables === null ||
+    Array.isArray(payload.variables)
+  )
+    return null;
+  const variables = payload.variables as Record<string, unknown>;
+  if (
+    typeof variables.accountLink !== "string" ||
+    typeof variables.ussdInstructions !== "string" ||
+    variables.cashPolicy !== "Cash is not accepted." ||
+    typeof variables.asOfDate !== "string"
+  )
+    return null;
+  const dueDate =
+    variables.dueDate === undefined ? null : stringOrNull(variables.dueDate);
+  const overdueMinorUnits =
+    variables.overdueMinorUnits === undefined
+      ? null
+      : stringOrNull(variables.overdueMinorUnits);
+  const missedInstallments =
+    variables.missedInstallments === undefined
+      ? null
+      : numberOrNull(variables.missedInstallments);
+  if (
+    (variables.dueDate !== undefined && dueDate === null) ||
+    (variables.overdueMinorUnits !== undefined && overdueMinorUnits === null) ||
+    (variables.missedInstallments !== undefined && missedInstallments === null)
+  )
+    return null;
+  return hashReminderCommand({
+    contractId: payload.contractId,
+    template: payload.template,
+    dueDate,
+    overdueMinorUnits,
+    missedInstallments,
+    asOfDate: variables.asOfDate,
+    accountLink: variables.accountLink,
+    ussdInstructions: variables.ussdInstructions,
+    cashPolicy: "Cash is not accepted.",
+    recipientReference,
+  });
+}
+
+function isReminderTemplate(value: string): value is ReminderTemplate {
+  return ["PAYMENT_DUE", "PAYMENT_WARNING", "ARREARS_WARNING"].includes(value);
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) ? value : null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, stableValue(entry)]),
   );
 }

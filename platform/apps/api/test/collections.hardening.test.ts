@@ -1,6 +1,7 @@
 import argon2 from "argon2";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { deriveOtpCode, otpDerivationKeyId } from "@somo/integrations";
 import {
   createDatabase,
   createStaffUser,
@@ -17,6 +18,7 @@ import {
 } from "../src/modules/payments/ledger-service.js";
 import { buildApp } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
+import type { OtpPolicy } from "../src/modules/identity/otp-service.js";
 import { createCollectionsService } from "../src/modules/collections/service.js";
 import { createNotificationService } from "../src/modules/notifications/service.js";
 import { createSettlementService } from "../src/modules/contracts/settlement-service.js";
@@ -51,6 +53,20 @@ const config: AppConfig = {
   argon2TimeCost: 2,
   argon2Parallelism: 1,
   requireVerifiedMfa: false,
+};
+
+const otpPolicy: OtpPolicy = {
+  ttlMs: 120_000,
+  attemptLimit: 3,
+  resendCooldownMs: 30_000,
+  codeLength: 6,
+  hashSecret: "test-otp-hash-secret-with-at-least-32-characters",
+  deliveryDerivationSecret:
+    "test-otp-delivery-secret-with-at-least-32-characters",
+  deliveryDerivationKeyId: otpDerivationKeyId(
+    "test-otp-delivery-secret-with-at-least-32-characters",
+  ),
+  sessionTtlMs: 3_600_000,
 };
 
 let database: Database;
@@ -101,6 +117,33 @@ describe("collections hardening against actor and contract scope", () => {
     const first = await queueReminder(input);
     const replay = await queueReminder(input);
     expect(replay).toEqual(first);
+    const beforeConflict = await queryTestSql<{
+      notification_count: number;
+      outbox_count: number;
+      audit_count: number;
+    }>(
+      databaseUrl,
+      `select
+         (select count(*)::int from notification) as notification_count,
+         (select count(*)::int from outbox_message) as outbox_count,
+         (select count(*)::int from audit_event) as audit_count`,
+    );
+    await expect(
+      queueReminder({ ...input, overdueMinorUnits: 101n }),
+    ).rejects.toMatchObject({ code: "REMINDER_IDEMPOTENCY_KEY_REUSED" });
+    await expect(
+      queryTestSql<{
+        notification_count: number;
+        outbox_count: number;
+        audit_count: number;
+      }>(
+        databaseUrl,
+        `select
+           (select count(*)::int from notification) as notification_count,
+           (select count(*)::int from outbox_message) as outbox_count,
+           (select count(*)::int from audit_event) as audit_count`,
+      ),
+    ).resolves.toEqual(beforeConflict);
     expect(
       await queryTestSql<{ count: number }>(
         databaseUrl,
@@ -123,6 +166,15 @@ describe("collections hardening against actor and contract scope", () => {
         [],
       ),
     ).toEqual({ count: 1 });
+
+    const auditor = await seedStaff("COMPLIANCE_AUDITOR");
+    await expect(
+      queueReminder({
+        ...input,
+        idempotencyKey: "reminder-auditor-1",
+        actor: principal(auditor, "COMPLIANCE_AUDITOR"),
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
 
     await executeTestSql(
       databaseUrl,
@@ -199,6 +251,36 @@ describe("settlement transfer evidence", () => {
       verificationStatus: "CLEAN",
     });
   });
+
+  it("rejects a legacy unbound CLEAN conflict instead of replaying it", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const actorId = await seedStaff("MD");
+    const documentId = await seedCleanDocument(fixture.applicantId);
+    await executeTestSql(
+      databaseUrl,
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_id, evidence_document_reference,
+         evidence_hash, evidence_object_key, evidence_object_version_id,
+         evidence_object_etag, verification_status, accepted_by, accepted_at)
+       values ($1, $2, $3, 'legacy/mismatched.pdf', repeat('a', 64),
+               'legacy/mismatched.pdf', 'legacy-v0', 'legacy-etag', 'CLEAN', $4, now())`,
+      [randomUUID(), fixture.contractId, documentId, actorId],
+    );
+    const settlement = createSettlementService({ database });
+    const recordEvidence = settlement.recordEvidence as unknown as (input: {
+      contractId: string;
+      evidenceDocumentId: string;
+      actor: StaffPrincipal;
+    }) => Promise<Record<string, unknown>>;
+
+    await expect(
+      recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId: documentId,
+        actor: principal(actorId, "MD"),
+      }),
+    ).rejects.toMatchObject({ code: "TRANSFER_EVIDENCE_BINDING_CONFLICT" });
+  });
 });
 
 describe("recovery action replay", () => {
@@ -271,6 +353,7 @@ describe("settlement and reconciliation serialization", () => {
     const finance = await seedStaff("CFO");
     const business = await seedStaff("MD");
     const evidence = randomUUID();
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
     await executeTestSql(
       databaseUrl,
       `insert into settlement_approval
@@ -290,9 +373,17 @@ describe("settlement and reconciliation serialization", () => {
     await executeTestSql(
       databaseUrl,
       `insert into settlement_evidence
-        (id, contract_id, evidence_document_reference, evidence_hash, verification_status, accepted_by, accepted_at)
-       values ($1, $2, 'accepted/transfer.pdf', repeat('b', 64), 'CLEAN', $3, now())`,
-      [evidence, fixture.contractId, business],
+        (id, contract_id, evidence_document_id, evidence_document_reference,
+         evidence_hash, evidence_object_key, evidence_object_version_id,
+         evidence_object_etag, verification_status, accepted_by, accepted_at)
+       values ($1, $2, $3, $4, repeat('b', 64), $4, 'v1', 'etag', 'CLEAN', $5, now())`,
+      [
+        evidence,
+        fixture.contractId,
+        evidenceDocumentId,
+        `accepted/${evidenceDocumentId}`,
+        business,
+      ],
     );
 
     let inserted = false;
@@ -335,6 +426,10 @@ describe("collections HTTP authorization", () => {
     const fixture = await seedContract("ACTIVE", 100_000);
     const support = await seedHttpStaff("CUSTOMER_SUPPORT");
     const officer = await seedHttpStaff("RECOVERY_OFFICER");
+    const auditor = await seedHttpStaff("COMPLIANCE_AUDITOR");
+    const maker = await seedHttpStaff("RECOVERY_OFFICER");
+    const md = await seedHttpStaff("MD");
+    const transferDocumentId = await seedCleanDocument(fixture.applicantId);
     const app = await buildApp({
       config,
       database,
@@ -377,6 +472,25 @@ describe("collections HTTP authorization", () => {
         accountLinkBaseUrl: "https://customer.test.somo.example/account",
         ussdInstructions: "Dial *123# to pay.",
       },
+      identity: {
+        sms: {
+          async send() {
+            return {
+              providerReference: "test-customer-otp",
+              acceptedAt: "2026-08-22T00:00:00.000Z",
+            };
+          },
+        },
+        otpPolicy,
+        consentCatalog: {
+          documents: [
+            {
+              purpose: "NIA_IDENTITY_VERIFICATION",
+              currentVersion: "nia-consent-v1",
+            },
+          ],
+        },
+      },
     });
     try {
       const supportLogin = await login(app, support.email);
@@ -390,6 +504,18 @@ describe("collections HTTP authorization", () => {
         payload: reminderPayload(fixture.contractId, "http-reminder-support"),
       });
       expect(denied.statusCode).toBe(403);
+
+      const auditorLogin = await login(app, auditor.email);
+      const auditorDenied = await app.inject({
+        method: "POST",
+        url: "/v1/staff/collections/reminders",
+        headers: {
+          cookie: auditorLogin.cookie,
+          "x-csrf-token": auditorLogin.csrf,
+        },
+        payload: reminderPayload(fixture.contractId, "http-reminder-auditor"),
+      });
+      expect(auditorDenied.statusCode).toBe(403);
 
       const officerLogin = await login(app, officer.email);
       const missingCsrf = await app.inject({
@@ -442,6 +568,161 @@ describe("collections HTTP authorization", () => {
         payload: reminderPayload(fixture.contractId, "http-reminder-allowed"),
       });
       expect(allowed.statusCode).toBe(201);
+
+      const changed = await app.inject({
+        method: "POST",
+        url: "/v1/staff/collections/reminders",
+        headers: {
+          cookie: officerLogin.cookie,
+          "x-csrf-token": officerLogin.csrf,
+        },
+        payload: {
+          ...reminderPayload(fixture.contractId, "http-reminder-allowed"),
+          overdueMinorUnits: "101",
+        },
+      });
+      expect(changed.statusCode).toBe(409);
+
+      const recoveryCaseId = randomUUID();
+      await executeTestSql(
+        databaseUrl,
+        `insert into recovery_case (id, contract_id, status, details, opened_at)
+         values ($1, $2, 'OPEN', $3::jsonb, now())`,
+        [
+          recoveryCaseId,
+          fixture.contractId,
+          JSON.stringify({ openedByStaffUserId: maker.id }),
+        ],
+      );
+      await executeTestSql(
+        databaseUrl,
+        `insert into recovery_decision
+          (id, recovery_case_id, idempotency_key, maker_staff_user_id,
+           checker_staff_user_id, decision, purpose, reason, decided_at)
+         values ($1, $2, $3, $4, $5, 'APPROVED', 'HTTP', 'Approved', now())`,
+        [
+          randomUUID(),
+          recoveryCaseId,
+          `http-decision-${randomUUID()}`,
+          maker.id,
+          officer.id,
+        ],
+      );
+      const actionPayload = {
+        actionType: "VISIT",
+        purpose: "HTTP review",
+        requestedBy: maker.id,
+        evidence: { note: "same action" },
+        evidenceHash: "a".repeat(64),
+        idempotencyKey: "http-action-replay-1",
+      } as const;
+      const action = await app.inject({
+        method: "POST",
+        url: `/v1/staff/collections/cases/${recoveryCaseId}/actions`,
+        headers: {
+          cookie: officerLogin.cookie,
+          "x-csrf-token": officerLogin.csrf,
+        },
+        payload: actionPayload,
+      });
+      expect(action.statusCode).toBe(201);
+      const actionReplay = await app.inject({
+        method: "POST",
+        url: `/v1/staff/collections/cases/${recoveryCaseId}/actions`,
+        headers: {
+          cookie: officerLogin.cookie,
+          "x-csrf-token": officerLogin.csrf,
+        },
+        payload: actionPayload,
+      });
+      expect(actionReplay.statusCode).toBe(201);
+      expect(actionReplay.json<{ id: string }>().id).toBe(
+        action.json<{ id: string }>().id,
+      );
+
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/v1/staff/collections/arrears",
+            headers: { cookie: officerLogin.cookie },
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/v1/staff/collections/cases",
+            headers: { cookie: officerLogin.cookie },
+          })
+        ).statusCode,
+      ).toBe(200);
+
+      const officerEvidenceDenied = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/evidence`,
+        headers: {
+          cookie: officerLogin.cookie,
+          "x-csrf-token": officerLogin.csrf,
+        },
+        payload: { evidenceDocumentId: transferDocumentId },
+      });
+      expect(officerEvidenceDenied.statusCode).toBe(403);
+      const mdLogin = await login(app, md.email);
+      const mdEvidenceAccepted = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/evidence`,
+        headers: { cookie: mdLogin.cookie, "x-csrf-token": mdLogin.csrf },
+        payload: { evidenceDocumentId: transferDocumentId },
+      });
+      expect(mdEvidenceAccepted.statusCode).toBe(200);
+
+      await executeTestSql(
+        databaseUrl,
+        "update privacy.person set phone_e164 = '+233201234567' where id = $1",
+        [fixture.applicantId],
+      );
+      const person = await queryTestSql<{ phone_e164: string }>(
+        databaseUrl,
+        "select phone_e164 from privacy.person where id = $1",
+        [fixture.applicantId],
+      );
+      const otpRequested = await app.inject({
+        method: "POST",
+        url: "/v1/customer/otp/requests",
+        payload: { phoneE164: person.phone_e164 },
+      });
+      expect(otpRequested.statusCode, otpRequested.body).toBe(202);
+      const challenge = await queryTestSql<{ id: string }>(
+        databaseUrl,
+        `select id from privacy.otp_challenge
+          where person_id = $1 order by created_at desc limit 1`,
+        [fixture.applicantId],
+      );
+      const otpVerified = await app.inject({
+        method: "POST",
+        url: "/v1/customer/otp/verifications",
+        payload: {
+          phoneE164: person.phone_e164,
+          code: deriveOtpCode(
+            otpPolicy.deliveryDerivationSecret,
+            challenge.id,
+            otpPolicy.codeLength,
+          ),
+        },
+      });
+      expect(otpVerified.statusCode).toBe(201);
+      const customerToken = otpVerified.json<{ sessionToken: string }>();
+      const customerStatus = await app.inject({
+        method: "GET",
+        url: "/v1/customer/account-status",
+        headers: { authorization: `Bearer ${customerToken.sessionToken}` },
+      });
+      expect(customerStatus.statusCode).toBe(200);
+      expect(
+        customerStatus.json<ReadonlyArray<{ contractId: string }>>(),
+      ).toEqual([expect.objectContaining({ contractId: fixture.contractId })]);
     } finally {
       await app.close();
     }
