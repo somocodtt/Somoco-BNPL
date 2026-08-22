@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(24);
+    expect(before.rows[0]?.count).toBe(25);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1240,7 +1240,7 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({ rows: [{ id: commandId }] });
   });
 
-  it("upgrades populated 0009 financing rows safely through 0023", async () => {
+  it("upgrades populated 0009 financing rows safely through 0024", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1323,6 +1323,7 @@ describe("populated legacy schema migration", () => {
     await applyMigrationFile(pool, "0021_high_siren.sql");
     await applyMigrationFile(pool, "0022_condemned_deathbird.sql");
     await applyMigrationFile(pool, "0023_bound_settlement_evidence.sql");
+    await applyMigrationFile(pool, "0024_safe_evidence_replacement.sql");
 
     const migrated = await pool.query<{
       calculation_method: string;
@@ -1425,21 +1426,89 @@ describe("populated legacy schema migration", () => {
       `insert into staff_user (id, email, password_hash) values ($1, $2, 'hash')`,
       [staffId, `${staffId}@example.test`],
     );
+    const revokedId = randomUUID();
     await pool.query(
       `insert into settlement_evidence
         (id, contract_id, evidence_document_reference, evidence_hash,
          verification_status, accepted_by, accepted_at)
        values ($1, $2, 'legacy/unbound.pdf', repeat('a', 64), 'CLEAN', $3, now())`,
-      [randomUUID(), legacy.contractId, staffId],
+      [revokedId, legacy.contractId, staffId],
     );
 
     await applyMigrationFile(pool, "0023_bound_settlement_evidence.sql");
+    await applyMigrationFile(pool, "0024_safe_evidence_replacement.sql");
     await expect(
       pool.query(
         `select verification_status from settlement_evidence where contract_id = $1`,
         [legacy.contractId],
       ),
     ).resolves.toMatchObject({ rows: [{ verification_status: "REVOKED" }] });
+    const applicant = await pool.query<{ applicant_person_id: string }>(
+      `select a.applicant_person_id
+         from contract c join application a on a.id = c.application_id
+        where c.id = $1`,
+      [legacy.contractId],
+    );
+    const documentId = randomUUID();
+    await pool.query(
+      `insert into privacy.document
+        (id, person_id, document_type, object_key, declared_mime_type,
+         declared_size_bytes, upload_ticket_hash, upload_expires_at,
+         accepted_object_key, accepted_object_version_id, accepted_object_etag,
+         sha256, status, malware_scanned)
+       values ($1, $2, 'TRANSFER_EVIDENCE', $3, 'application/pdf', 128,
+               repeat('c', 64), now() + interval '5 minutes', $4, 'v1', 'etag',
+               repeat('d', 64), 'ACCEPTED', true)`,
+      [
+        documentId,
+        applicant.rows[0]!.applicant_person_id,
+        `pending/${documentId}`,
+        `accepted/${documentId}`,
+      ],
+    );
+    await pool.query(
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_id, evidence_document_reference,
+         evidence_hash, evidence_object_key, evidence_object_version_id,
+         evidence_object_etag, verification_status, accepted_by, accepted_at)
+       values ($1, $2, $3, $4, repeat('d', 64), $4, 'v1', 'etag', 'CLEAN', $5, now())`,
+      [
+        randomUUID(),
+        legacy.contractId,
+        documentId,
+        `accepted/${documentId}`,
+        staffId,
+      ],
+    );
+    await expect(
+      pool.query(
+        `insert into settlement_evidence
+          (contract_id, evidence_document_id, evidence_document_reference,
+           evidence_hash, evidence_object_key, evidence_object_version_id,
+           evidence_object_etag, verification_status, accepted_by, accepted_at)
+         values ($1, $2, $3, repeat('d', 64), $3, 'v1', 'etag', 'CLEAN', $4, now())`,
+        [legacy.contractId, documentId, `accepted/${documentId}`, staffId],
+      ),
+    ).rejects.toMatchObject({ code: "23505" });
+    await expect(
+      pool.query(
+        `select verification_status from settlement_evidence
+          where id = $1`,
+        [revokedId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ verification_status: "REVOKED" }] });
+    await expect(
+      pool.query(
+        `select verification_status from settlement_evidence
+          where contract_id = $1 order by verification_status`,
+        [legacy.contractId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        { verification_status: "CLEAN" },
+        { verification_status: "REVOKED" },
+      ],
+    });
     await expect(
       pool.query(
         `insert into settlement_evidence

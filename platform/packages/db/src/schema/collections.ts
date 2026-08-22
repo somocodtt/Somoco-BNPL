@@ -246,7 +246,9 @@ export const settlementEvidence = pgTable(
       .notNull(),
   },
   (table) => [
-    uniqueIndex("settlement_evidence_contract_unique").on(table.contractId),
+    uniqueIndex("settlement_evidence_contract_active_unique")
+      .on(table.contractId)
+      .where(sql`${table.verificationStatus} = 'CLEAN'`),
     check(
       "settlement_evidence_status_allowed",
       sql`${table.verificationStatus} in ('CLEAN', 'REVOKED')`,

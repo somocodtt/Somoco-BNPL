@@ -625,13 +625,21 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       const [row] = await executor
         .insert(settlementEvidence)
         .values(input)
-        .onConflictDoNothing({ target: settlementEvidence.contractId })
+        .onConflictDoNothing({
+          target: settlementEvidence.contractId,
+          where: sql`${settlementEvidence.verificationStatus} = 'CLEAN'`,
+        })
         .returning();
       if (row !== undefined) return { row, inserted: true } as const;
       const [existing] = await executor
         .select()
         .from(settlementEvidence)
-        .where(eq(settlementEvidence.contractId, input.contractId))
+        .where(
+          and(
+            eq(settlementEvidence.contractId, input.contractId),
+            eq(settlementEvidence.verificationStatus, "CLEAN"),
+          ),
+        )
         .limit(1);
       if (existing === undefined)
         throw new Error("SETTLEMENT_EVIDENCE_DEDUP_FAILED");
@@ -677,7 +685,12 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       const [row] = await executor
         .select()
         .from(settlementEvidence)
-        .where(eq(settlementEvidence.contractId, contractId))
+        .where(
+          and(
+            eq(settlementEvidence.contractId, contractId),
+            eq(settlementEvidence.verificationStatus, "CLEAN"),
+          ),
+        )
         .limit(1);
       return row ?? null;
     },

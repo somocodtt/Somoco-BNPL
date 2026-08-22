@@ -169,6 +169,13 @@
       "when": 1787433826794,
       "tag": "0023_bound_settlement_evidence",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1787435822604,
+      "tag": "0024_safe_evidence_replacement",
+      "breakpoints": true
     }
   ]
 }

@@ -72,7 +72,7 @@ export function createSettlementService(options: {
     async recordEvidence(input) {
       if (
         !input.actor.roles.some((role) =>
-          ["MD", "INVENTORY_OFFICER", "COMPLIANCE_AUDITOR"].includes(role),
+          ["MD", "INVENTORY_OFFICER"].includes(role),
         )
       )
         throw new AppError(
@@ -130,6 +130,7 @@ export function createSettlementService(options: {
           acceptedAt: new Date(),
         });
         await assertBoundSettlementEvidence(repo, input.contractId, result.row);
+        assertRequestedEvidenceBinding(document, result.row);
         if (result.inserted)
           await appendAuditEvent(tx, {
             aggregateType: "settlement_evidence",
@@ -638,15 +639,43 @@ async function assertBoundSettlementEvidence(
 }
 
 function requireFinanceApproval(actor: StaffPrincipal): void {
-  if (
-    !actor.roles.some((role) =>
-      ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR"].includes(role),
-    )
-  )
+  if (!actor.roles.some((role) => ["FINANCE_OFFICER", "CFO"].includes(role)))
     throw new AppError(
       403,
       "FORBIDDEN",
       "Finance reconciliation approval is required.",
+    );
+}
+
+function assertRequestedEvidenceBinding(
+  document: {
+    document_id: string;
+    accepted_object_key: string | null;
+    accepted_object_version_id: string | null;
+    accepted_object_etag: string | null;
+    sha256: string | null;
+  },
+  evidence: {
+    evidenceDocumentId: string | null;
+    evidenceDocumentReference: string;
+    evidenceHash: string;
+    evidenceObjectKey: string | null;
+    evidenceObjectVersionId: string | null;
+    evidenceObjectEtag: string | null;
+  },
+): void {
+  if (
+    evidence.evidenceDocumentId !== document.document_id ||
+    evidence.evidenceDocumentReference !== document.accepted_object_key ||
+    evidence.evidenceHash !== document.sha256 ||
+    evidence.evidenceObjectKey !== document.accepted_object_key ||
+    evidence.evidenceObjectVersionId !== document.accepted_object_version_id ||
+    evidence.evidenceObjectEtag !== document.accepted_object_etag
+  )
+    throw new AppError(
+      409,
+      "TRANSFER_EVIDENCE_BINDING_CONFLICT",
+      "Another active settlement evidence document is already bound to this contract.",
     );
 }
 

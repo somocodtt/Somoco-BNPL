@@ -281,6 +281,121 @@ describe("settlement transfer evidence", () => {
       }),
     ).rejects.toMatchObject({ code: "TRANSFER_EVIDENCE_BINDING_CONFLICT" });
   });
+
+  it("keeps revoked evidence history while accepting one valid replacement", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const actorId = await seedStaff("MD");
+    const documentId = await seedCleanDocument(fixture.applicantId);
+    const revokedId = randomUUID();
+    await executeTestSql(
+      databaseUrl,
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_reference, evidence_hash,
+         verification_status, accepted_by, accepted_at)
+       values ($1, $2, 'legacy/revoked.pdf', repeat('a', 64), 'REVOKED', $3, now())`,
+      [revokedId, fixture.contractId, actorId],
+    );
+    const settlement = createSettlementService({ database });
+
+    const accepted = await settlement.recordEvidence({
+      contractId: fixture.contractId,
+      evidenceDocumentId: documentId,
+      actor: principal(actorId, "MD"),
+    });
+    const replay = await settlement.recordEvidence({
+      contractId: fixture.contractId,
+      evidenceDocumentId: documentId,
+      actor: principal(actorId, "MD"),
+    });
+
+    expect(accepted.id).not.toBe(revokedId);
+    expect(replay.id).toBe(accepted.id);
+    expect(
+      await queryTestSql<{ clean_count: number; revoked_count: number }>(
+        databaseUrl,
+        `select count(*) filter (where verification_status = 'CLEAN')::int as clean_count,
+                count(*) filter (where verification_status = 'REVOKED')::int as revoked_count
+           from settlement_evidence where contract_id = $1`,
+        [fixture.contractId],
+      ),
+    ).toEqual({ clean_count: 1, revoked_count: 1 });
+  });
+
+  it("serializes concurrent replacements and rejects a different active document", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const actorId = await seedStaff("MD");
+    const documentA = await seedCleanDocument(fixture.applicantId);
+    const documentB = await seedCleanDocument(fixture.applicantId);
+    await executeTestSql(
+      databaseUrl,
+      `insert into settlement_evidence
+        (id, contract_id, evidence_document_reference, evidence_hash,
+         verification_status, accepted_by, accepted_at)
+       values ($1, $2, 'legacy/revoked.pdf', repeat('a', 64), 'REVOKED', $3, now())`,
+      [randomUUID(), fixture.contractId, actorId],
+    );
+    const settlement = createSettlementService({ database });
+    const results = await Promise.allSettled([
+      settlement.recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId: documentA,
+        actor: principal(actorId, "MD"),
+      }),
+      settlement.recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId: documentB,
+        actor: principal(actorId, "MD"),
+      }),
+    ]);
+
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(rejected?.reason).toMatchObject({
+      code: "TRANSFER_EVIDENCE_BINDING_CONFLICT",
+    });
+  });
+
+  it("does not allow a compliance auditor to mutate settlement state", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const auditorId = await seedStaff("COMPLIANCE_AUDITOR");
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
+    const settlement = createSettlementService({ database });
+    const actor = principal(auditorId, "COMPLIANCE_AUDITOR");
+
+    await expect(
+      settlement.recordEvidence({
+        contractId: fixture.contractId,
+        evidenceDocumentId,
+        actor,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      settlement.approveFinance({
+        contractId: fixture.contractId,
+        reason: "Auditor must not approve",
+        idempotencyKey: "auditor-finance-approval",
+        actor,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      settlement.approveBusiness({
+        contractId: fixture.contractId,
+        reason: "Auditor must not approve",
+        idempotencyKey: "auditor-business-approval",
+        actor,
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      settlement.settle({ contractId: fixture.contractId, actor }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      settlement.transferOwnership({ contractId: fixture.contractId, actor }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
 });
 
 describe("recovery action replay", () => {
@@ -424,11 +539,14 @@ describe("settlement and reconciliation serialization", () => {
 describe("collections HTTP authorization", () => {
   it("enforces CSRF and collections roles on reminder POST", async () => {
     const fixture = await seedContract("ACTIVE", 100_000);
+    const otherFixture = await seedContract("ACTIVE", 0);
     const support = await seedHttpStaff("CUSTOMER_SUPPORT");
     const officer = await seedHttpStaff("RECOVERY_OFFICER");
     const auditor = await seedHttpStaff("COMPLIANCE_AUDITOR");
     const maker = await seedHttpStaff("RECOVERY_OFFICER");
     const md = await seedHttpStaff("MD");
+    const finance = await seedHttpStaff("CFO");
+    const inventory = await seedHttpStaff("INVENTORY_OFFICER");
     const transferDocumentId = await seedCleanDocument(fixture.applicantId);
     const app = await buildApp({
       config,
@@ -669,6 +787,16 @@ describe("collections HTTP authorization", () => {
         payload: { evidenceDocumentId: transferDocumentId },
       });
       expect(officerEvidenceDenied.statusCode).toBe(403);
+      const auditorEvidenceDenied = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/evidence`,
+        headers: {
+          cookie: auditorLogin.cookie,
+          "x-csrf-token": auditorLogin.csrf,
+        },
+        payload: { evidenceDocumentId: transferDocumentId },
+      });
+      expect(auditorEvidenceDenied.statusCode).toBe(403);
       const mdLogin = await login(app, md.email);
       const mdEvidenceAccepted = await app.inject({
         method: "POST",
@@ -680,8 +808,84 @@ describe("collections HTTP authorization", () => {
 
       await executeTestSql(
         databaseUrl,
+        "update contract set outstanding_balance_minor_units = 0 where id = $1",
+        [fixture.contractId],
+      );
+      const financeLogin = await login(app, finance.email);
+      const auditorFinanceDenied = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/finance-approval`,
+        headers: {
+          cookie: auditorLogin.cookie,
+          "x-csrf-token": auditorLogin.csrf,
+        },
+        payload: {
+          reason: "Auditor must not approve",
+          idempotencyKey: "http-auditor-finance",
+        },
+      });
+      expect(auditorFinanceDenied.statusCode).toBe(403);
+      const financeApproval = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/finance-approval`,
+        headers: {
+          cookie: financeLogin.cookie,
+          "x-csrf-token": financeLogin.csrf,
+        },
+        payload: {
+          reason: "Reconciled payment ledger",
+          idempotencyKey: "http-finance-approval",
+        },
+      });
+      expect(financeApproval.statusCode).toBe(200);
+      const incompleteSettlement = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/commit`,
+        headers: {
+          cookie: financeLogin.cookie,
+          "x-csrf-token": financeLogin.csrf,
+        },
+      });
+      expect(incompleteSettlement.statusCode).toBe(409);
+      const businessApproval = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/business-approval`,
+        headers: { cookie: mdLogin.cookie, "x-csrf-token": mdLogin.csrf },
+        payload: {
+          reason: "Approved transfer after reconciliation",
+          idempotencyKey: "http-business-approval",
+        },
+      });
+      expect(businessApproval.statusCode).toBe(200);
+      const settlementCommit = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/settlement/commit`,
+        headers: {
+          cookie: financeLogin.cookie,
+          "x-csrf-token": financeLogin.csrf,
+        },
+      });
+      expect(settlementCommit.statusCode).toBe(200);
+      const inventoryLogin = await login(app, inventory.email);
+      const ownershipTransfer = await app.inject({
+        method: "POST",
+        url: `/v1/staff/contracts/${fixture.contractId}/ownership-transfer`,
+        headers: {
+          cookie: inventoryLogin.cookie,
+          "x-csrf-token": inventoryLogin.csrf,
+        },
+      });
+      expect(ownershipTransfer.statusCode).toBe(200);
+
+      await executeTestSql(
+        databaseUrl,
         "update privacy.person set phone_e164 = '+233201234567' where id = $1",
         [fixture.applicantId],
+      );
+      await executeTestSql(
+        databaseUrl,
+        "update privacy.person set phone_e164 = '+233201234568' where id = $1",
+        [otherFixture.applicantId],
       );
       const person = await queryTestSql<{ phone_e164: string }>(
         databaseUrl,
@@ -723,6 +927,55 @@ describe("collections HTTP authorization", () => {
       expect(
         customerStatus.json<ReadonlyArray<{ contractId: string }>>(),
       ).toEqual([expect.objectContaining({ contractId: fixture.contractId })]);
+
+      const crossCustomerContract = await app.inject({
+        method: "GET",
+        url: `/v1/customer/applications/${otherFixture.applicationId}/contract`,
+        headers: { authorization: `Bearer ${customerToken.sessionToken}` },
+      });
+      expect(crossCustomerContract.statusCode).toBe(403);
+
+      const otherOtpRequested = await app.inject({
+        method: "POST",
+        url: "/v1/customer/otp/requests",
+        payload: { phoneE164: "+233201234568" },
+      });
+      expect(otherOtpRequested.statusCode, otherOtpRequested.body).toBe(202);
+      const otherChallenge = await queryTestSql<{ id: string }>(
+        databaseUrl,
+        `select id from privacy.otp_challenge
+          where person_id = $1 order by created_at desc limit 1`,
+        [otherFixture.applicantId],
+      );
+      const otherOtpVerified = await app.inject({
+        method: "POST",
+        url: "/v1/customer/otp/verifications",
+        payload: {
+          phoneE164: "+233201234568",
+          code: deriveOtpCode(
+            otpPolicy.deliveryDerivationSecret,
+            otherChallenge.id,
+            otpPolicy.codeLength,
+          ),
+        },
+      });
+      expect(otherOtpVerified.statusCode).toBe(201);
+      const otherCustomerToken = otherOtpVerified.json<{
+        sessionToken: string;
+      }>();
+      const otherCustomerStatus = await app.inject({
+        method: "GET",
+        url: "/v1/customer/account-status",
+        headers: {
+          authorization: `Bearer ${otherCustomerToken.sessionToken}`,
+        },
+      });
+      expect(otherCustomerStatus.statusCode).toBe(200);
+      expect(
+        otherCustomerStatus.json<ReadonlyArray<{ contractId: string }>>(),
+      ).toEqual([
+        expect.objectContaining({ contractId: otherFixture.contractId }),
+      ]);
     } finally {
       await app.close();
     }
@@ -815,7 +1068,11 @@ async function seedCleanDocument(personId: string): Promise<string> {
 async function seedContract(
   status: "ACTIVE" | "SETTLED",
   balance: number,
-): Promise<{ contractId: string; applicantId: string }> {
+): Promise<{
+  contractId: string;
+  applicantId: string;
+  applicationId: string;
+}> {
   const suffix = randomUUID();
   const applicantId = randomUUID();
   const applicationId = randomUUID();
@@ -838,8 +1095,8 @@ async function seedContract(
   );
   await executeTestSql(
     databaseUrl,
-    "insert into vehicle_model (id, manufacturer, model_name, model_year, active) values ($1, 'Somo', 'Pilot', 2026, true)",
-    [modelId],
+    "insert into vehicle_model (id, manufacturer, model_name, model_year, active) values ($1, 'Somo', $2, 2026, true)",
+    [modelId, `Pilot-${suffix.replaceAll("-", "").slice(0, 8)}`],
   );
   await executeTestSql(
     databaseUrl,
@@ -888,5 +1145,5 @@ async function seedContract(
       balance,
     ],
   );
-  return { contractId, applicantId };
+  return { contractId, applicantId, applicationId };
 }
