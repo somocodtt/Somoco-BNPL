@@ -76,6 +76,10 @@ import {
   type NotificationService,
 } from "./modules/notifications/service.js";
 import { createSettlementService } from "./modules/contracts/settlement-service.js";
+import { createReportService } from "./modules/reports/service.js";
+import { registerReportRoutes } from "./modules/reports/routes.js";
+import { createMigrationService } from "./modules/migration/service.js";
+import { registerMigrationRoutes } from "./modules/migration/routes.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -384,6 +388,10 @@ export async function buildApp(
     notifications,
     customerOtp,
   );
+  const reports = createReportService({ database });
+  await registerReportRoutes(app, config, accessService, reports);
+  const migration = createMigrationService({ database });
+  await registerMigrationRoutes(app, config, accessService, migration);
   return app;
 }
 

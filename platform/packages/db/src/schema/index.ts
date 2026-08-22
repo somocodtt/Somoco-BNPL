@@ -11,3 +11,4 @@ export * from "./offers.js";
 export * from "./payments.js";
 export * from "./privacy.js";
 export * from "./products.js";
+export * from "./reports.js";

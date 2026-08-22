@@ -13,6 +13,7 @@ import {
   CollectionsWorkspace,
   type StaffCollectionsApi,
 } from "../features/collections/collections-workspace.js";
+import { ReportsWorkspace } from "../features/reports/reports-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
@@ -20,6 +21,8 @@ import type {
   StaffAssetApi,
   StaffContractApi,
   StaffPaymentsApi,
+  StaffMigrationApi,
+  StaffReportsApi,
   StaffSession,
 } from "../lib/api.js";
 
@@ -31,6 +34,8 @@ export function StaffRouter({
   contractsApi,
   paymentsApi,
   collectionsApi,
+  reportsApi,
+  migrationApi,
 }: {
   api: StaffApi;
   initialSession?: StaffSession | null;
@@ -39,6 +44,8 @@ export function StaffRouter({
   contractsApi?: StaffContractApi;
   paymentsApi?: StaffPaymentsApi;
   collectionsApi?: StaffCollectionsApi;
+  reportsApi?: StaffReportsApi;
+  migrationApi?: StaffMigrationApi;
 }) {
   const [session, setSession] = useState<StaffSession | null>(initialSession);
   const [queue, setQueue] = useState<QueueApplication[] | null>(null);
@@ -83,6 +90,35 @@ export function StaffRouter({
     ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR", "MD"].includes(role),
   );
   const canOperateCollections = canOperateCollectionsRole(session.roles);
+  const canReadReports = session.roles.some((role) =>
+    [
+      "VERIFICATION_OFFICER",
+      "BSM",
+      "AGM",
+      "CFO",
+      "MD",
+      "FINANCE_OFFICER",
+      "RECOVERY_OFFICER",
+      "COMPLIANCE_AUDITOR",
+      "CUSTOMER_SUPPORT",
+    ].includes(role),
+  );
+  const reportsRoute =
+    typeof window !== "undefined" &&
+    /\/(reports|audit|migration)(\/|$)/.test(window.location.pathname);
+  if (
+    reportsApi !== undefined &&
+    canReadReports &&
+    (reportsRoute || session.roles.includes("COMPLIANCE_AUDITOR"))
+  ) {
+    return (
+      <ReportsWorkspace
+        api={reportsApi}
+        {...(migrationApi === undefined ? {} : { migrationApi })}
+        roles={session.roles}
+      />
+    );
+  }
   if (collectionsApi !== undefined && canOperateCollections) {
     return (
       <CollectionsWorkspace

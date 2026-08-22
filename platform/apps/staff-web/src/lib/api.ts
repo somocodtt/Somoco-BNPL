@@ -92,6 +92,39 @@ export interface StaffPaymentsApi {
   ): Promise<{ id: string; status: "APPROVED" | "REJECTED" }>;
 }
 
+export type StaffReportName =
+  "operations" | "portfolio" | "audit" | "migration";
+
+export interface StaffReportsApi {
+  getReport(
+    name: StaffReportName,
+    filters?: {
+      status?: string;
+      asOfDate?: string;
+      includePersonalData?: boolean;
+    },
+  ): Promise<Record<string, unknown>>;
+  exportReport(input: {
+    report: StaffReportName;
+    format: "CSV" | "JSON";
+    filters?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>>;
+  getExport(exportId: string): Promise<Record<string, unknown>>;
+}
+
+export interface StaffMigrationApi {
+  listBatches(): Promise<readonly Record<string, unknown>[]>;
+  verify(
+    batchId: string,
+    sampleRecordIds?: readonly string[],
+  ): Promise<Record<string, unknown>>;
+  approve(
+    batchId: string,
+    financialEvidenceHash: string,
+  ): Promise<Record<string, unknown>>;
+  activateMigration(batchId: string): Promise<Record<string, unknown>>;
+}
+
 export interface StaffAssetSummary {
   id: string;
   vehicleModelId: string;
@@ -266,7 +299,13 @@ export class ProblemError extends Error {
 }
 
 export class FetchStaffApi
-  implements StaffApi, ProductApi, StaffPaymentsApi, StaffCollectionsApi
+  implements
+    StaffApi,
+    ProductApi,
+    StaffPaymentsApi,
+    StaffCollectionsApi,
+    StaffReportsApi,
+    StaffMigrationApi
 {
   private csrfToken = "";
 
@@ -307,6 +346,89 @@ export class FetchStaffApi
       await this.request("/v1/staff/collections/arrears"),
       "MALFORMED_COLLECTIONS_ARREARS",
     );
+  }
+
+  async getReport(
+    name: StaffReportName,
+    filters: {
+      status?: string;
+      asOfDate?: string;
+      includePersonalData?: boolean;
+    } = {},
+  ): Promise<Record<string, unknown>> {
+    const query = new URLSearchParams();
+    if (filters.status !== undefined) query.set("status", filters.status);
+    if (filters.asOfDate !== undefined) query.set("asOfDate", filters.asOfDate);
+    if (filters.includePersonalData === true)
+      query.set("includePersonalData", "true");
+    const suffix = query.toString() === "" ? "" : `?${query.toString()}`;
+    const body = await this.request(`/v1/staff/reports/${name}${suffix}`);
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_REPORT");
+    return body;
+  }
+
+  async exportReport(input: {
+    report: StaffReportName;
+    format: "CSV" | "JSON";
+    filters?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const body = await this.request("/v1/staff/reports/exports", {
+      method: "POST",
+      body: input,
+    });
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_REPORT_EXPORT");
+    return body;
+  }
+
+  async getExport(exportId: string): Promise<Record<string, unknown>> {
+    const body = await this.request(
+      `/v1/staff/reports/exports/${encodeURIComponent(exportId)}`,
+    );
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_REPORT_EXPORT");
+    return body;
+  }
+
+  async listBatches(): Promise<readonly Record<string, unknown>[]> {
+    return arrayOfRecords(
+      await this.request("/v1/staff/migrations"),
+      "MALFORMED_MIGRATION_LIST",
+    );
+  }
+
+  async verify(
+    batchId: string,
+    sampleRecordIds?: readonly string[],
+  ): Promise<Record<string, unknown>> {
+    const body = await this.request(
+      `/v1/staff/migrations/${encodeURIComponent(batchId)}/verify`,
+      {
+        method: "POST",
+        body: sampleRecordIds === undefined ? {} : { sampleRecordIds },
+      },
+    );
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");
+    return body;
+  }
+
+  async approve(
+    batchId: string,
+    financialEvidenceHash: string,
+  ): Promise<Record<string, unknown>> {
+    const body = await this.request(
+      `/v1/staff/migrations/${encodeURIComponent(batchId)}/approve`,
+      { method: "POST", body: { financialEvidenceHash } },
+    );
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");
+    return body;
+  }
+
+  async activateMigration(batchId: string): Promise<Record<string, unknown>> {
+    const body = await this.request(
+      `/v1/staff/migrations/${encodeURIComponent(batchId)}/activate`,
+      { method: "POST", body: {} },
+    );
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");
+    return body;
   }
 
   async listCases(): Promise<readonly Record<string, unknown>[]> {

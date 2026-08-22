@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(25);
+    expect(before.rows[0]?.count).toBe(26);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1436,6 +1436,96 @@ describe("populated legacy schema migration", () => {
       status: "APPROVED",
       principal_minor_units: "100000",
     });
+  });
+
+  it("preserves populated migration evidence and enforces append-only source columns in 0025", async () => {
+    for (const migration of [
+      "0001_fresh_talon.sql",
+      "0002_lovely_maginty.sql",
+      "0003_square_zaran.sql",
+      "0004_tearful_dark_phoenix.sql",
+      "0005_fantastic_kabuki.sql",
+      "0006_worthless_marrow.sql",
+      "0007_concerned_siren.sql",
+      "0008_regular_juggernaut.sql",
+      "0009_whole_nightmare.sql",
+      "0010_controlled_financing.sql",
+      "0011_financing_binding.sql",
+      "0012_financing_disclosures.sql",
+      "0013_asset_contract_handover.sql",
+      "0014_asset_hardening.sql",
+      "0015_asset_privacy_controls.sql",
+      "0016_payment_ledger_reconciliation.sql",
+      "0017_wooden_selene.sql",
+      "0018_sealed_payment_policy.sql",
+      "0019_external_payment_policy_evidence.sql",
+      "0020_flippant_bishop.sql",
+      "0021_high_siren.sql",
+      "0022_condemned_deathbird.sql",
+      "0023_bound_settlement_evidence.sql",
+      "0024_safe_evidence_replacement.sql",
+    ]) {
+      await applyMigrationFile(pool, migration);
+    }
+
+    const batchId = randomUUID();
+    const recordId = randomUUID();
+    const sourceRecordId = `legacy-${randomUUID()}`;
+    const payload = { sourceRecordId, currentBalanceMinorUnits: "12345" };
+    await pool.query(
+      `insert into migration_batch (id, source, source_batch_id, expected_records)
+       values ($1, 'LEGACY_CSV', $2, 1)`,
+      [batchId, `batch-${randomUUID()}`],
+    );
+    await pool.query(
+      `insert into migration_record (id, migration_batch_id, source_record_id, payload)
+       values ($1, $2, $3, $4::jsonb)`,
+      [recordId, batchId, sourceRecordId, JSON.stringify(payload)],
+    );
+
+    await applyMigrationFile(pool, "0025_bumpy_kang.sql");
+
+    const preserved = await pool.query<{
+      source_record_id: string;
+      payload: Record<string, unknown>;
+      template_version: string;
+    }>(
+      `select source_record_id, payload, template_version
+         from migration_record
+        where id = $1`,
+      [recordId],
+    );
+    expect(preserved.rows[0]).toEqual({
+      source_record_id: sourceRecordId,
+      payload,
+      template_version: "legacy-v1",
+    });
+
+    await pool.query(
+      `update migration_record set status = 'VALID' where id = $1`,
+      [recordId],
+    );
+    await expect(
+      pool.query(
+        `update migration_record set payload = '{"tampered":true}'::jsonb where id = $1`,
+        [recordId],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(`delete from migration_record where id = $1`, [recordId]),
+    ).rejects.toMatchObject({ code: "55000" });
+
+    const privileges = await pool.query<{ privilege_type: string }>(
+      `select privilege_type
+         from information_schema.role_table_grants
+        where grantee = 'somo_runtime'
+          and table_name = 'migration_record'
+        order by privilege_type`,
+    );
+    expect(privileges.rows.map((row) => row.privilege_type)).toEqual([
+      "INSERT",
+      "SELECT",
+    ]);
   });
 
   it("quarantines populated unbound CLEAN evidence before enforcing new bindings", async () => {
