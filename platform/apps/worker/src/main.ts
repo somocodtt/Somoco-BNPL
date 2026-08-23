@@ -293,6 +293,7 @@ export * from "./jobs/recompute-arrears.js";
 export * from "./jobs/send-notification.js";
 export * from "./jobs/send-reminders.js";
 export * from "./jobs/reconcile-payments.js";
+export * from "./jobs/report-exports.js";
 export * from "./database-outbox-store.js";
 
 const entrypoint = process.argv[1];

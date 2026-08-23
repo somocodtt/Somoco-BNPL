@@ -156,5 +156,9 @@ export {
   type PaymentAllocationPolicy,
   type PaymentSettlementBatch,
 } from "./repositories/payments.js";
+export {
+  appendReportExportReadyEvent,
+  type CompleteReportExportInput,
+} from "./repositories/reports.js";
 export { withTransaction, type DatabaseTransaction } from "./transaction.js";
 export { migrateDatabase } from "./schema/migration.js";

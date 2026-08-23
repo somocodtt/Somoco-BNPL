@@ -14,6 +14,8 @@ import {
   type StaffCollectionsApi,
 } from "../features/collections/collections-workspace.js";
 import { ReportsWorkspace } from "../features/reports/reports-workspace.js";
+import { AuditWorkspace } from "../features/audit/audit-workspace.js";
+import { MigrationWorkspace } from "../features/migration/migration-workspace.js";
 import type {
   ApplicationDetail,
   QueueApplication,
@@ -101,23 +103,31 @@ export function StaffRouter({
       "RECOVERY_OFFICER",
       "COMPLIANCE_AUDITOR",
       "CUSTOMER_SUPPORT",
+      "SYSTEM_ADMIN",
+      "MIGRATION_IMPORTER",
     ].includes(role),
   );
   const reportsRoute =
     typeof window !== "undefined" &&
     /\/(reports|audit|migration)(\/|$)/.test(window.location.pathname);
+  const routePath =
+    typeof window === "undefined" ? "" : window.location.pathname;
   if (
     reportsApi !== undefined &&
     canReadReports &&
     (reportsRoute || session.roles.includes("COMPLIANCE_AUDITOR"))
   ) {
-    return (
-      <ReportsWorkspace
-        api={reportsApi}
-        {...(migrationApi === undefined ? {} : { migrationApi })}
-        roles={session.roles}
-      />
-    );
+    if (/\/audit(\/|$)/.test(routePath))
+      return <AuditWorkspace api={reportsApi} roles={session.roles} />;
+    if (/\/migration(\/|$)/.test(routePath) && migrationApi !== undefined)
+      return (
+        <MigrationWorkspace
+          api={reportsApi}
+          migrationApi={migrationApi}
+          roles={session.roles}
+        />
+      );
+    return <ReportsWorkspace api={reportsApi} roles={session.roles} />;
   }
   if (collectionsApi !== undefined && canOperateCollections) {
     return (

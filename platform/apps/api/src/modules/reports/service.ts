@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { sql } from "../../../../../packages/db/node_modules/drizzle-orm/index.js";
 import { enqueueOutbox, withTransaction, type Database } from "@somo/db";
 import { getInternalDatabase } from "../../../../../packages/db/src/client.js";
-import { reportExport } from "../../../../../packages/db/src/schema/reports.js";
+import {
+  reportExport,
+  reportExportEvent,
+} from "../../../../../packages/db/src/schema/reports.js";
 import { getInternalExecutor } from "../../../../../packages/db/src/transaction.js";
 import type { StaffPrincipal } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
@@ -26,6 +29,11 @@ export interface ReportResult {
   filters: Record<string, unknown>;
   rows: readonly Record<string, unknown>[];
   rowCount: number;
+  pagination: {
+    limit: number;
+    truncated: boolean;
+    nextCursor: string | null;
+  };
   migrationTotals: {
     batches: number;
     records: number;
@@ -80,6 +88,7 @@ export interface ReportService {
 }
 
 const OPERATIONAL_ROLES = new Set([
+  "SYSTEM_ADMIN",
   "VERIFICATION_OFFICER",
   "BSM",
   "AGM",
@@ -92,6 +101,7 @@ const OPERATIONAL_ROLES = new Set([
 ]);
 const PERSONAL_DATA_ROLES = new Set(["CFO", "MD", "COMPLIANCE_AUDITOR"]);
 const INLINE_EXPORT_ROW_LIMIT = 500;
+const REPORT_PAGE_LIMIT = 1000;
 
 export function createReportService(options: {
   database: Database;
@@ -101,19 +111,31 @@ export function createReportService(options: {
     report: ReportName,
     filters: ReportFilters = {},
   ): Promise<ReportResult> {
-    requireReportRead(actor);
+    requireReportRead(actor, report);
     const dataClassification = classify(actor, filters);
     const internal = getInternalDatabase(options.database);
     const safeFilters = sanitizeFilters(filters);
+    const asOfDate = asOfDateFilter(safeFilters);
     const rows =
       report === "operations"
         ? await listOperations(internal, safeFilters, dataClassification)
         : report === "portfolio"
           ? await listPortfolio(internal, safeFilters, dataClassification)
           : report === "audit"
-            ? await listAudit(internal)
-            : await listMigration(internal);
-    const migrationTotals = await getMigrationTotals(internal);
+            ? await listAudit(internal, safeFilters, dataClassification)
+            : await listMigration(internal, safeFilters);
+    const migrationTotals = await getMigrationTotals(internal, asOfDate);
+    const truncated = rows.length === REPORT_PAGE_LIMIT;
+    const lastRow = rows.at(-1);
+    const nextCursor = truncated
+      ? String(
+          lastRow?.applicationId ??
+            lastRow?.contractId ??
+            lastRow?.id ??
+            lastRow?.batchId ??
+            "",
+        )
+      : null;
     return {
       report,
       generatedAt: new Date().toISOString(),
@@ -121,6 +143,11 @@ export function createReportService(options: {
       filters: safeFilters,
       rows,
       rowCount: rows.length,
+      pagination: {
+        limit: REPORT_PAGE_LIMIT,
+        truncated,
+        nextCursor,
+      },
       migrationTotals,
       summary: summarize(report, rows, migrationTotals),
     };
@@ -132,7 +159,7 @@ export function createReportService(options: {
     audit: (input) => read(input.actor, "audit", input.filters),
     migration: (input) => read(input.actor, "migration", input.filters),
     async export(input) {
-      requireReportRead(input.actor);
+      requireReportRead(input.actor, input.report);
       const filters = input.filters ?? {};
       const report = await read(input.actor, input.report, filters);
       if (
@@ -183,6 +210,20 @@ export function createReportService(options: {
           artifact,
           status,
         });
+        await executor.insert(reportExportEvent).values({
+          id: randomUUID(),
+          reportExportId: id,
+          eventKey: `report-export:${id}:${status === "QUEUED" ? "QUEUED" : "READY"}`,
+          eventType: status,
+          contentHash,
+          artifact: {
+            watermark,
+            generatedAt: report.generatedAt,
+            format: input.format,
+            noRawDocumentUrls: true,
+            ...(status === "READY" ? { content } : {}),
+          },
+        });
         if (status === "QUEUED") {
           await enqueueOutbox(tx, {
             id: randomUUID(),
@@ -201,6 +242,7 @@ export function createReportService(options: {
               expectedRowCount: report.rowCount,
               expectedContentHash: contentHash,
               watermark,
+              content,
             },
           });
         }
@@ -236,7 +278,7 @@ export function createReportService(options: {
       };
     },
     async getExport(input) {
-      requireReportRead(input.actor);
+      requireReportRead(input.actor, "operations");
       const internal = getInternalDatabase(options.database);
       const result = await internal.execute<{
         id: string;
@@ -267,6 +309,19 @@ export function createReportService(options: {
           "REPORT_EXPORT_FORBIDDEN",
           "This export is not available to the staff role.",
         );
+      const eventResult = await internal.execute<{
+        event_type: "QUEUED" | "READY" | "FAILED";
+        content_hash: string | null;
+        artifact: Record<string, unknown>;
+      }>(sql`
+        select event_type, content_hash, artifact
+          from report_export_event
+         where report_export_id = ${input.exportId}
+         order by created_at desc, id desc
+         limit 1
+      `);
+      const event = eventResult.rows[0];
+      const artifact = event?.artifact ?? row.artifact;
       return {
         id: row.id,
         report: row.report_type.toLowerCase() as ReportName,
@@ -275,20 +330,32 @@ export function createReportService(options: {
         requesterStaffUserId: row.requester_staff_user_id,
         requestId: row.request_id,
         rowCount: row.row_count,
-        contentHash: row.content_hash,
-        watermark: String(row.artifact.watermark ?? ""),
-        content:
-          typeof row.artifact.content === "string" ? row.artifact.content : "",
-        status: row.status,
+        contentHash: event?.content_hash ?? row.content_hash,
+        watermark: String(artifact.watermark ?? ""),
+        content: typeof artifact.content === "string" ? artifact.content : "",
+        status: event?.event_type ?? row.status,
       };
     },
   };
 }
 
-function requireReportRead(actor: StaffPrincipal): void {
+function requireReportRead(actor: StaffPrincipal, report: ReportName): void {
+  const permitted =
+    report === "audit"
+      ? new Set(["SYSTEM_ADMIN", "CFO", "MD", "COMPLIANCE_AUDITOR"])
+      : report === "migration"
+        ? new Set([
+            "SYSTEM_ADMIN",
+            "CFO",
+            "FINANCE_OFFICER",
+            "VERIFICATION_OFFICER",
+            "MIGRATION_IMPORTER",
+            "COMPLIANCE_AUDITOR",
+          ])
+        : OPERATIONAL_ROLES;
   if (
     actor.kind !== "staff" ||
-    !actor.roles.some((role) => OPERATIONAL_ROLES.has(role))
+    !actor.roles.some((role) => permitted.has(role))
   )
     throw new AppError(
       403,
@@ -336,6 +403,49 @@ async function listOperations(
   const status = typeof filters.status === "string" ? filters.status : null;
   const statusClause =
     status === null ? sql`true` : sql`a.status::text = ${status}`;
+  const asOfDate = asOfDateFilter(filters);
+  const applicationAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`a.created_at < (${asOfDate}::date + interval '1 day')`;
+  const identityCheckAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`i.created_at < (${asOfDate}::date + interval '1 day')`;
+  const offerAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`o.created_at < (${asOfDate}::date + interval '1 day')`;
+  const depositAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`dr.created_at < (${asOfDate}::date + interval '1 day')`;
+  const paymentAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`p.created_at < (${asOfDate}::date + interval '1 day')`;
+  const paymentContractAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`pc.created_at < (${asOfDate}::date + interval '1 day')`;
+  const contractAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`c.created_at < (${asOfDate}::date + interval '1 day')`;
+  const vehicleAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`vu.created_at < (${asOfDate}::date + interval '1 day')`;
+  const recoveryAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`r.opened_at < (${asOfDate}::date + interval '1 day')`;
+  const reconciliationAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`rc.created_at < (${asOfDate}::date + interval '1 day')`;
+  const snapshotClause =
+    asOfDate === null ? sql`true` : sql`x.as_of_date <= ${asOfDate}::date`;
   const result = await db.execute<{
     id: string;
     status: string;
@@ -357,29 +467,35 @@ async function listOperations(
            a.applicant_person_id,
            (select count(*)::int from privacy.identity_check i
              where i.person_id = a.applicant_person_id
+               and ${identityCheckAsOfClause}
                and i.status in ('FAILED', 'MANUAL_REVIEW')) as nia_exceptions,
            exists(select 1 from offer o
                     where o.application_id = a.id
+                      and ${offerAsOfClause}
                       and o.status in ('PENDING', 'ACCEPTED')
                       and not exists (
                         select 1 from deposit_reconciliation dr
                          where dr.application_id = a.id
                            and dr.offer_id = o.id
+                           and ${depositAsOfClause}
                            and dr.status = 'RECONCILED'
                       )) as offer_awaiting_deposit,
            case when exists(select 1 from payment_transaction p
                               join contract pc on pc.id = p.contract_id
-                             where pc.application_id = a.id and p.status = 'RECEIVED')
+                             where pc.application_id = a.id
+                               and ${paymentAsOfClause}
+                               and ${paymentContractAsOfClause}
+                               and p.status = 'RECEIVED')
                 then 'RECEIVED' else 'NONE' end as payment_state,
-           coalesce((select c.status::text from contract c where c.application_id = a.id limit 1), 'NONE') as contract_state,
-           (select c.outstanding_balance_minor_units from contract c where c.application_id = a.id limit 1) as balance,
-           (select vu.status::text from vehicle_unit vu join contract c on c.vehicle_unit_id = vu.id where c.application_id = a.id limit 1) as vehicle_state,
-           coalesce((select max(x.consecutive_missed_installments)::int from arrears_snapshot x join contract c on c.id = x.contract_id where c.application_id = a.id), 0) as consecutive_missed,
-           coalesce((select max(x.unpaid_installments)::int from arrears_snapshot x join contract c on c.id = x.contract_id where c.application_id = a.id), 0) as total_unpaid,
-           (select count(*)::int from recovery_case r join contract c on c.id = r.contract_id where c.application_id = a.id and r.status <> 'CLOSED') as recovery_cases,
-           (select count(*)::int from reconciliation_case rc join payment_transaction p on p.id = rc.payment_transaction_id join contract c on c.id = p.contract_id where c.application_id = a.id and rc.status <> 'RESOLVED') as integration_exceptions
+           coalesce((select c.status::text from contract c where c.application_id = a.id and ${contractAsOfClause} limit 1), 'NONE') as contract_state,
+           (select c.outstanding_balance_minor_units from contract c where c.application_id = a.id and ${contractAsOfClause} limit 1) as balance,
+           (select vu.status::text from vehicle_unit vu join contract c on c.vehicle_unit_id = vu.id where c.application_id = a.id and ${contractAsOfClause} and ${vehicleAsOfClause} limit 1) as vehicle_state,
+           coalesce((select max(x.consecutive_missed_installments)::int from arrears_snapshot x join contract c on c.id = x.contract_id where c.application_id = a.id and ${snapshotClause}), 0) as consecutive_missed,
+           coalesce((select max(x.unpaid_installments)::int from arrears_snapshot x join contract c on c.id = x.contract_id where c.application_id = a.id and ${snapshotClause}), 0) as total_unpaid,
+           (select count(*)::int from recovery_case r join contract c on c.id = r.contract_id where c.application_id = a.id and ${recoveryAsOfClause} and ${contractAsOfClause} and r.status <> 'CLOSED') as recovery_cases,
+           (select count(*)::int from reconciliation_case rc join payment_transaction p on p.id = rc.payment_transaction_id join contract c on c.id = p.contract_id where c.application_id = a.id and ${reconciliationAsOfClause} and ${paymentAsOfClause} and ${contractAsOfClause} and rc.status <> 'RESOLVED') as integration_exceptions
       from application a
-     where ${statusClause}
+     where ${statusClause} and ${applicationAsOfClause}
      order by a.created_at asc, a.id asc
      limit 1000
   `);
@@ -428,6 +544,45 @@ async function listPortfolio(
     typeof filters.status === "string"
       ? sql`c.status::text = ${filters.status}`
       : sql`true`;
+  const asOfDate = asOfDateFilter(filters);
+  const asOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`c.created_at < (${asOfDate}::date + interval '1 day')`;
+  const vehicleAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`vu.created_at < (${asOfDate}::date + interval '1 day')`;
+  const identityCheckAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`i.created_at < (${asOfDate}::date + interval '1 day')`;
+  const applicationAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`ia.created_at < (${asOfDate}::date + interval '1 day')`;
+  const offerAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`o.created_at < (${asOfDate}::date + interval '1 day')`;
+  const depositAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`dr.created_at < (${asOfDate}::date + interval '1 day')`;
+  const recoveryAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`r.opened_at < (${asOfDate}::date + interval '1 day')`;
+  const reconciliationAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`rc.created_at < (${asOfDate}::date + interval '1 day')`;
+  const paymentAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`p.created_at < (${asOfDate}::date + interval '1 day')`;
+  const snapshotClause =
+    asOfDate === null ? sql`true` : sql`a.as_of_date <= ${asOfDate}::date`;
   const result = await db.execute<{
     id: string;
     reference: string;
@@ -437,13 +592,43 @@ async function listPortfolio(
     vehicle_status: string;
     consecutive_missed: number;
     total_unpaid: number;
+    nia_exceptions: number;
+    deposit_exceptions: number;
+    recovery_cases: number;
+    integration_exceptions: number;
   }>(sql`
     select c.id, c.reference, c.status, c.outstanding_balance_minor_units as balance,
            c.ownership_holder, vu.status::text as vehicle_status,
-           coalesce((select max(a.consecutive_missed_installments)::int from arrears_snapshot a where a.contract_id = c.id), 0) as consecutive_missed,
-           coalesce((select max(a.unpaid_installments)::int from arrears_snapshot a where a.contract_id = c.id), 0) as total_unpaid
-      from contract c join vehicle_unit vu on vu.id = c.vehicle_unit_id
-     where ${statusClause}
+           coalesce((select max(a.consecutive_missed_installments)::int from arrears_snapshot a where a.contract_id = c.id and ${snapshotClause}), 0) as consecutive_missed,
+           coalesce((select max(a.unpaid_installments)::int from arrears_snapshot a where a.contract_id = c.id and ${snapshotClause}), 0) as total_unpaid,
+           coalesce((select count(*)::int from privacy.identity_check i
+                      join application ia on ia.applicant_person_id = i.person_id
+                     where ia.id = c.application_id
+                       and ${applicationAsOfClause}
+                       and ${identityCheckAsOfClause}
+                       and i.status in ('FAILED', 'MANUAL_REVIEW')), 0) as nia_exceptions,
+           coalesce((select count(*)::int from offer o
+                      where o.application_id = c.application_id
+                        and ${offerAsOfClause}
+                        and o.status in ('PENDING', 'ACCEPTED')
+                        and not exists (
+                          select 1 from deposit_reconciliation dr
+                           where dr.application_id = o.application_id
+                             and dr.offer_id = o.id
+                             and ${depositAsOfClause}
+                             and dr.status = 'RECONCILED')), 0) as deposit_exceptions,
+           coalesce((select count(*)::int from recovery_case r
+                      where r.contract_id = c.id
+                        and ${recoveryAsOfClause}
+                        and r.status <> 'CLOSED'), 0) as recovery_cases,
+           coalesce((select count(*)::int from reconciliation_case rc
+                      join payment_transaction p on p.id = rc.payment_transaction_id
+                     where p.contract_id = c.id
+                       and ${reconciliationAsOfClause}
+                       and ${paymentAsOfClause}
+                       and rc.status <> 'RESOLVED'), 0) as integration_exceptions
+      from contract c join vehicle_unit vu on vu.id = c.vehicle_unit_id and ${vehicleAsOfClause}
+     where ${statusClause} and ${asOfClause}
      order by c.created_at asc, c.id asc limit 1000
   `);
   return result.rows.map((row) => ({
@@ -455,6 +640,10 @@ async function listPortfolio(
     vehicleState: row.vehicle_status,
     consecutiveMissed: row.consecutive_missed,
     totalUnpaid: row.total_unpaid,
+    niaExceptions: row.nia_exceptions,
+    depositReconciliationExceptions: row.deposit_exceptions,
+    recoveryCases: row.recovery_cases,
+    integrationExceptions: row.integration_exceptions,
     accountReference:
       classification === "PERSONAL_DATA"
         ? row.reference
@@ -464,7 +653,14 @@ async function listPortfolio(
 
 async function listAudit(
   db: ReturnType<typeof getInternalDatabase>,
+  filters: Record<string, unknown>,
+  classification: ReportClassification,
 ): Promise<readonly Record<string, unknown>[]> {
+  const asOfDate = asOfDateFilter(filters);
+  const asOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`occurred_at < (${asOfDate}::date + interval '1 day')`;
   const result = await db.execute<{
     id: string;
     aggregate_type: string;
@@ -477,14 +673,21 @@ async function listAudit(
     select id, aggregate_type, action, actor_staff_user_id, request_id,
            occurred_at, data
       from audit_event
+     where ${asOfClause}
      order by occurred_at desc, id desc limit 1000
   `);
   return result.rows.map((row) => ({
-    id: row.id,
+    id: classification === "PERSONAL_DATA" ? row.id : maskedReference(row.id),
     aggregateType: row.aggregate_type,
     action: row.action,
-    actorStaffUserId: row.actor_staff_user_id,
-    requestId: row.request_id,
+    actorStaffUserId:
+      classification === "PERSONAL_DATA" || row.actor_staff_user_id === null
+        ? row.actor_staff_user_id
+        : maskedReference(row.actor_staff_user_id),
+    requestId:
+      classification === "PERSONAL_DATA" || row.request_id === null
+        ? row.request_id
+        : maskedReference(row.request_id),
     occurredAt: new Date(row.occurred_at).toISOString(),
     data: safeAuditData(row.data),
   }));
@@ -492,7 +695,13 @@ async function listAudit(
 
 async function listMigration(
   db: ReturnType<typeof getInternalDatabase>,
+  filters: Record<string, unknown>,
 ): Promise<readonly Record<string, unknown>[]> {
+  const asOfDate = asOfDateFilter(filters);
+  const asOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`created_at < (${asOfDate}::date + interval '1 day')`;
   const result = await db.execute<{
     id: string;
     source: string;
@@ -514,6 +723,7 @@ async function listMigration(
            reconciled_total_minor_units, sample_required, sample_passed,
            created_at, verified_by, approved_by, activated_at
       from migration_batch
+     where ${asOfClause}
      order by created_at desc, id desc limit 1000
   `);
   return result.rows.map((row) => ({
@@ -536,7 +746,18 @@ async function listMigration(
   }));
 }
 
-async function getMigrationTotals(db: ReturnType<typeof getInternalDatabase>) {
+async function getMigrationTotals(
+  db: ReturnType<typeof getInternalDatabase>,
+  asOfDate: string | null,
+) {
+  const asOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`created_at < (${asOfDate}::date + interval '1 day')`;
+  const recordAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`b.created_at < (${asOfDate}::date + interval '1 day')`;
   const result = await db.execute<{
     batches: number;
     records: number;
@@ -544,10 +765,10 @@ async function getMigrationTotals(db: ReturnType<typeof getInternalDatabase>) {
     imported: number;
   }>(sql`
     select
-      (select count(*)::int from migration_batch) as batches,
-      (select count(*)::int from migration_record) as records,
-      (select count(*)::int from migration_record where status = 'QUARANTINED' or status = 'INVALID') as quarantined,
-      (select count(*)::int from migration_record where status = 'IMPORTED') as imported
+      (select count(*)::int from migration_batch where ${asOfClause}) as batches,
+      (select count(*)::int from migration_record r join migration_batch b on b.id = r.migration_batch_id where ${recordAsOfClause}) as records,
+      (select count(*)::int from migration_record r join migration_batch b on b.id = r.migration_batch_id where (r.status = 'QUARANTINED' or r.status = 'INVALID') and ${recordAsOfClause}) as quarantined,
+      (select count(*)::int from migration_record r join migration_batch b on b.id = r.migration_batch_id where r.status = 'IMPORTED' and ${recordAsOfClause}) as imported
   `);
   const row = result.rows[0];
   return row ?? { batches: 0, records: 0, quarantined: 0, imported: 0 };
@@ -582,13 +803,28 @@ function csvCell(value: unknown): string {
 }
 
 function safeAuditData(value: unknown): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
-    return {};
+  const redacted = redactAuditValue(value);
+  return redacted !== null &&
+    typeof redacted === "object" &&
+    !Array.isArray(redacted)
+    ? (redacted as Record<string, unknown>)
+    : {};
+}
+
+function redactAuditValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return typeof value === "string" ? value.slice(0, 256) : value;
+  }
+  if (Array.isArray(value)) return value.map(redactAuditValue);
   const result: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (/secret|token|password|document|url|ciphertext|ghana/i.test(key))
+    if (
+      /secret|token|password|document|url|ciphertext|ghana|free.?text|comment|note|(?:^|_)(id|.*id)$/i.test(
+        key,
+      )
+    )
       continue;
-    result[key] = typeof item === "string" ? item.slice(0, 256) : item;
+    result[key] = redactAuditValue(item);
   }
   return result;
 }
@@ -599,4 +835,27 @@ function maskedReference(value: string): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function asOfDateFilter(filters: Record<string, unknown>): string | null {
+  const value = filters.asOfDate;
+  if (value === undefined) return null;
+  if (typeof value !== "string" || !isIsoCalendarDate(value))
+    throw new AppError(
+      400,
+      "REPORT_AS_OF_DATE_INVALID",
+      "The as-of date is invalid.",
+    );
+  return value;
+}
+
+function isIsoCalendarDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year!, month! - 1, day!));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month! - 1 &&
+    parsed.getUTCDate() === day
+  );
 }

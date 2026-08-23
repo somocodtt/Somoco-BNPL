@@ -16,6 +16,36 @@ test("legacy migration template is deterministic and non-executable", async () =
   assert.equal(first.containsMacros, false);
   assert.equal(first.containsFormulas, false);
   assert.equal(first.csv, `${first.headers.join(",")}\r\n`);
+  for (const required of [
+    "applicant_legacy_id",
+    "applicant_full_name",
+    "applicant_phone_e164",
+    "applicant_ghana_card_fingerprint",
+    "applicant_date_of_birth",
+    "guarantor_legacy_id",
+    "guarantor_full_name",
+    "guarantor_phone_e164",
+    "guarantor_ghana_card_fingerprint",
+    "guarantor_date_of_birth",
+    "contract_legacy_id",
+    "contract_reference",
+    "contract_start_date",
+    "contract_end_date",
+    "repayment_frequency",
+    "tenure_months",
+    "vehicle_legacy_id",
+    "somoco_vehicle_model",
+    "current_balance_minor_units",
+    "arrears_minor_units",
+    "repayment_history_json",
+    "attachment_document_id",
+  ]) {
+    assert.ok(first.schema.required.includes(required), required);
+  }
+  assert.deepEqual(first.schema.anyOf, [
+    { required: ["vehicle_vin"] },
+    { required: ["vehicle_chassis_number"] },
+  ]);
 
   const directory = await mkdtemp(join(tmpdir(), "somo-legacy-template-"));
   try {

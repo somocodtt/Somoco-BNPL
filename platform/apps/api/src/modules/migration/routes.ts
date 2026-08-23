@@ -62,6 +62,7 @@ export async function registerMigrationRoutes(
             sourceFileHash: hash,
             templateVersion: { type: "string", minLength: 1, maxLength: 128 },
             expectedRecords: { type: "integer", minimum: 0 },
+            sampleRequired: { type: "integer", minimum: 1 },
             controlTotalMinorUnits: {
               type: "string",
               pattern: "^(0|[1-9][0-9]*)$",

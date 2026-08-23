@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(26);
+    expect(before.rows[0]?.count).toBe(27);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1438,7 +1438,7 @@ describe("populated legacy schema migration", () => {
     });
   });
 
-  it("preserves populated migration evidence and enforces append-only source columns in 0025", async () => {
+  it("preserves populated migration evidence and enforces append-only source columns in 0026", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1484,6 +1484,7 @@ describe("populated legacy schema migration", () => {
     );
 
     await applyMigrationFile(pool, "0025_bumpy_kang.sql");
+    await applyMigrationFile(pool, "0026_loose_stellaris.sql");
 
     const preserved = await pool.query<{
       source_record_id: string;
@@ -1501,10 +1502,17 @@ describe("populated legacy schema migration", () => {
       template_version: "legacy-v1",
     });
 
-    await pool.query(
-      `update migration_record set status = 'VALID' where id = $1`,
-      [recordId],
-    );
+    await expect(
+      pool.query(`update migration_record set status = 'VALID' where id = $1`, [
+        recordId,
+      ]),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(`update migration_record set target_id = $2 where id = $1`, [
+        recordId,
+        randomUUID(),
+      ]),
+    ).rejects.toMatchObject({ code: "55000" });
     await expect(
       pool.query(
         `update migration_record set payload = '{"tampered":true}'::jsonb where id = $1`,

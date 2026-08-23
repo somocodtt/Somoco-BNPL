@@ -7,6 +7,7 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
 import { staffUser } from "./access.js";
@@ -61,4 +62,37 @@ export const reportExport = pgTable(
   ],
 );
 
+export const reportExportEvent = pgTable(
+  "report_export_event",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    reportExportId: uuid("report_export_id")
+      .notNull()
+      .references(() => reportExport.id, { onDelete: "restrict" }),
+    eventKey: text("event_key").notNull(),
+    eventType: text("event_type").notNull(),
+    contentHash: text("content_hash"),
+    artifact: jsonb("artifact").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("report_export_event_key_unique").on(table.eventKey),
+    index("report_export_event_export_created_idx").on(
+      table.reportExportId,
+      table.createdAt,
+    ),
+    check(
+      "report_export_event_type_allowed",
+      sql`${table.eventType} in ('QUEUED', 'READY', 'FAILED')`,
+    ),
+    check(
+      "report_export_event_content_hash_sha256",
+      sql`${table.contentHash} is null or ${table.contentHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
 export type ReportExport = typeof reportExport.$inferSelect;
+export type ReportExportEvent = typeof reportExportEvent.$inferSelect;

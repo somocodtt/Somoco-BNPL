@@ -9,7 +9,10 @@ import {
   createReportService,
   serializeCsv,
 } from "../src/modules/reports/service.js";
-import { createMigrationService } from "../src/modules/migration/service.js";
+import {
+  createMigrationService,
+  type MigrationService,
+} from "../src/modules/migration/service.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (databaseUrl === undefined) throw new Error("TEST_DATABASE_URL is required");
@@ -151,6 +154,139 @@ describe("reporting and quarantined legacy import", () => {
       aggregate_id: exported.id,
       payload: { exportId: exported.id, expectedRowCount: 501 },
     });
+    const events = await getInternalDatabase(database).execute<{
+      event_type: string;
+    }>(sql`
+      select event_type
+        from report_export_event
+       where report_export_id = ${exported.id}
+       order by created_at asc
+    `);
+    expect(events.rows).toEqual([{ event_type: "QUEUED" }]);
+  });
+
+  it("recursively redacts nested audit evidence and applies an as-of boundary", async () => {
+    const service = createReportService({ database });
+    const support = principal("COMPLIANCE_AUDITOR");
+    await seedActor(database, support);
+    await getInternalDatabase(database).execute(sql`
+      insert into audit_event
+        (aggregate_type, aggregate_id, action, actor_staff_user_id,
+         request_id, data, occurred_at)
+      values
+        ('test', ${randomUUID()}, 'TEST', ${support.staffUserId}, ${randomUUID()},
+         ${JSON.stringify({
+           safe: "visible",
+           nested: { secret: "nested-secret", documentUrl: "https://private" },
+           values: [{ token: "nested-token", ok: true }],
+         })}::jsonb,
+         '2020-01-01T00:00:00Z')
+    `);
+    const audit = await service.audit({ actor: support });
+    expect(JSON.stringify(audit.rows)).not.toContain("nested-secret");
+    expect(JSON.stringify(audit.rows)).not.toContain("nested-token");
+
+    const beforeId = randomUUID();
+    const afterId = randomUUID();
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.person (id, phone_e164)
+      values (${beforeId}, '+233200000111'), (${afterId}, '+233200000112')
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into application (id, applicant_person_id, status, created_at)
+      values
+        (${randomUUID()}, ${beforeId}, 'ACTIVE', '2020-01-01T00:00:00Z'),
+        (${randomUUID()}, ${afterId}, 'ACTIVE', '2030-01-01T00:00:00Z')
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.identity_check
+        (id, person_id, provider, provider_correlation_id, status, evidence,
+         checked_at, created_at)
+      values
+        (${randomUUID()}, ${beforeId}, 'NIA', ${randomUUID()}, 'FAILED', '{}',
+         '2020-01-02T00:00:00Z', '2020-01-02T00:00:00Z'),
+        (${randomUUID()}, ${beforeId}, 'NIA', ${randomUUID()}, 'FAILED', '{}',
+         '2030-01-02T00:00:00Z', '2030-01-02T00:00:00Z')
+    `);
+    const asOf = await service.operations({
+      actor: support,
+      filters: { asOfDate: "2025-01-01" },
+    });
+    expect(asOf.rows).toHaveLength(1);
+    expect(asOf.rows[0]?.niaExceptions).toBe(1);
+  });
+
+  it("does not mutate immutable migration target evidence", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const batch = await service.importBatch({
+      actor,
+      requestId: randomUUID(),
+      source: "LEGACY_EXCEL",
+      sourceBatchId: "append-only-target",
+      sourceFileHash: "7".repeat(64),
+      templateVersion: "legacy-v1",
+      expectedRecords: 1,
+      rows: [
+        {
+          sourceRecordId: "append-only-row",
+          sourceRowNumber: 2,
+          customer: {
+            phoneE164: "+233200000113",
+            ghanaCardFingerprint: "6".repeat(64),
+          },
+          currentBalanceMinorUnits: "100",
+        },
+      ],
+    });
+    await expect(
+      getInternalDatabase(database).execute(sql`
+        update migration_record
+           set target_type = 'application', target_id = ${randomUUID()}
+         where migration_batch_id = ${batch.id}
+      `),
+    ).rejects.toThrow();
+  });
+
+  it("serializes concurrent imports of the same file evidence", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const common = {
+      actor,
+      source: "LEGACY_EXCEL" as const,
+      sourceFileHash: "1".repeat(64),
+      templateVersion: "legacy-v1",
+      expectedRecords: 0,
+      rows: [],
+    };
+    const results = await Promise.allSettled([
+      service.importBatch({
+        ...common,
+        sourceBatchId: "concurrent-a",
+        requestId: randomUUID(),
+      }),
+      service.importBatch({
+        ...common,
+        sourceBatchId: "concurrent-b",
+        requestId: randomUUID(),
+      }),
+    ]);
+    expect(
+      results.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    const rows = await getInternalDatabase(database).execute<{
+      count: number;
+    }>(sql`
+      select count(*)::int as count
+        from migration_batch
+       where source_file_hash = ${common.sourceFileHash}
+    `);
+    expect(rows.rows[0]?.count).toBe(1);
   });
 
   it("quarantines duplicate identity rows and makes import replay idempotent", async () => {
@@ -193,6 +329,14 @@ describe("reporting and quarantined legacy import", () => {
     expect(first.records).toEqual(
       expect.arrayContaining([expect.objectContaining({ status: "INVALID" })]),
     );
+    await expect(
+      service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        ...input,
+        sourceBatchId: "batch-1-replayed-under-another-key",
+      }),
+    ).rejects.toThrow("MIGRATION_REPLAY_CONFLICT");
     await expect(
       service.importBatch({
         actor,
@@ -251,6 +395,62 @@ describe("reporting and quarantined legacy import", () => {
         "PHONE_INVALID",
         "ATTACHMENT_REQUIRED",
         "CONTROL_TOTAL_MISMATCH",
+      ]),
+    );
+  });
+
+  it("requires complete applicant, guarantor, contract, and vehicle identity fields", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const batch = await service.importBatch({
+      actor,
+      requestId: randomUUID(),
+      source: "LEGACY_CSV",
+      sourceBatchId: "batch-required-identity-fields",
+      sourceFileHash: "2".repeat(64),
+      templateVersion: "legacy-v1",
+      expectedRecords: 1,
+      rows: [
+        {
+          sourceRecordId: "required-fields-row",
+          sourceRowNumber: 2,
+          customer: {
+            phoneE164: "+233200000014",
+            ghanaCardFingerprint: "a".repeat(64),
+          },
+          guarantor: {
+            phoneE164: "+233200000015",
+            ghanaCardFingerprint: "b".repeat(64),
+          },
+          contract: {
+            reference: "REQUIRED-FIELDS-CONTRACT",
+            startDate: "2025-01-01",
+            endDate: "2026-01-01",
+          },
+          vehicle: { vin: "REQUIRED-FIELDS-VIN" },
+          repaymentFrequency: "WEEKLY",
+          tenureMonths: 12,
+          arrearsMinorUnits: "0",
+          repaymentHistory: [],
+          currentBalanceMinorUnits: "100",
+        },
+      ],
+    });
+    const codes = batch.records.flatMap((record) =>
+      record.errors.map((error) => String(error.code)),
+    );
+    expect(codes).toEqual(
+      expect.arrayContaining([
+        "APPLICANT_LEGACY_ID_REQUIRED",
+        "APPLICANT_NAME_REQUIRED",
+        "APPLICANT_DATE_OF_BIRTH_INVALID",
+        "GUARANTOR_LEGACY_ID_REQUIRED",
+        "GUARANTOR_NAME_REQUIRED",
+        "GUARANTOR_DATE_OF_BIRTH_INVALID",
+        "CONTRACT_LEGACY_ID_REQUIRED",
+        "VEHICLE_LEGACY_ID_REQUIRED",
+        "VEHICLE_MODEL_REQUIRED",
       ]),
     );
   });
@@ -351,6 +551,35 @@ describe("reporting and quarantined legacy import", () => {
     ]);
   });
 
+  it("persists a final live conflict quarantine outside the failed activation transaction", async () => {
+    const service = createMigrationService({ database });
+    const { batch, finance, applicantFingerprint } =
+      await createApprovedBoundBatch(database, service, "live-conflict");
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.person (id, phone_e164, ghana_card_fingerprint)
+      values (${randomUUID()}, '+233200000077', ${applicantFingerprint})
+    `);
+    await expect(
+      service.activateBatch({
+        batchId: batch.id,
+        actor: finance,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toThrow("MIGRATION_LIVE_RECORD_CONFLICT");
+    const persisted = (await service.listBatches(finance)).find(
+      (item) => item.id === batch.id,
+    );
+    expect(persisted).toMatchObject({ status: "QUARANTINED" });
+    expect(persisted?.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "QUARANTINED",
+          reasonCode: "MIGRATION_LIVE_RECORD_CONFLICT",
+        }),
+      ]),
+    );
+  });
+
   it("activates only a clean bound attachment after verification and finance approval", async () => {
     const service = createMigrationService({ database });
     const importer = principal("VERIFICATION_OFFICER");
@@ -390,19 +619,53 @@ describe("reporting and quarantined legacy import", () => {
           sourceRecordId: "paper-row-1",
           sourceRowNumber: 1,
           customer: {
+            legacyId: "LEGACY-APP-1",
+            fullName: "Applicant One",
             phoneE164: "+233200000002",
             ghanaCardFingerprint: "e".repeat(64),
+            dateOfBirth: "1990-01-01",
           },
+          guarantor: {
+            legacyId: "LEGACY-GUA-1",
+            fullName: "Guarantor One",
+            phoneE164: "+233200000003",
+            ghanaCardFingerprint: "d".repeat(64),
+            dateOfBirth: "1985-01-01",
+          },
+          contract: {
+            legacyId: "LEGACY-CONTRACT-1",
+            reference: "LEGACY-CONTRACT-1",
+            startDate: "2025-01-01",
+            endDate: "2026-01-01",
+          },
+          vehicle: {
+            legacyId: "LEGACY-VEHICLE-1",
+            vin: "LEGACY-VIN-1",
+            model: "Somoco Model One",
+          },
+          repaymentFrequency: "WEEKLY",
+          tenureMonths: 12,
+          arrearsMinorUnits: "0",
+          repaymentHistory: [],
           currentBalanceMinorUnits: "100",
           attachmentDocumentId: documentId,
         },
       ],
     });
     expect(batch.status).toBe("VALIDATED");
+    await expect(
+      service.verifyBatch({
+        batchId: batch.id,
+        actor: verifier,
+        requestId: randomUUID(),
+        sampleRecordIds: [],
+      }),
+    ).rejects.toThrow("MIGRATION_SAMPLE_REQUIRED");
     await service.verifyBatch({
       batchId: batch.id,
       actor: verifier,
       requestId: randomUUID(),
+      sampleRecordIds: [batch.records[0]!.id],
     });
     await service.approveBatch({
       batchId: batch.id,
@@ -410,15 +673,20 @@ describe("reporting and quarantined legacy import", () => {
       requestId: randomUUID(),
       financialEvidenceHash: "1".repeat(64),
     });
-    const activated = await service.activateBatch({
-      batchId: batch.id,
-      actor: finance,
-      requestId: randomUUID(),
-    });
-    expect(activated.status).toBe("IMPORTED");
-    expect(activated.records[0]).toMatchObject({
-      status: "IMPORTED",
-      targetId: expect.any(String),
+    await expect(
+      service.activateBatch({
+        batchId: batch.id,
+        actor: finance,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toThrow("MIGRATION_COMPLETE_GRAPH_REQUIRED");
+    const quarantined = (await service.listBatches(finance)).find(
+      (item) => item.id === batch.id,
+    );
+    expect(quarantined).toMatchObject({ status: "QUARANTINED" });
+    expect(quarantined?.records[0]).toMatchObject({
+      status: "VALID",
+      targetId: null,
     });
     const target = await getInternalDatabase(database).execute<{
       status: string;
@@ -428,7 +696,7 @@ describe("reporting and quarantined legacy import", () => {
         join migration_record r on r.target_id = a.id
        where r.migration_batch_id = ${batch.id}
     `);
-    expect(target.rows).toEqual([{ status: "ACTIVE" }]);
+    expect(target.rows).toEqual([]);
   });
 });
 
@@ -449,4 +717,99 @@ async function seedActor(
     insert into staff_user (id, email, password_hash, status)
     values (${actor.staffUserId}, ${`${actor.staffUserId}@example.test`}, 'hash', 'ACTIVE')
   `);
+}
+
+async function createApprovedBoundBatch(
+  database: Database,
+  service: MigrationService,
+  suffix: string,
+): Promise<{
+  batch: Awaited<ReturnType<MigrationService["importBatch"]>>;
+  finance: StaffPrincipal;
+  applicantFingerprint: string;
+}> {
+  const importer = principal("VERIFICATION_OFFICER");
+  const verifier = principal("VERIFICATION_OFFICER");
+  const finance = principal("CFO");
+  await seedActor(database, importer);
+  await seedActor(database, verifier);
+  await seedActor(database, finance);
+  const documentOwnerId = randomUUID();
+  const documentId = randomUUID();
+  await getInternalDatabase(database).execute(sql`
+    insert into privacy.person (id, phone_e164)
+    values (${documentOwnerId}, '+233200000078')
+  `);
+  await getInternalDatabase(database).execute(sql`
+    insert into privacy.document
+      (id, person_id, document_type, object_key, declared_mime_type,
+       declared_size_bytes, upload_ticket_hash, upload_expires_at,
+       accepted_object_key, accepted_object_version_id, accepted_object_etag,
+       sha256, status, malware_scanned)
+    values
+      (${documentId}, ${documentOwnerId}, 'LEGACY_SCAN', ${`incoming/${documentId}`},
+       'application/pdf', 128, ${"f".repeat(64)}, now() + interval '1 day',
+       ${`accepted/${documentId}`}, 'v1', 'etag-live', ${"1".repeat(64)}, 'ACCEPTED', true)
+  `);
+  const applicantFingerprint = "5".repeat(64);
+  const batch = await service.importBatch({
+    actor: importer,
+    requestId: randomUUID(),
+    source: "LEGACY_PAPER",
+    sourceBatchId: `approved-${suffix}`,
+    sourceFileHash: "4".repeat(64),
+    templateVersion: "legacy-v1",
+    expectedRecords: 1,
+    controlTotalMinorUnits: "100",
+    rows: [
+      {
+        sourceRecordId: `approved-${suffix}-row`,
+        sourceRowNumber: 1,
+        customer: {
+          legacyId: `LEGACY-APP-${suffix}`,
+          fullName: "Applicant One",
+          phoneE164: "+233200000079",
+          ghanaCardFingerprint: applicantFingerprint,
+          dateOfBirth: "1990-01-01",
+        },
+        guarantor: {
+          legacyId: `LEGACY-GUA-${suffix}`,
+          fullName: "Guarantor One",
+          phoneE164: "+233200000080",
+          ghanaCardFingerprint: "3".repeat(64),
+          dateOfBirth: "1985-01-01",
+        },
+        contract: {
+          legacyId: `LEGACY-CONTRACT-${suffix}`,
+          reference: `APPROVED-${suffix}`,
+          startDate: "2025-01-01",
+          endDate: "2026-01-01",
+        },
+        vehicle: {
+          legacyId: `LEGACY-VEHICLE-${suffix}`,
+          vin: `VIN-${suffix}`,
+          model: "Somoco Model One",
+        },
+        repaymentFrequency: "WEEKLY",
+        tenureMonths: 12,
+        arrearsMinorUnits: "0",
+        repaymentHistory: [],
+        currentBalanceMinorUnits: "100",
+        attachmentDocumentId: documentId,
+      },
+    ],
+  });
+  await service.verifyBatch({
+    batchId: batch.id,
+    actor: verifier,
+    requestId: randomUUID(),
+    sampleRecordIds: [batch.records[0]!.id],
+  });
+  await service.approveBatch({
+    batchId: batch.id,
+    actor: finance,
+    requestId: randomUUID(),
+    financialEvidenceHash: "2".repeat(64),
+  });
+  return { batch, finance, applicantFingerprint };
 }

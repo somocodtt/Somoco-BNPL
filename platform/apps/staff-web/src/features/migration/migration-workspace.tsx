@@ -11,6 +11,11 @@ export function MigrationWorkspace({
   roles: readonly string[];
 }) {
   return (
-    <ReportsWorkspace api={api} migrationApi={migrationApi} roles={roles} />
+    <ReportsWorkspace
+      api={api}
+      migrationApi={migrationApi}
+      roles={roles}
+      reportName="migration"
+    />
   );
 }

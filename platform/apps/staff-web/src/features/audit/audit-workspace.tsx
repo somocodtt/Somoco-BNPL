@@ -8,5 +8,5 @@ export function AuditWorkspace({
   api: StaffReportsApi;
   roles: readonly string[];
 }) {
-  return <ReportsWorkspace api={api} roles={roles} />;
+  return <ReportsWorkspace api={api} roles={roles} reportName="audit" />;
 }

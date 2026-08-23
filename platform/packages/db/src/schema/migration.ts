@@ -26,6 +26,7 @@ export const migrationBatch = pgTable(
     sourceBatchId: text("source_batch_id").notNull(),
     sourceFileHash: text("source_file_hash"),
     templateVersion: text("template_version").notNull().default("legacy-v1"),
+    batchFingerprint: text("batch_fingerprint"),
     schemaVersion: text("schema_version").notNull().default("legacy-v1"),
     sourceFileName: text("source_file_name"),
     uploaderStaffUserId: uuid("uploader_staff_user_id").references(
@@ -116,6 +117,7 @@ export const migrationRecord = pgTable(
     sourceFileHash: text("source_file_hash"),
     templateVersion: text("template_version").notNull().default("legacy-v1"),
     payloadHash: text("payload_hash"),
+    rowFingerprint: text("row_fingerprint"),
     amountMinorUnits: bigint("amount_minor_units", { mode: "bigint" }),
     legacyCustomerId: text("legacy_customer_id"),
     legacyGuarantorId: text("legacy_guarantor_id"),
@@ -169,12 +171,53 @@ export const migrationRecord = pgTable(
       sql`${table.payloadHash} is null or ${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
     ),
     check(
+      "migration_record_row_fingerprint_sha256",
+      sql`${table.rowFingerprint} is null or ${table.rowFingerprint} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
       "migration_record_amount_nonnegative",
       sql`${table.amountMinorUnits} is null or ${table.amountMinorUnits} >= 0`,
     ),
     check(
       "migration_record_status_allowed",
       sql`${table.status} in ('QUARANTINED', 'VALID', 'INVALID', 'IMPORTED', 'REJECTED')`,
+    ),
+  ],
+);
+
+export const migrationEvent = pgTable(
+  "migration_event",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    migrationBatchId: uuid("migration_batch_id")
+      .notNull()
+      .references(() => migrationBatch.id, { onDelete: "restrict" }),
+    migrationRecordId: uuid("migration_record_id").references(
+      () => migrationRecord.id,
+      { onDelete: "restrict" },
+    ),
+    eventKey: text("event_key").notNull(),
+    eventType: text("event_type").notNull(),
+    actorStaffUserId: uuid("actor_staff_user_id").references(
+      () => staffUser.id,
+      { onDelete: "restrict" },
+    ),
+    requestId: uuid("request_id"),
+    reasonCode: text("reason_code"),
+    data: jsonb("data").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("migration_event_key_unique").on(table.eventKey),
+    index("migration_event_batch_created_idx").on(
+      table.migrationBatchId,
+      table.createdAt,
+    ),
+    check(
+      "migration_event_type_allowed",
+      sql`${table.eventType} in ('IMPORTED', 'VALIDATED', 'SAMPLED', 'APPROVED', 'ACTIVATED', 'QUARANTINED', 'CORRECTED')`,
     ),
   ],
 );

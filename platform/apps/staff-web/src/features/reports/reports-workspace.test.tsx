@@ -23,6 +23,8 @@ function migrationApi(): StaffMigrationApi {
       .mockResolvedValue([
         { id: "batch-1", sourceBatchId: "legacy-1", status: "VALIDATED" },
       ]),
+    importBatch: vi.fn().mockResolvedValue({}),
+    validate: vi.fn().mockResolvedValue({}),
     verify: vi.fn().mockResolvedValue({}),
     approve: vi.fn().mockResolvedValue({}),
     activateMigration: vi.fn().mockResolvedValue({}),

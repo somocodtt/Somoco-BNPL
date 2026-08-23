@@ -114,6 +114,8 @@ export interface StaffReportsApi {
 
 export interface StaffMigrationApi {
   listBatches(): Promise<readonly Record<string, unknown>[]>;
+  importBatch(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  validate(batchId: string): Promise<Record<string, unknown>>;
   verify(
     batchId: string,
     sampleRecordIds?: readonly string[],
@@ -393,6 +395,26 @@ export class FetchStaffApi
       await this.request("/v1/staff/migrations"),
       "MALFORMED_MIGRATION_LIST",
     );
+  }
+
+  async importBatch(
+    input: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const body = await this.request("/v1/staff/migrations/import", {
+      method: "POST",
+      body: input,
+    });
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");
+    return body;
+  }
+
+  async validate(batchId: string): Promise<Record<string, unknown>> {
+    const body = await this.request(
+      `/v1/staff/migrations/${encodeURIComponent(batchId)}/validate`,
+      { method: "POST", body: {} },
+    );
+    if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");
+    return body;
   }
 
   async verify(

@@ -1,14 +1,20 @@
 import { useEffect, useState } from "react";
-import type { StaffMigrationApi, StaffReportsApi } from "../../lib/api.js";
+import type {
+  StaffMigrationApi,
+  StaffReportName,
+  StaffReportsApi,
+} from "../../lib/api.js";
 
 export function ReportsWorkspace({
   api,
   migrationApi,
   roles,
+  reportName = "operations",
 }: {
   api: StaffReportsApi;
   migrationApi?: StaffMigrationApi;
   roles: readonly string[];
+  reportName?: StaffReportName;
 }) {
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
   const [batches, setBatches] = useState<
@@ -21,7 +27,7 @@ export function ReportsWorkspace({
     setReport(null);
     setBatches(null);
     setError("");
-    void api.getReport("operations").then(
+    void api.getReport(reportName).then(
       (value) => {
         if (active) setReport(value);
       },
@@ -42,7 +48,7 @@ export function ReportsWorkspace({
     return () => {
       active = false;
     };
-  }, [api, migrationApi]);
+  }, [api, migrationApi, reportName]);
 
   if (error) return <p role="alert">{error}</p>;
   if (report === null)
@@ -52,7 +58,7 @@ export function ReportsWorkspace({
   return (
     <main className="staff-shell reports-workspace">
       <section className="panel" aria-labelledby="reports-title">
-        <h1 id="reports-title">Operations and portfolio reporting</h1>
+        <h1 id="reports-title">{reportTitle(reportName)}</h1>
         <p role="status">
           Server-enforced classification:{" "}
           {stringValue(report.dataClassification) ?? "REDACTED"}
@@ -61,16 +67,22 @@ export function ReportsWorkspace({
           type="button"
           onClick={() => {
             setNotice("");
-            void api.exportReport({ report: "operations", format: "CSV" }).then(
-              (value) =>
+            void api.exportReport({ report: reportName, format: "CSV" }).then(
+              (value) => {
+                downloadArtifact(value, reportName);
                 setNotice(
-                  `Export ${stringValue(value.id) ?? "created"} attributed to the requester.`,
-                ),
+                  stringValue(value.status) === "QUEUED"
+                    ? `Export ${stringValue(value.id) ?? "created"} is queued for worker delivery.`
+                    : stringValue(value.content) === null
+                      ? `Export ${stringValue(value.id) ?? "created"} attributed to the requester.`
+                      : `Export ${stringValue(value.id) ?? "created"} downloaded and attributed to the requester.`,
+                );
+              },
               () => setNotice("The export could not be created."),
             );
           }}
         >
-          Export operations CSV
+          Export {reportName} CSV
         </button>
         {notice ? <p role="status">{notice}</p> : null}
       </section>
@@ -130,10 +142,14 @@ function MigrationPanel({
   roles: readonly string[];
 }) {
   const [error, setError] = useState("");
+  const [migrationFile, setMigrationFile] = useState<File | null>(null);
   const [financialEvidenceHashes, setFinancialEvidenceHashes] = useState<
     Record<string, string>
   >({});
   const canVerify = roles.includes("VERIFICATION_OFFICER");
+  const canImport = roles.some((role) =>
+    ["SYSTEM_ADMIN", "MIGRATION_IMPORTER"].includes(role),
+  );
   const canApprove = roles.some((role) =>
     ["CFO", "FINANCE_OFFICER"].includes(role),
   );
@@ -142,6 +158,41 @@ function MigrationPanel({
   return (
     <section className="panel" aria-labelledby="migration-title">
       <h2 id="migration-title">Legacy migration quarantine</h2>
+      {canImport ? (
+        <div>
+          <label>
+            Legacy migration JSON
+            <input
+              aria-label="Legacy migration JSON"
+              type="file"
+              accept="application/json,.json"
+              onChange={(event) =>
+                setMigrationFile(event.target.files?.[0] ?? null)
+              }
+            />
+          </label>
+          <button
+            type="button"
+            disabled={migrationFile === null}
+            onClick={() => {
+              if (migrationFile === null) return;
+              void migrationFile
+                .text()
+                .then((value) => JSON.parse(value) as Record<string, unknown>)
+                .then((value) => api.importBatch(value))
+                .then(
+                  (value) =>
+                    setError(
+                      `Imported migration batch ${stringValue(value.id) ?? "created"}.`,
+                    ),
+                  () => setError("The migration upload could not be imported."),
+                );
+            }}
+          >
+            Upload migration batch
+          </button>
+        </div>
+      ) : null}
       {batches.length === 0 ? (
         <p>No migration batches have been uploaded.</p>
       ) : (
@@ -178,6 +229,33 @@ function MigrationPanel({
                   >
                     Verify sample
                   </button>
+                ) : null}
+                {canImport && status === "QUARANTINED" ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void api
+                        .validate(id)
+                        .catch(() => setError("The batch validation failed."))
+                    }
+                  >
+                    Validate batch
+                  </button>
+                ) : null}
+                {Array.isArray(batch.records) || Array.isArray(batch.events) ? (
+                  <details>
+                    <summary>Evidence, row errors, and match history</summary>
+                    <pre>
+                      {JSON.stringify(
+                        {
+                          records: batch.records ?? [],
+                          events: batch.events ?? [],
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </details>
                 ) : null}
                 {canApprove &&
                 status === "VALIDATED" &&
@@ -244,6 +322,46 @@ function stringValue(value: unknown): string | null {
     ? String(value)
     : null;
 }
+
+function reportTitle(report: StaffReportName): string {
+  switch (report) {
+    case "audit":
+      return "Audit evidence reporting";
+    case "migration":
+      return "Legacy migration reporting";
+    case "portfolio":
+      return "Portfolio reporting";
+    default:
+      return "Operations and portfolio reporting";
+  }
+}
+
+function downloadArtifact(
+  value: Record<string, unknown>,
+  report: StaffReportName,
+): void {
+  const content = stringValue(value.content);
+  const id = stringValue(value.id);
+  const format = stringValue(value.format)?.toLowerCase() ?? "csv";
+  if (
+    content === null ||
+    id === null ||
+    typeof document === "undefined" ||
+    typeof URL === "undefined"
+  )
+    return;
+  const objectUrl = URL.createObjectURL(
+    new Blob([content], {
+      type: format === "json" ? "application/json" : "text/csv",
+    }),
+  );
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = `somo-${report}-${id}.${format}`;
+  anchor.click();
+  URL.revokeObjectURL(objectUrl);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

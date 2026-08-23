@@ -183,6 +183,13 @@
       "when": 1787438733046,
       "tag": "0025_bumpy_kang",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1787442849791,
+      "tag": "0026_loose_stellaris",
+      "breakpoints": true
     }
   ]
 }
