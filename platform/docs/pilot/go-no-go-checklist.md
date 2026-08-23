@@ -5,6 +5,10 @@ Proposed pilot scope: ____________________ Decision meeting (UTC): _____________
 
 The pilot is **NO-GO** if any required row is missing, expired, unsigned, contradicted, or owned by an unassigned person. A green simulator test cannot override an external gate.
 
+## Current automated boundary (unsigned)
+
+The real-app API rehearsal is limited to the disposable PostgreSQL service and simulator adapters. It does not constitute provider, hosting, restore, browser, legal/privacy, security, or business sign-off. The current build remains **NO-GO/BLOCKED** until the public guarantor-signature action, deposit-reconciliation-before-contract path, posted-ledger/receipt replay path, physical execution/handover/activation, settlement/ownership path, worker restart/reclaim evidence, and browser runtime evidence are supplied and signed. No production endpoint or real customer data may be used to close these rows.
+
 | Gate                 | Required evidence                                                                                                                                                            | Status                  | Owner / expiry / evidence reference |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------------------- |
 | Licence and tenure   | Current licence/approval proves every enabled tenure; disabled tenures remain blocked.                                                                                       | ☐ PENDING ☐ PASS ☐ FAIL | ____________________                |

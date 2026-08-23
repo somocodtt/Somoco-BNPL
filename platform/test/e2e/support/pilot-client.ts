@@ -1,25 +1,38 @@
+import { randomUUID } from "node:crypto";
+import type { CanonicalPaymentEvent } from "../../../packages/integrations/src/index.js";
+import { deriveGuarantorInvitationToken } from "../../../packages/integrations/src/index.js";
 import {
   applicantPhone,
-  applicantPersonId,
-  applicationId,
   guarantorPhone,
-  guarantorPersonId,
-  invitationToken,
-  otpCode,
-  type PilotHarness,
-} from "./pilot-harness.js";
+  type PilotRole,
+  type PilotRuntime,
+} from "./real-pilot.js";
 
-interface ApiResponse {
+export interface ApiResponse {
   status(): number;
   json(): Promise<unknown>;
   text(): Promise<string>;
 }
 
-interface ApiRequest {
+export interface ApiRequest {
   get(url: string, options?: Record<string, unknown>): Promise<ApiResponse>;
   post(url: string, options?: Record<string, unknown>): Promise<ApiResponse>;
   patch(url: string, options?: Record<string, unknown>): Promise<ApiResponse>;
 }
+
+export interface PilotFlow {
+  runtime: PilotRuntime;
+  applicationId: string;
+  invitationToken: string;
+}
+
+const invitationSecret = "controlled-pilot-invitation-secret-at-least-32-chars";
+const pngBytes = Uint8Array.from(
+  Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ),
+);
 
 export function api(request: ApiRequest): ApiRequest {
   return request;
@@ -31,25 +44,20 @@ export async function call(
   method: "get" | "post" | "patch",
   path: string,
   options: {
-    token?: string;
-    body?: Record<string, unknown>;
     headers?: Record<string, string>;
+    body?: Record<string, unknown>;
   } = {},
 ): Promise<ApiResponse> {
   const headers = {
-    ...(options.token === undefined
-      ? {}
-      : { authorization: `Bearer ${options.token}` }),
     ...(options.body === undefined
       ? {}
       : { "content-type": "application/json" }),
-    ...options.headers,
+    ...(options.headers ?? {}),
   };
-  const requestOptions = {
+  return request[method](`${baseUrl}${path}`, {
     headers,
     ...(options.body === undefined ? {} : { data: options.body }),
-  };
-  return request[method](`${baseUrl}${path}`, requestOptions);
+  });
 }
 
 export async function body(
@@ -61,73 +69,19 @@ export async function body(
   return parsed as Record<string, unknown>;
 }
 
-export async function json(response: ApiResponse): Promise<unknown> {
-  return response.json();
-}
-
-export async function authenticateApplicant(
-  request: ApiRequest,
-  harness: PilotHarness,
-): Promise<void> {
-  const otpRequest = await call(
-    request,
-    harness.baseUrl,
-    "post",
-    "/v1/customer/otp/requests",
-    { body: { phoneE164: applicantPhone } },
-  );
-  assertStatus(otpRequest, 202);
-  const verified = await call(
-    request,
-    harness.baseUrl,
-    "post",
-    "/v1/customer/otp/verifications",
-    { body: { phoneE164: applicantPhone, code: otpCode } },
-  );
-  assertStatus(verified, 201);
-  const result = await body(verified);
-  if (result.sessionToken !== harness.applicantToken)
-    throw new Error("APPLICANT_SESSION_FIXTURE_MISMATCH");
-}
-
-export async function authenticateGuarantor(
-  request: ApiRequest,
-  harness: PilotHarness,
-): Promise<void> {
-  const otpRequest = await call(
-    request,
-    harness.baseUrl,
-    "post",
-    "/v1/customer/otp/requests",
-    { body: { phoneE164: guarantorPhone } },
-  );
-  assertStatus(otpRequest, 202);
-  const verified = await call(
-    request,
-    harness.baseUrl,
-    "post",
-    "/v1/customer/otp/verifications",
-    { body: { phoneE164: guarantorPhone, code: otpCode } },
-  );
-  assertStatus(verified, 201);
-  const result = await body(verified);
-  if (result.sessionToken !== harness.guarantorToken)
-    throw new Error("GUARANTOR_SESSION_FIXTURE_MISMATCH");
-}
-
 export async function completeOnboarding(
   request: ApiRequest,
-  harness: PilotHarness,
-): Promise<void> {
-  await authenticateApplicant(request, harness);
-  const applicantHeaders = { token: harness.applicantToken };
+  runtime: PilotRuntime,
+): Promise<PilotFlow> {
+  const applicant = runtime.customer.applicant;
+  const guarantor = runtime.customer.guarantor;
   const consent = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/consents",
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
         purpose: "NIA_IDENTITY_VERIFICATION",
         documentVersion: "nia-consent-v1",
@@ -139,13 +93,13 @@ export async function completeOnboarding(
   const consentBody = await body(consent);
   const nia = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/identity/ghana-card-verifications",
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
-        consentId: consentBody.consentId as string,
+        consentId: String(consentBody.consentId),
         ghanaCardNumber: "GHA-123456789-1",
         idempotencyKey: "31000000-0000-4000-8000-000000000001",
       },
@@ -154,47 +108,65 @@ export async function completeOnboarding(
   assertStatus(nia, 201);
   const upload = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/documents/uploads",
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
         documentType: "GHANA_CARD_FRONT",
-        mimeType: "image/jpeg",
-        sizeBytes: 128,
+        mimeType: "image/png",
+        sizeBytes: pngBytes.byteLength,
       },
     },
   );
   assertStatus(upload, 201);
   const uploadBody = await body(upload);
+  runtime.uploadDocument(
+    {
+      uploadUrl: String(uploadBody.uploadUrl),
+      requiredHeaders: (uploadBody.requiredHeaders ?? {}) as Readonly<
+        Record<string, string>
+      >,
+    },
+    pngBytes,
+    "image/png",
+  );
   const completed = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     `/v1/customer/documents/${String(uploadBody.documentId)}/complete`,
-    applicantHeaders,
+    { headers: applicant.headers, body: {} },
   );
-  assertStatus(completed, 200);
+  if (completed.status() !== 200)
+    throw new Error(
+      `DOCUMENT_COMPLETE_FAILED_${completed.status()}_${await completed.text()}`,
+    );
   const created = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/applications",
-    applicantHeaders,
+    { headers: applicant.headers, body: {} },
   );
-  assertStatus(created, 201);
+  if (created.status() !== 201)
+    throw new Error(
+      `APPLICATION_CREATE_FAILED_${created.status()}_${await created.text()}`,
+    );
+  const applicationId = String((await body(created)).id);
+  await runtime.attachProduct(applicationId);
   const saved = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "patch",
     `/v1/customer/applications/${applicationId}/applicant`,
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
         expectedVersion: 1,
         mutationId: "32000000-0000-4000-8000-000000000001",
-        vehicleModelId: "20000000-0000-4000-8000-000000000001",
+        vehicleModelId: runtime.applicationFixtures.vehicleModelId,
         profile: { occupation: "Courier", residentialArea: "Dansoman" },
       },
     },
@@ -203,11 +175,11 @@ export async function completeOnboarding(
   const savedBody = await body(saved);
   const invitation = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
-    "/v1/customer/applications/" + applicationId + "/guarantor-invitations",
+    `/v1/customer/applications/${applicationId}/guarantor-invitations`,
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
         expectedVersion: Number(savedBody.version),
         mutationId: "33000000-0000-4000-8000-000000000001",
@@ -216,23 +188,31 @@ export async function completeOnboarding(
     },
   );
   assertStatus(invitation, 201);
-  await authenticateGuarantor(request, harness);
-  const guarantorHeaders = { token: harness.guarantorToken };
+  const invitationBody = await body(invitation);
+  const invitationToken = deriveGuarantorInvitationToken(
+    invitationSecret,
+    String(invitationBody.invitationId),
+    1,
+  );
   const resolved = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/guarantor-invitations/resolutions",
-    { ...guarantorHeaders, body: { invitationToken } },
+    {
+      headers: guarantor.headers,
+      body: { invitationToken },
+    },
   );
   assertStatus(resolved, 200);
+  const resolvedBody = await body(resolved);
   const guarantorConsent = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/consents",
     {
-      ...guarantorHeaders,
+      headers: guarantor.headers,
       body: {
         purpose: "NIA_IDENTITY_VERIFICATION",
         documentVersion: "nia-consent-v1",
@@ -244,13 +224,13 @@ export async function completeOnboarding(
   const guarantorConsentBody = await body(guarantorConsent);
   const guarantorNia = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/identity/ghana-card-verifications",
     {
-      ...guarantorHeaders,
+      headers: guarantor.headers,
       body: {
-        consentId: guarantorConsentBody.consentId as string,
+        consentId: String(guarantorConsentBody.consentId),
         ghanaCardNumber: "GHA-987654321-0",
         idempotencyKey: "34000000-0000-4000-8000-000000000001",
       },
@@ -259,52 +239,69 @@ export async function completeOnboarding(
   assertStatus(guarantorNia, 201);
   const guarantorUpload = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     "/v1/customer/documents/uploads",
     {
-      ...guarantorHeaders,
+      headers: guarantor.headers,
       body: {
         documentType: "GHANA_CARD_FRONT",
-        mimeType: "image/jpeg",
-        sizeBytes: 128,
+        mimeType: "image/png",
+        sizeBytes: pngBytes.byteLength,
       },
     },
   );
   assertStatus(guarantorUpload, 201);
   const guarantorUploadBody = await body(guarantorUpload);
+  runtime.uploadDocument(
+    {
+      uploadUrl: String(guarantorUploadBody.uploadUrl),
+      requiredHeaders: (guarantorUploadBody.requiredHeaders ?? {}) as Readonly<
+        Record<string, string>
+      >,
+    },
+    pngBytes,
+    "image/png",
+  );
   const guarantorCompleted = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     `/v1/customer/documents/${String(guarantorUploadBody.documentId)}/complete`,
-    guarantorHeaders,
+    { headers: guarantor.headers, body: {} },
   );
-  assertStatus(guarantorCompleted, 200);
+  if (guarantorCompleted.status() !== 200)
+    throw new Error(
+      `GUARANTOR_DOCUMENT_COMPLETE_FAILED_${guarantorCompleted.status()}_${await guarantorCompleted.text()}`,
+    );
+  const currentVersion = Number(resolvedBody.relationshipVersion);
   const guarantorSaved = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "patch",
     "/v1/customer/guarantor",
     {
-      ...guarantorHeaders,
+      headers: guarantor.headers,
       body: {
         invitationToken,
-        expectedVersion: Number(savedBody.version) + 1,
+        expectedVersion: currentVersion,
         mutationId: "35000000-0000-4000-8000-000000000001",
         profile: { occupation: "Mechanic", relationshipToApplicant: "Sibling" },
       },
     },
   );
-  assertStatus(guarantorSaved, 200);
+  if (guarantorSaved.status() !== 200)
+    throw new Error(
+      `GUARANTOR_SAVE_FAILED_${guarantorSaved.status()}_saved_${String(savedBody.version)}_resolved_${String(invitationBody.applicationVersion)}_expected_${String(currentVersion)}_${await guarantorSaved.text()}`,
+    );
   const guarantorSavedBody = await body(guarantorSaved);
   const submitted = await call(
     request,
-    harness.baseUrl,
+    runtime.baseUrl,
     "post",
     `/v1/customer/applications/${applicationId}/submissions`,
     {
-      ...applicantHeaders,
+      headers: applicant.headers,
       body: {
         expectedVersion: Number(guarantorSavedBody.applicationVersion),
         mutationId: "36000000-0000-4000-8000-000000000001",
@@ -312,13 +309,14 @@ export async function completeOnboarding(
     },
   );
   assertStatus(submitted, 200);
+  return { runtime, applicationId, invitationToken };
 }
 
 export async function approveAllStages(
   request: ApiRequest,
-  harness: PilotHarness,
+  flow: PilotFlow,
 ): Promise<void> {
-  const stages: Array<[string, RoleKey]> = [
+  const stages: Array<[string, PilotRole]> = [
     ["VERIFICATION", "VERIFICATION_OFFICER"],
     ["BSM_INITIAL", "BSM"],
     ["AGM", "AGM"],
@@ -326,92 +324,122 @@ export async function approveAllStages(
     ["BSM_FINAL", "BSM"],
     ["MD", "MD"],
   ];
+  let version = await currentApplicationVersion(request, flow);
   for (const [stage, role] of stages) {
     const result = await call(
       request,
-      harness.baseUrl,
+      flow.runtime.baseUrl,
       "post",
-      `/v1/staff/applications/${applicationId}/approve`,
+      `/v1/staff/applications/${flow.applicationId}/approve`,
       {
-        token: harness.staffTokens[role],
+        headers: flow.runtime.staff.get(role)!.headers,
         body: {
-          expectedVersion: harness.state.application.version,
+          expectedVersion: version,
           stage,
-          note: `Synthetic ${stage} approval`,
-          idempotencyKey: `approval-${stage.toLowerCase()}`,
+          note: `Controlled pilot ${stage} approval`,
+          idempotencyKey: randomUUID(),
         },
       },
     );
     assertStatus(result, 200);
+    version = Number((await body(result)).version);
   }
 }
 
 export async function createAndAcceptOffer(
   request: ApiRequest,
-  harness: PilotHarness,
-): Promise<void> {
+  flow: PilotFlow,
+): Promise<Record<string, unknown>> {
   const created = await call(
     request,
-    harness.baseUrl,
+    flow.runtime.baseUrl,
     "post",
-    `/v1/customer/applications/${applicationId}/offers`,
+    `/v1/customer/applications/${flow.applicationId}/offers`,
     {
-      token: harness.applicantToken,
+      headers: flow.runtime.customer.applicant.headers,
       body: {
         depositMinor: "10000",
         frequency: "MONTHLY",
-        tenureMonths: 12,
-        firstDueDate: "2026-09-01",
-        expiresAt: "2026-08-30T12:00:00.000Z",
+        tenureMonths: 6,
+        firstDueDate: "2026-08-15",
+        expiresAt: "2026-08-31T00:00:00.000Z",
         idempotencyKey: "offer-create-001",
       },
     },
   );
-  assertStatus(created, 201);
+  if (created.status() !== 201)
+    throw new Error(
+      `OFFER_CREATE_FAILED_${created.status()}_${await created.text()}`,
+    );
   const offer = await body(created);
+  const terms = (offer.terms ?? {}) as Record<string, unknown>;
   const accepted = await call(
     request,
-    harness.baseUrl,
+    flow.runtime.baseUrl,
     "post",
     `/v1/customer/offers/${String(offer.id)}/accept`,
     {
-      token: harness.applicantToken,
+      headers: flow.runtime.customer.applicant.headers,
       body: {
         consent: true,
         expectedVersion: Number(offer.version),
-        consentAt: "2026-08-23T12:00:00.000Z",
-        disclosedVersion: "disclosure-v1",
-        disclosedHash: "b".repeat(64),
+        consentAt: "2026-08-01T12:00:00.000Z",
+        disclosedVersion: String(offer.disclosedVersion),
+        disclosedHash: String(offer.disclosedHash ?? terms.disclosureHash),
         idempotencyKey: "offer-accept-001",
       },
     },
   );
   assertStatus(accepted, 200);
+  return body(accepted);
 }
 
 export async function postPayment(
   request: ApiRequest,
-  harness: PilotHarness,
-  event: Record<string, unknown>,
+  flow: PilotFlow,
+  event: CanonicalPaymentEvent,
 ): Promise<ApiResponse> {
-  const signed = harness.signPayment(event);
+  const rawBody = Uint8Array.from(Buffer.from(JSON.stringify(event)));
+  const signature = `controlled-pilot-${event.eventId}`;
+  const requestTimestamp = event.occurredAt;
+  flow.runtime.addPaymentFixture({
+    rawBody,
+    signature,
+    requestTimestamp,
+    event,
+  });
   return call(
     request,
-    harness.baseUrl,
+    flow.runtime.baseUrl,
     "post",
     "/v1/integrations/payments/somoco",
     {
-      body: JSON.parse(signed.body) as Record<string, unknown>,
-      headers: signed.headers,
+      headers: {
+        "content-type": "application/json",
+        "x-payment-signature": signature,
+        "x-payment-timestamp": requestTimestamp,
+      },
+      body: event as unknown as Record<string, unknown>,
     },
   );
+}
+
+export async function currentApplicationVersion(
+  request: ApiRequest,
+  flow: PilotFlow,
+): Promise<number> {
+  const response = await call(
+    request,
+    flow.runtime.baseUrl,
+    "get",
+    `/v1/staff/applications/${flow.applicationId}`,
+    { headers: flow.runtime.staff.get("VERIFICATION_OFFICER")!.headers },
+  );
+  assertStatus(response, 200);
+  return Number((await body(response)).version);
 }
 
 export function assertStatus(response: ApiResponse, expected: number): void {
   if (response.status() !== expected)
     throw new Error(`Expected HTTP ${expected}, received ${response.status()}`);
 }
-
-type RoleKey = keyof PilotHarness["staffTokens"];
-
-export { applicantPersonId, guarantorPersonId };

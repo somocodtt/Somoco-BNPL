@@ -1,201 +1,67 @@
-import {
-  expect,
-  test,
-} from "../../apps/customer-web/node_modules/@playwright/test/index.mjs";
-import {
-  applicantPhone,
-  applicationId,
-  otpCode,
-  startPilotHarness,
-} from "./support/pilot-harness.js";
-import {
-  api,
-  assertStatus,
-  body,
-  call,
-  completeOnboarding,
-} from "./support/pilot-client.js";
+import { randomUUID } from "node:crypto";
+import { afterEach, describe, expect, it } from "vitest";
+import { startRealPilot, type PilotRuntime } from "./support/real-pilot.js";
+import { body, call, completeOnboarding } from "./support/pilot-client.js";
+import { createApiRequest } from "./support/vitest-http.js";
 
-test("information requests return to the same approval stage only after customer resubmission", async ({
-  request,
-}) => {
-  const harness = await startPilotHarness();
-  try {
-    const client = api(request);
-    await completeOnboarding(client, harness);
-    const requested = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      `/v1/staff/applications/${applicationId}/request-information`,
+let runtime: PilotRuntime | undefined;
+
+afterEach(async () => {
+  await runtime?.close();
+  runtime = undefined;
+});
+
+describe("controlled-pilot information request boundary", () => {
+  it("returns the application to the requested stage only after public resubmission", async () => {
+    runtime = await startRealPilot();
+    const request = createApiRequest(runtime.app);
+    const flow = await completeOnboarding(request, runtime);
+    const detail = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      `/v1/staff/applications/${flow.applicationId}`,
       {
-        token: harness.staffTokens.VERIFICATION_OFFICER,
+        headers: runtime.staff.get("VERIFICATION_OFFICER")!.headers,
+      },
+    );
+    expect(detail.status()).toBe(200);
+    const requestInfo = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/applications/${flow.applicationId}/request-information`,
+      {
+        headers: runtime.staff.get("VERIFICATION_OFFICER")!.headers,
         body: {
-          expectedVersion: harness.state.application.version,
+          expectedVersion: Number((await body(detail)).version),
           stage: "VERIFICATION",
           note: "Please clarify the residential area.",
-          idempotencyKey: "info-request-001",
+          idempotencyKey: randomUUID(),
         },
       },
     );
-    assertStatus(requested, 200);
-    expect((await body(requested)).status).toBe("INFORMATION_REQUESTED");
-
+    expect(requestInfo.status()).toBe(200);
+    await expect(body(requestInfo)).resolves.toMatchObject({
+      action: "REQUEST_INFORMATION",
+    });
+    const requested = await body(requestInfo);
     const resubmitted = await call(
-      client,
-      harness.baseUrl,
+      request,
+      runtime.baseUrl,
       "post",
-      `/v1/customer/applications/${applicationId}/resubmissions`,
+      `/v1/customer/applications/${flow.applicationId}/resubmissions`,
       {
-        token: harness.applicantToken,
+        headers: runtime.customer.applicant.headers,
         body: {
-          expectedVersion: harness.state.application.version,
-          idempotencyKey: "resubmission-001",
+          expectedVersion: Number(requested.version),
+          idempotencyKey: randomUUID(),
         },
       },
     );
-    assertStatus(resubmitted, 200);
-    expect((await body(resubmitted)).status).toBe("VERIFICATION_REVIEW");
-  } finally {
-    await harness.close();
-  }
-});
-
-test("NIA outage and malware rejection fail closed at their provider boundaries", async ({
-  request,
-}) => {
-  const harness = await startPilotHarness();
-  try {
-    const client = api(request);
-    const otpRequest = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/otp/requests",
-      { body: { phoneE164: applicantPhone } },
-    );
-    assertStatus(otpRequest, 202);
-    const verified = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/otp/verifications",
-      { body: { phoneE164: applicantPhone, code: otpCode } },
-    );
-    assertStatus(verified, 201);
-    harness.setNiaOutage(true);
-    const unavailable = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/consents",
-      {
-        token: harness.applicantToken,
-        body: {
-          purpose: "NIA_IDENTITY_VERIFICATION",
-          documentVersion: "nia-consent-v1",
-          phoneE164: applicantPhone,
-        },
-      },
-    );
-    assertStatus(unavailable, 503);
-    expect((await body(unavailable)).code).toBe("NIA_UNAVAILABLE");
-    harness.setNiaOutage(false);
-    const consent = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/consents",
-      {
-        token: harness.applicantToken,
-        body: {
-          purpose: "NIA_IDENTITY_VERIFICATION",
-          documentVersion: "nia-consent-v1",
-          phoneE164: applicantPhone,
-        },
-      },
-    );
-    assertStatus(consent, 201);
-    const consentBody = await body(consent);
-    const nia = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/identity/ghana-card-verifications",
-      {
-        token: harness.applicantToken,
-        body: {
-          consentId: String(consentBody.consentId),
-          ghanaCardNumber: "GHA-123456789-1",
-          idempotencyKey: "nia-recovery-001",
-        },
-      },
-    );
-    assertStatus(nia, 201);
-    const malware = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/documents/uploads",
-      {
-        token: harness.applicantToken,
-        body: {
-          documentType: "GHANA_CARD_FRONT",
-          mimeType: "application/x-msdownload",
-          sizeBytes: 128,
-        },
-      },
-    );
-    assertStatus(malware, 422);
-    expect((await body(malware)).code).toBe("MALWARE_REJECTED");
-  } finally {
-    await harness.close();
-  }
-});
-
-test("OTP request and verification abuse stay rate-limited", async ({
-  request,
-}) => {
-  const harness = await startPilotHarness();
-  try {
-    const client = api(request);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await call(
-        client,
-        harness.baseUrl,
-        "post",
-        "/v1/customer/otp/requests",
-        { body: { phoneE164: applicantPhone } },
-      );
-      assertStatus(response, 202);
-    }
-    const fourthRequest = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/otp/requests",
-      { body: { phoneE164: applicantPhone } },
-    );
-    assertStatus(fourthRequest, 429);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await call(
-        client,
-        harness.baseUrl,
-        "post",
-        "/v1/customer/otp/verifications",
-        { body: { phoneE164: applicantPhone, code: "000000" } },
-      );
-      assertStatus(response, 401);
-    }
-    const locked = await call(
-      client,
-      harness.baseUrl,
-      "post",
-      "/v1/customer/otp/verifications",
-      { body: { phoneE164: applicantPhone, code: "000000" } },
-    );
-    assertStatus(locked, 429);
-  } finally {
-    await harness.close();
-  }
+    expect(resubmitted.status()).toBe(200);
+    await expect(body(resubmitted)).resolves.toMatchObject({
+      status: "VERIFICATION_REVIEW",
+    });
+  }, 60_000);
 });

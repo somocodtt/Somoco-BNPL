@@ -5,6 +5,10 @@ Run ID: ____________________ Trigger time (UTC): ____________________ Incident c
 
 Rollback is a controlled stop and recovery of service. Never delete financial, approval, payment, personal-data-request, or audit evidence to make a rollback appear clean.
 
+## Rehearsal evidence status
+
+This runbook is an unsigned control template. The bounded load output is labelled `SIMULATED_PROXY` and measures request latency against disposable PostgreSQL and simulator adapters only; it is not queue-age, worker-restart/reclaim, provider-resilience, hosting-capacity, or restore-integrity evidence. Those checks remain `PENDING_EXTERNAL_REHEARSAL`. The real-app API tests also leave the pilot blocked where no public guarantor-signature or deposit-reconciliation-before-contract boundary exists. Do not close those gaps by writing workflow tables, replaying against production, or deleting evidence.
+
 ## Trigger and authority
 
 Trigger immediately for duplicate/misallocated ledger entries, unauthorized access/action, skipped approval, wrong ownership, data disclosure, provider signature failure, unreconciled settlement, material outage, or any critical/high UAT defect. The Incident Commander may stop admission; the named Business Sponsor and Operations/Finance authorities approve resumption. If authority is unavailable, fail closed and keep traffic stopped.

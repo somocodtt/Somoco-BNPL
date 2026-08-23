@@ -6,6 +6,12 @@ Run ID: ____________________ Date/time (UTC): ____________________ Facilitator: 
 
 This rehearsal proves the simulator-backed core and launch controls. It does not substitute for provider sandbox evidence, hosting rehearsal, legal approval, DPC/DPIA approval, restore evidence, penetration testing, or signed business UAT. Use synthetic Ghana Card values, phones, documents, and payments only. Never paste a real person's data into this run.
 
+## Automated evidence boundary
+
+The real-app API composition is exercised by `apps/api/test/task15-controlled-pilot.e2e.test.ts` against the disposable PostgreSQL service `postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`. It uses production `buildApp`, migrations, OTP/customer sessions, signed staff cookies, simulator ports, and public HTTP routes. The current automated run proves onboarding, independent guarantor consent/NIA/document evidence, six-stage approval attribution, offer acceptance, wrong-role/licence/asset/provider/recovery guards, and unmatched-payment replay quarantine.
+
+The following remain `BLOCKED/PENDING` and must not be marked Pass from simulator output: customer/guarantor signature action (no public signature route is exposed), deposit reconciliation before contract generation (assignment requires a reconciled deposit while provider ledger posting requires an existing contract), physical execution/handover/activation, posted ledger and receipt replay, settlement, ownership transfer, worker restart/reclaim, browser execution when the Playwright browser runtime is unavailable, provider/hosting/restore rehearsal, and signed UAT. These are explicit release gates, not test-fixture substitutions.
+
 ## Entry checks
 
 Record the exact commit and commands before starting:
