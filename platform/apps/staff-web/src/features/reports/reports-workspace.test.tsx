@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ReportsWorkspace } from "./reports-workspace.js";
@@ -101,5 +101,40 @@ describe("reports workspace", () => {
     expect(approve).toBeEnabled();
     await userEvent.click(approve);
     expect(migration.approve).toHaveBeenCalledWith("batch-2", "a".repeat(64));
+  });
+
+  it("polls queued exports and only attributes the completed artifact", async () => {
+    const api = reportsApi();
+    api.exportReport = vi.fn().mockResolvedValue({
+      id: "export-queued",
+      status: "QUEUED",
+      content: "",
+    });
+    api.getExport = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: "export-queued",
+        status: "QUEUED",
+        content: "",
+      })
+      .mockResolvedValueOnce({
+        id: "export-queued",
+        status: "READY",
+        format: "CSV",
+        content: "# SOMOCO\r\nvalue\r\n",
+      });
+    render(<ReportsWorkspace api={api} roles={["CUSTOMER_SUPPORT"]} />);
+    await screen.findByText("No records match the selected report filters.");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Export operations CSV" }),
+    );
+    await waitFor(() => expect(api.getExport).toHaveBeenCalledTimes(2), {
+      timeout: 1000,
+    });
+    expect(
+      await screen.findByText(
+        "Export export-queued downloaded and attributed to the requester.",
+      ),
+    ).toBeVisible();
   });
 });

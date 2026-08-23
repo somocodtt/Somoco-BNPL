@@ -64,7 +64,9 @@ describe("reporting and quarantined legacy import", () => {
       requesterStaffUserId: auditor.staffUserId,
       watermark: expect.stringContaining(auditor.staffUserId),
     });
-    expect(exported.content).not.toMatch(/(=|\+|-|@)[^,\r\n]*/);
+    expect(exported.content.split("\r\n").slice(1).join("\r\n")).not.toMatch(
+      /(=|\+|-|@)[^,\r\n]*/,
+    );
     const persisted = await getInternalDatabase(database).execute<{
       requester_staff_user_id: string;
       request_id: string;
@@ -111,6 +113,12 @@ describe("reporting and quarantined legacy import", () => {
     expect(serializeCsv([{ value: "=1+1" }, { value: "@cmd" }])).toBe(
       "value\r\n'=1+1\r\n'@cmd\r\n",
     );
+    expect(
+      serializeCsv([{ value: "  =1+1" }, { nested: { value: "\t@cmd" } }]),
+    ).toContain("'  =1+1");
+    expect(serializeCsv([{ nested: { value: "\t@cmd" } }])).not.toContain(
+      "\t@cmd",
+    );
   });
 
   it("queues large exports durably without embedding a raw report payload", async () => {
@@ -154,6 +162,8 @@ describe("reporting and quarantined legacy import", () => {
       aggregate_id: exported.id,
       payload: { exportId: exported.id, expectedRowCount: 501 },
     });
+    expect(outbox.rows[0]?.payload).not.toHaveProperty("content");
+    expect(outbox.rows[0]?.payload).not.toHaveProperty("expectedContentHash");
     const events = await getInternalDatabase(database).execute<{
       event_type: string;
     }>(sql`
@@ -214,6 +224,41 @@ describe("reporting and quarantined legacy import", () => {
     });
     expect(asOf.rows).toHaveLength(1);
     expect(asOf.rows[0]?.niaExceptions).toBe(1);
+  });
+
+  it("uses a real ordered cursor for reports beyond one page", async () => {
+    const service = createReportService({ database });
+    const support = principal("CUSTOMER_SUPPORT");
+    await seedActor(database, support);
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.person (id, phone_e164)
+      select gen_random_uuid(), '+233210' || lpad(series::text, 7, '0')
+        from generate_series(1, 1001) as series
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into application (applicant_person_id, status)
+      select id, 'ACTIVE'::application_status
+        from privacy.person
+       where phone_e164 like '+233210%'
+    `);
+    const first = await service.operations({ actor: support });
+    expect(first.rows).toHaveLength(1000);
+    expect(first.pagination.truncated).toBe(true);
+    expect(first.pagination.nextCursor).toEqual(expect.any(String));
+    const second = await service.operations({
+      actor: support,
+      filters: { cursor: first.pagination.nextCursor! },
+    });
+    expect(second.rows.length).toBeGreaterThan(0);
+    expect(
+      new Set([
+        ...first.rows.map((row) => String(row.applicationId)),
+        ...second.rows.map((row) => String(row.applicationId)),
+      ]).size,
+    ).toBe(first.rows.length + second.rows.length);
+    expect(second.rows[0]?.applicationId).not.toBe(
+      first.rows[0]?.applicationId,
+    );
   });
 
   it("does not mutate immutable migration target evidence", async () => {
@@ -348,6 +393,52 @@ describe("reporting and quarantined legacy import", () => {
         ],
       }),
     ).rejects.toThrow("MIGRATION_REPLAY_CONFLICT");
+    await expect(
+      service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        ...input,
+        controlTotalMinorUnits: "201",
+      }),
+    ).rejects.toThrow("MIGRATION_REPLAY_CONFLICT");
+    await expect(
+      service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        ...input,
+        rows: [input.rows[1], input.rows[0]],
+      }),
+    ).rejects.toThrow("MIGRATION_REPLAY_CONFLICT");
+  });
+
+  it("keeps migration batch lifecycle state append-only", async () => {
+    const service = createMigrationService({ database });
+    const importer = principal("MIGRATION_IMPORTER");
+    await seedActor(database, importer);
+    const batch = await service.importBatch({
+      actor: importer,
+      requestId: randomUUID(),
+      source: "LEGACY_CSV",
+      sourceBatchId: "append-only-batch-state",
+      sourceFileHash: "f".repeat(64),
+      templateVersion: "legacy-v1",
+      expectedRecords: 0,
+      rows: [],
+    });
+    await expect(
+      getInternalDatabase(database).execute(sql`
+        update migration_batch set status = 'APPROVED' where id = ${batch.id}
+      `),
+    ).rejects.toThrow();
+    await expect(
+      getInternalDatabase(database).execute(sql`
+        delete from migration_batch where id = ${batch.id}
+      `),
+    ).rejects.toThrow();
+    const current = await service.listBatches(importer);
+    expect(current.find((item) => item.id === batch.id)?.status).toBe(
+      batch.status,
+    );
   });
 
   it("quarantines malformed fields, duplicate contract or vehicle keys, and control-total mismatch", async () => {
@@ -433,6 +524,15 @@ describe("reporting and quarantined legacy import", () => {
           tenureMonths: 12,
           arrearsMinorUnits: "0",
           repaymentHistory: [],
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "100",
+              status: "DUE",
+              currency: "GHS",
+            },
+          ],
           currentBalanceMinorUnits: "100",
         },
       ],
@@ -516,12 +616,14 @@ describe("reporting and quarantined legacy import", () => {
         batchId: batch.id,
         actor: importer,
         requestId: randomUUID(),
+        sampleRecordIds: [],
       }),
     ).rejects.toThrow("MIGRATION_SEPARATION_REQUIRED");
     const verified = await service.verifyBatch({
       batchId: batch.id,
       actor: verifier,
       requestId: randomUUID(),
+      sampleRecordIds: [],
     });
     expect(verified.status).toBe("VALIDATED");
     const approved = await service.approveBatch({
@@ -647,12 +749,28 @@ describe("reporting and quarantined legacy import", () => {
           tenureMonths: 12,
           arrearsMinorUnits: "0",
           repaymentHistory: [],
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "100",
+              status: "DUE",
+              currency: "GHS",
+            },
+          ],
           currentBalanceMinorUnits: "100",
           attachmentDocumentId: documentId,
         },
       ],
     });
     expect(batch.status).toBe("VALIDATED");
+    await expect(
+      service.verifyBatch({
+        batchId: batch.id,
+        actor: verifier,
+        requestId: randomUUID(),
+      }),
+    ).rejects.toThrow("MIGRATION_SAMPLE_REQUIRED");
     await expect(
       service.verifyBatch({
         batchId: batch.id,
@@ -794,6 +912,15 @@ async function createApprovedBoundBatch(
         tenureMonths: 12,
         arrearsMinorUnits: "0",
         repaymentHistory: [],
+        installmentSchedule: [
+          {
+            number: 1,
+            dueDate: "2025-02-01",
+            amountMinorUnits: "100",
+            status: "DUE",
+            currency: "GHS",
+          },
+        ],
         currentBalanceMinorUnits: "100",
         attachmentDocumentId: documentId,
       },

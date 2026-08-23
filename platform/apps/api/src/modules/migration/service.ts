@@ -54,6 +54,8 @@ export interface LegacyImportRow {
   schedule?: { frequency?: string; tenureMonths?: number | string };
   currentBalanceMinorUnits: string;
   repaymentHistory?: readonly Record<string, unknown>[];
+  installmentSchedule?: readonly Record<string, unknown>[];
+  installment_schedule_json?: string;
   attachmentDocumentId?: string;
   [key: string]: unknown;
 }
@@ -83,6 +85,12 @@ export interface MigrationBatchView {
   verifiedBy: string | null;
   approvedBy: string | null;
   activatedAt: string | null;
+  sampleEvidence: readonly {
+    recordId: string;
+    verifierStaffUserId: string;
+    verifiedAt: string;
+    result: string;
+  }[];
   records: readonly MigrationRecordView[];
   events: readonly MigrationEventView[];
 }
@@ -193,11 +201,16 @@ export function createMigrationService(options: {
         await executor.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${`${input.sourceFileHash}:${input.templateVersion}`}, 0))`,
         );
-        const fingerprint = batchFingerprint(
-          input.sourceFileHash,
-          input.templateVersion,
-          input.rows,
-        );
+        const fingerprint = batchFingerprint({
+          source: input.source,
+          sourceBatchId: input.sourceBatchId,
+          sourceFileHash: input.sourceFileHash,
+          templateVersion: input.templateVersion,
+          expectedRecords: input.expectedRecords,
+          sampleRequired: configuredSample,
+          controlTotalMinorUnits: input.controlTotalMinorUnits ?? null,
+          rows: input.rows,
+        });
         const sameFile = await executor.execute<{
           id: string;
           source_batch_id: string;
@@ -227,8 +240,9 @@ export function createMigrationService(options: {
           id: string;
           source_file_hash: string | null;
           template_version: string;
+          batch_fingerprint: string | null;
         }>(sql`
-          select id, source_file_hash, template_version
+          select id, source_file_hash, template_version, batch_fingerprint
             from migration_batch
            where source = ${input.source}
              and source_batch_id = ${input.sourceBatchId}
@@ -239,7 +253,8 @@ export function createMigrationService(options: {
           const prior = await listBatch(tx, batch.id);
           if (
             batch.source_file_hash !== input.sourceFileHash ||
-            batch.template_version !== input.templateVersion
+            batch.template_version !== input.templateVersion ||
+            batch.batch_fingerprint !== fingerprint
           )
             throw new AppError(
               409,
@@ -304,15 +319,17 @@ export function createMigrationService(options: {
             id: string;
             source_file_hash: string | null;
             template_version: string;
+            batch_fingerprint: string | null;
           }>(sql`
-            select id, source_file_hash, template_version from migration_batch
+            select id, source_file_hash, template_version, batch_fingerprint from migration_batch
              where source = ${input.source} and source_batch_id = ${input.sourceBatchId}
           `);
           const batch = concurrent.rows[0];
           if (
             batch === undefined ||
             batch.source_file_hash !== input.sourceFileHash ||
-            batch.template_version !== input.templateVersion
+            batch.template_version !== input.templateVersion ||
+            batch.batch_fingerprint !== fingerprint
           )
             throw new AppError(
               409,
@@ -363,6 +380,14 @@ export function createMigrationService(options: {
           requestId: input.requestId,
           data: { source: input.source, status: batchStatus },
         });
+        await appendBatchTransition(tx, {
+          batchId,
+          eventKey: `migration:${batchId}:IMPORTED`,
+          eventType: "IMPORTED",
+          actor: input.actor,
+          requestId: input.requestId,
+          fields: { status: batchStatus },
+        });
         return listBatch(tx, batchId);
       });
     },
@@ -380,7 +405,14 @@ export function createMigrationService(options: {
         const rows = await listRecordRows(tx, input.batchId);
         if (rows.some((row) => row.status === "INVALID"))
           return listBatch(tx, input.batchId);
-        await updateBatch(tx, input.batchId, { status: "VALIDATED" });
+        await appendBatchTransition(tx, {
+          batchId: input.batchId,
+          eventKey: `migration:${input.batchId}:VALIDATED`,
+          eventType: "VALIDATED",
+          actor: input.actor,
+          requestId: input.requestId,
+          fields: { status: "VALIDATED" },
+        });
         await appendAudit(tx, {
           aggregateType: "migration_batch",
           aggregateId: input.batchId,
@@ -435,43 +467,61 @@ export function createMigrationService(options: {
             "MIGRATION_BATCH_QUARANTINED",
             "Every row must be valid before verification.",
           );
-        if (input.sampleRecordIds !== undefined) {
-          const requestedIds = new Set(input.sampleRecordIds);
-          if (
-            batch.expected_records > 0 &&
-            input.sampleRecordIds.length < batch.sample_required
+        if (input.sampleRecordIds === undefined)
+          throw new AppError(
+            409,
+            "MIGRATION_SAMPLE_REQUIRED",
+            "The verifier must select the configured sample rows.",
+          );
+        const requestedIds = new Set(input.sampleRecordIds);
+        if (input.sampleRecordIds.length !== batch.sample_required)
+          throw new AppError(
+            409,
+            "MIGRATION_SAMPLE_REQUIRED",
+            "The verifier must select exactly the configured sample size.",
+          );
+        if (
+          requestedIds.size !== input.sampleRecordIds.length ||
+          input.sampleRecordIds.some(
+            (recordId) => !rows.some((row) => row.id === recordId),
           )
-            throw new AppError(
-              409,
-              "MIGRATION_SAMPLE_REQUIRED",
-              "The configured non-empty sample must be independently evidenced.",
-            );
-          if (
-            requestedIds.size !== input.sampleRecordIds.length ||
-            input.sampleRecordIds.some(
-              (recordId) => !rows.some((row) => row.id === recordId),
-            )
-          )
-            throw new AppError(
-              400,
-              "MIGRATION_SAMPLE_INVALID",
-              "Every requested sample row must belong to the batch exactly once.",
-            );
-        }
-        const requested =
-          input.sampleRecordIds?.length ??
-          Math.min(rows.length, batch.sample_required);
+        )
+          throw new AppError(
+            400,
+            "MIGRATION_SAMPLE_INVALID",
+            "Every requested sample row must belong to the batch exactly once.",
+          );
+        const requested = input.sampleRecordIds.length;
         if (batch.expected_records > 0 && requested < batch.sample_required)
           throw new AppError(
             409,
             "MIGRATION_SAMPLE_REQUIRED",
             "The configured non-empty sample must be independently evidenced.",
           );
-        await updateBatch(tx, input.batchId, {
-          status: "VALIDATED",
-          verifiedBy: input.actor.staffUserId,
-          verifiedAt: new Date(),
-          samplePassed: requested,
+        for (const recordId of input.sampleRecordIds) {
+          const row = rows.find((candidate) => candidate.id === recordId);
+          await getInternalExecutor(tx).execute(sql`
+            insert into migration_sample_evidence
+              (migration_batch_id, migration_record_id, verifier_staff_user_id,
+               verified_at, result, evidence_hash)
+            values
+              (${input.batchId}, ${recordId}, ${input.actor.staffUserId}, now(),
+               'PASS', ${row?.payload_hash ?? null})
+            on conflict (migration_batch_id, migration_record_id) do nothing
+          `);
+        }
+        await appendBatchTransition(tx, {
+          batchId: input.batchId,
+          eventKey: `migration:${input.batchId}:SAMPLED:${input.actor.staffUserId}`,
+          eventType: "SAMPLED",
+          actor: input.actor,
+          requestId: input.requestId,
+          fields: {
+            status: "VALIDATED",
+            verifiedBy: input.actor.staffUserId,
+            verifiedAt: new Date(),
+            samplePassed: requested,
+          },
         });
         await appendAudit(tx, {
           aggregateType: "migration_batch",
@@ -548,11 +598,18 @@ export function createMigrationService(options: {
             "MIGRATION_SAMPLE_REQUIRED",
             "A non-empty independently verified sample is required before finance approval.",
           );
-        await updateBatch(tx, input.batchId, {
-          status: "APPROVED",
-          approvedBy: input.actor.staffUserId,
-          approvedAt: new Date(),
-          financialEvidenceHash: input.financialEvidenceHash,
+        await appendBatchTransition(tx, {
+          batchId: input.batchId,
+          eventKey: `migration:${input.batchId}:APPROVED`,
+          eventType: "APPROVED",
+          actor: input.actor,
+          requestId: input.requestId,
+          fields: {
+            status: "APPROVED",
+            approvedBy: input.actor.staffUserId,
+            approvedAt: new Date(),
+            financialEvidenceHash: input.financialEvidenceHash,
+          },
         });
         await appendAudit(tx, {
           aggregateType: "migration_batch",
@@ -639,10 +696,17 @@ export function createMigrationService(options: {
               "Legacy rows remain quarantined until the complete customer, guarantor, vehicle, contract, schedule, ledger, and repayment graph is validated.",
             );
           const imported = 0;
-          await updateBatch(tx, input.batchId, {
-            status: "IMPORTED",
-            importedRecords: imported,
-            activatedAt: new Date(),
+          await appendBatchTransition(tx, {
+            batchId: input.batchId,
+            eventKey: `migration:${input.batchId}:ACTIVATED`,
+            eventType: "ACTIVATED",
+            actor: input.actor,
+            requestId: input.requestId,
+            fields: {
+              status: "IMPORTED",
+              importedRecords: imported,
+              activatedAt: new Date(),
+            },
           });
           await enqueueOutbox(tx, {
             id: randomUUID(),
@@ -684,7 +748,15 @@ export function createMigrationService(options: {
           await withTransaction(options.database, async (tx) => {
             const batch = await getBatch(tx, input.batchId);
             if (batch === null || batch.status !== "APPROVED") return;
-            await updateBatch(tx, input.batchId, { status: "QUARANTINED" });
+            await appendBatchTransition(tx, {
+              batchId: input.batchId,
+              eventKey: `migration:${input.batchId}:QUARANTINED:${error.code}`,
+              eventType: "QUARANTINED",
+              actor: input.actor,
+              requestId: input.requestId,
+              reasonCode: error.code,
+              fields: { status: "QUARANTINED" },
+            });
             await appendMigrationEvent(tx, {
               batchId: input.batchId,
               eventKey: `migration:${input.batchId}:QUARANTINED:${error.code}`,
@@ -762,9 +834,7 @@ async function validateRows(
         : suppliedSourceRecordId;
     const suppliedSourceRowNumber =
       payload.sourceRowNumber ?? numberField(payload, "source_row_number");
-    if (
-      suppliedSourceRecordId === "" || duplicateSourceRecordId
-    )
+    if (suppliedSourceRecordId === "" || duplicateSourceRecordId)
       errors.push({
         code: "DUPLICATE_SOURCE_ROW",
         message: "Source row identity is missing or duplicated.",
@@ -813,6 +883,14 @@ async function validateRows(
       payload.repaymentHistory ??
         payload.repayment_history ??
         stringField(payload, "repaymentHistoryJson", "repayment_history_json"),
+    );
+    const installmentSchedule = parseInstallmentSchedule(
+      payload.installmentSchedule ??
+        stringField(
+          payload,
+          "installmentScheduleJson",
+          "installment_schedule_json",
+        ),
     );
     if (!customer.legacyId?.trim())
       errors.push({
@@ -970,6 +1048,50 @@ async function validateRows(
         message:
           "A repayment history array is required, including an empty array when none exists.",
       });
+    if (!Array.isArray(installmentSchedule) || installmentSchedule.length === 0)
+      errors.push({
+        code: "INSTALLMENT_SCHEDULE_REQUIRED",
+        message:
+          "At least one reconciled installment schedule entry is required.",
+      });
+    else {
+      const scheduleTotal = installmentSchedule.reduce(
+        (total, entry) => total + BigInt(String(entry.amountMinorUnits)),
+        0n,
+      );
+      if (scheduleTotal <= 0n)
+        errors.push({
+          code: "INSTALLMENT_SCHEDULE_TOTAL_INVALID",
+          message: "The installment schedule total must be positive.",
+        });
+      if (
+        isIsoCalendarDate(contract.startDate) &&
+        isIsoCalendarDate(contract.endDate) &&
+        installmentSchedule.some(
+          (entry) =>
+            String(entry.dueDate) < contract.startDate! ||
+            String(entry.dueDate) > contract.endDate!,
+        )
+      )
+        errors.push({
+          code: "INSTALLMENT_DATE_OUT_OF_RANGE",
+          message: "Installment due dates must fall within the contract dates.",
+        });
+    }
+    if (
+      Array.isArray(repaymentHistory) &&
+      isIsoCalendarDate(contract.startDate) &&
+      isIsoCalendarDate(contract.endDate) &&
+      repaymentHistory.some(
+        (entry) =>
+          String(entry.date) < contract.startDate! ||
+          String(entry.date) > contract.endDate!,
+      )
+    )
+      errors.push({
+        code: "REPAYMENT_DATE_OUT_OF_RANGE",
+        message: "Repayment dates must fall within the contract dates.",
+      });
     let attachment: ValidatedRow["attachment"] = null;
     const attachmentDocumentId =
       payload.attachmentDocumentId ??
@@ -1049,6 +1171,9 @@ async function validateRows(
       repaymentFrequency,
       tenureMonths: tenure,
       repaymentHistory: Array.isArray(repaymentHistory) ? repaymentHistory : [],
+      installmentSchedule: Array.isArray(installmentSchedule)
+        ? installmentSchedule
+        : [],
     };
     result.push({
       id: randomUUID(),
@@ -1298,20 +1423,82 @@ function isIsoCalendarDate(value: string | undefined): boolean {
 function parseRepaymentHistory(
   value: unknown,
 ): readonly Record<string, unknown>[] | undefined {
-  if (Array.isArray(value))
-    return value.filter(
-      (item): item is Record<string, unknown> =>
-        typeof item === "object" && item !== null && !Array.isArray(item),
-    );
+  const parsed = parseJsonArray(value);
+  if (parsed === undefined) return undefined;
+  const result: Record<string, unknown>[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null || Array.isArray(item))
+      return undefined;
+    const row = item as Record<string, unknown>;
+    const date = row.date ?? row.paymentDate;
+    const amount = row.amountMinorUnits ?? row.amount;
+    const type = row.type;
+    const reference = row.reference;
+    const currency = row.currency;
+    if (
+      typeof date !== "string" ||
+      !isIsoCalendarDate(date) ||
+      typeof amount !== "string" ||
+      !/^(0|[1-9][0-9]*)$/.test(amount) ||
+      typeof type !== "string" ||
+      !/^[A-Z][A-Z0-9_]{1,31}$/.test(type) ||
+      typeof reference !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$/.test(reference) ||
+      currency !== "GHS"
+    )
+      return undefined;
+    result.push({ date, amountMinorUnits: amount, type, reference, currency });
+  }
+  return result;
+}
+
+function parseInstallmentSchedule(
+  value: unknown,
+): readonly Record<string, unknown>[] | undefined {
+  const parsed = parseJsonArray(value);
+  if (parsed === undefined) return undefined;
+  const seen = new Set<number>();
+  const result: Record<string, unknown>[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null || Array.isArray(item))
+      return undefined;
+    const row = item as Record<string, unknown>;
+    const number = row.number ?? row.installmentNumber;
+    const dueDate = row.dueDate;
+    const amount = row.amountMinorUnits ?? row.amount;
+    const status = row.status;
+    if (
+      typeof number !== "number" ||
+      !Number.isSafeInteger(number) ||
+      number < 1 ||
+      seen.has(number) ||
+      typeof dueDate !== "string" ||
+      !isIsoCalendarDate(dueDate) ||
+      typeof amount !== "string" ||
+      !/^(0|[1-9][0-9]*)$/.test(amount) ||
+      typeof status !== "string" ||
+      !["DUE", "PAID", "MISSED", "WAIVED", "PENDING"].includes(status) ||
+      row.currency !== "GHS"
+    )
+      return undefined;
+    seen.add(number);
+    result.push({
+      number,
+      dueDate,
+      amountMinorUnits: amount,
+      status,
+      currency: "GHS",
+    });
+  }
+  return result;
+}
+
+function parseJsonArray(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) return value;
   if (typeof value !== "string" || value.trim() === "") return undefined;
   try {
     const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed)
-      ? parsed.filter(
-          (item): item is Record<string, unknown> =>
-            typeof item === "object" && item !== null && !Array.isArray(item),
-        )
-      : undefined;
+    return Array.isArray(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -1342,6 +1529,17 @@ async function listBatch(
      where migration_batch_id = ${batchId}
      order by created_at asc, id asc
   `);
+  const sampleEvidence = await getInternalExecutor(db).execute<{
+    migration_record_id: string;
+    verifier_staff_user_id: string;
+    verified_at: Date;
+    result: string;
+  }>(sql`
+    select migration_record_id, verifier_staff_user_id, verified_at, result
+      from migration_sample_evidence
+     where migration_batch_id = ${batchId}
+     order by verified_at asc, id asc
+  `);
   return {
     id: batch.id,
     source: batch.source,
@@ -1359,6 +1557,12 @@ async function listBatch(
       batch.activated_at === null
         ? null
         : new Date(batch.activated_at).toISOString(),
+    sampleEvidence: sampleEvidence.rows.map((evidence) => ({
+      recordId: evidence.migration_record_id,
+      verifierStaffUserId: evidence.verifier_staff_user_id,
+      verifiedAt: new Date(evidence.verified_at).toISOString(),
+      result: evidence.result,
+    })),
     records: records.map((row) => ({
       id: row.id,
       sourceRecordId: row.source_record_id,
@@ -1396,13 +1600,39 @@ async function getBatch(
     verified_by: string | null;
     verified_at: Date | null;
     approved_by: string | null;
+    approved_at: Date | null;
     expected_total_minor_units: bigint | string;
     reconciled_total_minor_units: bigint | string;
     sample_required: number;
     sample_passed: number;
+    financial_evidence_hash: string | null;
     activated_at: Date | null;
   }>(
-    sql`select id, source, source_batch_id, status, expected_records, imported_records, uploader_staff_user_id, verified_by, verified_at, approved_by, expected_total_minor_units, reconciled_total_minor_units, sample_required, sample_passed, activated_at from migration_batch where id = ${batchId} for update`,
+    sql`
+      select b.id, b.source, b.source_batch_id,
+             case when t.id is null then b.status else t.status end as status,
+             b.expected_records,
+             case when t.id is null then b.imported_records else t.imported_records end as imported_records,
+             b.uploader_staff_user_id,
+             case when t.id is null then b.verified_by else t.verified_by end as verified_by,
+             case when t.id is null then b.verified_at else t.verified_at end as verified_at,
+             case when t.id is null then b.approved_by else t.approved_by end as approved_by,
+             case when t.id is null then b.expected_total_minor_units else t.expected_total_minor_units end as expected_total_minor_units,
+             case when t.id is null then b.reconciled_total_minor_units else t.reconciled_total_minor_units end as reconciled_total_minor_units,
+             case when t.id is null then b.sample_required else t.sample_required end as sample_required,
+             case when t.id is null then b.sample_passed else t.sample_passed end as sample_passed,
+             case when t.id is null then b.financial_evidence_hash else t.financial_evidence_hash end as financial_evidence_hash,
+             case when t.id is null then b.activated_at else t.activated_at end as activated_at
+        from migration_batch b
+        left join lateral (
+          select * from migration_batch_transition
+           where migration_batch_id = b.id
+           order by created_at desc, id desc
+           limit 1
+        ) t on true
+       where b.id = ${batchId}
+       for update of b
+    `,
   );
   return result.rows[0] ?? null;
 }
@@ -1429,38 +1659,71 @@ async function listRecordRows(
   return result.rows;
 }
 
-async function updateBatch(
+async function appendBatchTransition(
   db: Parameters<typeof getInternalExecutor>[0],
-  batchId: string,
-  fields: Record<string, unknown>,
+  input: {
+    batchId: string;
+    eventKey: string;
+    eventType: string;
+    actor: StaffPrincipal;
+    requestId: string;
+    reasonCode?: string;
+    fields: Record<string, unknown>;
+  },
 ) {
   const executor = getInternalExecutor(db);
-  const assignments = [];
-  if ("status" in fields) assignments.push(sql`status = ${fields.status}`);
-  if ("importedRecords" in fields)
-    assignments.push(sql`imported_records = ${fields.importedRecords}`);
-  if ("verifiedBy" in fields)
-    assignments.push(sql`verified_by = ${fields.verifiedBy}`);
-  if ("verifiedAt" in fields)
-    assignments.push(sql`verified_at = ${fields.verifiedAt}`);
-  if ("approvedBy" in fields)
-    assignments.push(sql`approved_by = ${fields.approvedBy}`);
-  if ("approvedAt" in fields)
-    assignments.push(sql`approved_at = ${fields.approvedAt}`);
-  if ("financialEvidenceHash" in fields)
-    assignments.push(
-      sql`financial_evidence_hash = ${fields.financialEvidenceHash}`,
+  const current = await getBatch(db, input.batchId);
+  if (current === null)
+    throw new AppError(
+      404,
+      "MIGRATION_BATCH_NOT_FOUND",
+      "Migration batch not found.",
     );
-  if ("sampleRequired" in fields)
-    assignments.push(sql`sample_required = ${fields.sampleRequired}`);
-  if ("samplePassed" in fields)
-    assignments.push(sql`sample_passed = ${fields.samplePassed}`);
-  if ("activatedAt" in fields)
-    assignments.push(sql`activated_at = ${fields.activatedAt}`);
-  if (assignments.length === 0) return;
+  const next = {
+    status: String(input.fields.status ?? current.status),
+    importedRecords: Number(
+      input.fields.importedRecords ?? current.imported_records,
+    ),
+    expectedTotalMinorUnits: String(current.expected_total_minor_units),
+    reconciledTotalMinorUnits: String(current.reconciled_total_minor_units),
+    sampleRequired: Number(
+      input.fields.sampleRequired ?? current.sample_required,
+    ),
+    samplePassed: Number(input.fields.samplePassed ?? current.sample_passed),
+    verifiedBy: (input.fields.verifiedBy ?? current.verified_by) as
+      string | null,
+    verifiedAt: (input.fields.verifiedAt ?? current.verified_at) as Date | null,
+    approvedBy: (input.fields.approvedBy ?? current.approved_by) as
+      string | null,
+    approvedAt: (input.fields.approvedAt ?? current.approved_at) as Date | null,
+    financialEvidenceHash: (input.fields.financialEvidenceHash ??
+      current.financial_evidence_hash) as string | null,
+    activatedAt: (input.fields.activatedAt ??
+      current.activated_at) as Date | null,
+  };
   await executor.execute(
-    sql`update migration_batch set ${sql.join(assignments, sql`, `)}, updated_at = now() where id = ${batchId}`,
+    sql`
+      insert into migration_batch_transition
+        (migration_batch_id, event_key, event_type, status, imported_records,
+         expected_total_minor_units, reconciled_total_minor_units,
+         sample_required, sample_passed, verified_by, verified_at, approved_by,
+         approved_at, financial_evidence_hash, activated_at, actor_staff_user_id,
+         request_id, reason_code, data, created_at)
+      values
+        (${input.batchId}, ${input.eventKey}, ${input.eventType}, ${next.status},
+         ${next.importedRecords}, ${next.expectedTotalMinorUnits},
+         ${next.reconciledTotalMinorUnits}, ${next.sampleRequired},
+         ${next.samplePassed}, ${nullableSql(next.verifiedBy)}, ${nullableSql(next.verifiedAt)},
+         ${nullableSql(next.approvedBy)}, ${nullableSql(next.approvedAt)}, ${nullableSql(next.financialEvidenceHash)},
+         ${nullableSql(next.activatedAt)}, ${input.actor.staffUserId}, ${input.requestId},
+         ${nullableSql(input.reasonCode)}, ${JSON.stringify(input.fields)}::jsonb, now())
+      on conflict (event_key) do nothing
+    `,
   );
+}
+
+function nullableSql(value: unknown) {
+  return value === null || value === undefined ? sql`NULL` : sql`${value}`;
 }
 
 async function appendAudit(
@@ -1581,21 +1844,33 @@ function normalizeFingerprint(value: string | undefined): string | null {
 function payloadHash(value: unknown): string {
   return sha256(canonicalJson(value));
 }
-function batchFingerprint(
-  sourceFileHash: string,
-  templateVersion: string,
-  rows: readonly LegacyImportRow[],
-): string {
-  const identities = rows
-    .map((row) => ({
-      sourceRecordId: sourceRecordIdOf(row),
-      rowFingerprint: payloadHash(row),
-    }))
-    .sort((left, right) =>
-      left.sourceRecordId.localeCompare(right.sourceRecordId),
-    );
+function batchFingerprint(input: {
+  source: string;
+  sourceBatchId: string;
+  sourceFileHash: string;
+  templateVersion: string;
+  expectedRecords: number;
+  sampleRequired: number;
+  controlTotalMinorUnits: string | null;
+  rows: readonly LegacyImportRow[];
+}): string {
   return sha256(
-    canonicalJson({ sourceFileHash, templateVersion, rows: identities }),
+    canonicalJson({
+      source: input.source,
+      sourceBatchId: input.sourceBatchId,
+      sourceFileHash: input.sourceFileHash,
+      templateVersion: input.templateVersion,
+      expectedRecords: input.expectedRecords,
+      sampleRequired: input.sampleRequired,
+      controlTotalMinorUnits: input.controlTotalMinorUnits,
+      rows: input.rows.map((row, index) => ({
+        position: index,
+        sourceRecordId: sourceRecordIdOf(row),
+        sourceRowNumber:
+          row.sourceRowNumber ?? numberField(row, "source_row_number") ?? null,
+        rowFingerprint: payloadHash(row),
+      })),
+    }),
   );
 }
 

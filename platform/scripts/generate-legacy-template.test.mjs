@@ -38,6 +38,7 @@ test("legacy migration template is deterministic and non-executable", async () =
     "current_balance_minor_units",
     "arrears_minor_units",
     "repayment_history_json",
+    "installment_schedule_json",
     "attachment_document_id",
   ]) {
     assert.ok(first.schema.required.includes(required), required);

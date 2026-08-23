@@ -102,6 +102,7 @@ export interface StaffReportsApi {
       status?: string;
       asOfDate?: string;
       includePersonalData?: boolean;
+      cursor?: string;
     },
   ): Promise<Record<string, unknown>>;
   exportReport(input: {
@@ -118,7 +119,7 @@ export interface StaffMigrationApi {
   validate(batchId: string): Promise<Record<string, unknown>>;
   verify(
     batchId: string,
-    sampleRecordIds?: readonly string[],
+    sampleRecordIds: readonly string[],
   ): Promise<Record<string, unknown>>;
   approve(
     batchId: string,
@@ -356,6 +357,7 @@ export class FetchStaffApi
       status?: string;
       asOfDate?: string;
       includePersonalData?: boolean;
+      cursor?: string;
     } = {},
   ): Promise<Record<string, unknown>> {
     const query = new URLSearchParams();
@@ -363,6 +365,7 @@ export class FetchStaffApi
     if (filters.asOfDate !== undefined) query.set("asOfDate", filters.asOfDate);
     if (filters.includePersonalData === true)
       query.set("includePersonalData", "true");
+    if (filters.cursor !== undefined) query.set("cursor", filters.cursor);
     const suffix = query.toString() === "" ? "" : `?${query.toString()}`;
     const body = await this.request(`/v1/staff/reports/${name}${suffix}`);
     if (!isRecord(body)) throw malformedStaff("MALFORMED_REPORT");
@@ -419,13 +422,13 @@ export class FetchStaffApi
 
   async verify(
     batchId: string,
-    sampleRecordIds?: readonly string[],
+    sampleRecordIds: readonly string[],
   ): Promise<Record<string, unknown>> {
     const body = await this.request(
       `/v1/staff/migrations/${encodeURIComponent(batchId)}/verify`,
       {
         method: "POST",
-        body: sampleRecordIds === undefined ? {} : { sampleRecordIds },
+        body: { sampleRecordIds },
       },
     );
     if (!isRecord(body)) throw malformedStaff("MALFORMED_MIGRATION_BATCH");

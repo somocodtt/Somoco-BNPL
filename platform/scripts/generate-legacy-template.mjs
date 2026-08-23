@@ -31,6 +31,7 @@ export const HEADERS = Object.freeze([
   "current_balance_minor_units",
   "arrears_minor_units",
   "repayment_history_json",
+  "installment_schedule_json",
   "attachment_document_id",
 ]);
 
@@ -67,12 +68,23 @@ export function generateLegacyTemplate(version = TEMPLATE_VERSION) {
       "current_balance_minor_units",
       "arrears_minor_units",
       "repayment_history_json",
+      "installment_schedule_json",
       "attachment_document_id",
     ],
     properties: Object.fromEntries(
       HEADERS.map((header) => [
         header,
-        { type: header === "source_row_number" ? "integer" : "string" },
+        header === "source_row_number"
+          ? { type: "integer" }
+          : ["repayment_history_json", "installment_schedule_json"].includes(
+                header,
+              )
+            ? {
+                type: "string",
+                contentMediaType: "application/json",
+                pattern: "^\\s*\\[.*\\]\\s*$",
+              }
+            : { type: "string" },
       ]),
     ),
     anyOf: [

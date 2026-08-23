@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(27);
+    expect(before.rows[0]?.count).toBe(28);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1438,7 +1438,7 @@ describe("populated legacy schema migration", () => {
     });
   });
 
-  it("preserves populated migration evidence and enforces append-only source columns in 0026", async () => {
+  it("preserves populated migration evidence and enforces append-only lifecycles in 0027", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
       "0002_lovely_maginty.sql",
@@ -1485,6 +1485,10 @@ describe("populated legacy schema migration", () => {
 
     await applyMigrationFile(pool, "0025_bumpy_kang.sql");
     await applyMigrationFile(pool, "0026_loose_stellaris.sql");
+    await applyMigrationFile(
+      pool,
+      "0027_complete_export_and_migration_lifecycles.sql",
+    );
 
     const preserved = await pool.query<{
       source_record_id: string;
@@ -1501,6 +1505,44 @@ describe("populated legacy schema migration", () => {
       payload,
       template_version: "legacy-v1",
     });
+
+    const baseline = await pool.query<{
+      event_type: string;
+      status: string;
+    }>(
+      `select event_type, status
+         from migration_batch_transition
+        where migration_batch_id = $1`,
+      [batchId],
+    );
+    expect(baseline.rows).toEqual([
+      { event_type: "CORRECTED", status: "QUARANTINED" },
+    ]);
+
+    await expect(
+      pool.query(
+        `update migration_batch set status = 'VALIDATED' where id = $1`,
+        [batchId],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(`delete from migration_batch where id = $1`, [batchId]),
+    ).rejects.toMatchObject({ code: "55000" });
+    const transitionId = await pool.query<{ id: string }>(
+      `select id from migration_batch_transition where migration_batch_id = $1`,
+      [batchId],
+    );
+    await expect(
+      pool.query(
+        `update migration_batch_transition set status = 'VALIDATED' where id = $1`,
+        [transitionId.rows[0]!.id],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(`delete from migration_batch_transition where id = $1`, [
+        transitionId.rows[0]!.id,
+      ]),
+    ).rejects.toMatchObject({ code: "55000" });
 
     await expect(
       pool.query(`update migration_record set status = 'VALID' where id = $1`, [

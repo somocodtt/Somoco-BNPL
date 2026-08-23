@@ -157,7 +157,9 @@ export {
   type PaymentSettlementBatch,
 } from "./repositories/payments.js";
 export {
+  appendReportExportFailedEvent,
   appendReportExportReadyEvent,
+  type FailReportExportInput,
   type CompleteReportExportInput,
 } from "./repositories/reports.js";
 export { withTransaction, type DatabaseTransaction } from "./transaction.js";

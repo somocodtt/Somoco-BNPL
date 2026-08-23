@@ -24,6 +24,7 @@ export async function registerReportRoutes(
         status?: string;
         asOfDate?: string;
         includePersonalData?: string;
+        cursor?: string;
       };
     }>(
       `/v1/staff/reports/${name}`,
@@ -37,6 +38,7 @@ export async function registerReportRoutes(
               status: { type: "string", maxLength: 64 },
               asOfDate: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
               includePersonalData: { type: "string", enum: ["true", "false"] },
+              cursor: { type: "string", maxLength: 512 },
             },
           },
         },
@@ -53,6 +55,9 @@ export async function registerReportRoutes(
           ...(request.query.includePersonalData === "true"
             ? { includePersonalData: true }
             : {}),
+          ...(request.query.cursor === undefined
+            ? {}
+            : { cursor: request.query.cursor }),
         };
         const result = await reports[name]({ actor, filters });
         return reply.send(result);

@@ -1,19 +1,53 @@
+import { createHash } from "node:crypto";
+import { sql } from "../../../../packages/db/node_modules/drizzle-orm/index.js";
 import {
+  appendReportExportFailedEvent,
   appendReportExportReadyEvent,
   type Database,
   type OutboxMessage,
 } from "@somo/db";
+import { getInternalDatabase } from "../../../../packages/db/src/client.js";
 import {
   createOutboxHandler,
   PermanentWorkerError,
   type OutboxHandler,
 } from "./dispatch-outbox.js";
 
+export type ReportName = "operations" | "portfolio" | "audit" | "migration";
+export type ReportFormat = "CSV" | "JSON";
+export type ReportClassification = "REDACTED" | "PERSONAL_DATA";
+
+export interface ReportExportJob {
+  exportId: string;
+  requesterStaffUserId: string;
+  requestId: string;
+  report: ReportName;
+  format: ReportFormat;
+  dataClassification: ReportClassification;
+  filters: Record<string, unknown>;
+  filtersFingerprint: string;
+  watermark: string;
+  status: "QUEUED" | "READY" | "FAILED";
+}
+
+export interface ReportExportPage {
+  rows: readonly Record<string, unknown>[];
+}
+
 export interface ReportExportCompletionPort {
+  load(exportId: string): Promise<ReportExportJob | null>;
+  generate(job: ReportExportJob): AsyncIterable<ReportExportPage>;
   complete(input: {
     exportId: string;
     eventKey: string;
     contentHash: string;
+    rowCount: number;
+    artifact: Record<string, unknown>;
+  }): Promise<boolean>;
+  fail(input: {
+    exportId: string;
+    eventKey: string;
+    reasonCode: string;
     artifact: Record<string, unknown>;
   }): Promise<boolean>;
 }
@@ -21,8 +55,59 @@ export interface ReportExportCompletionPort {
 export function createDatabaseReportExportCompletionPort(
   database: Database,
 ): ReportExportCompletionPort {
+  const internal = getInternalDatabase(database);
   return {
+    async load(exportId) {
+      const result = await internal.execute<{
+        id: string;
+        requester_staff_user_id: string;
+        request_id: string;
+        report_type: string;
+        format: ReportFormat;
+        data_classification: ReportClassification;
+        filters: Record<string, unknown>;
+        artifact: Record<string, unknown>;
+        status: "QUEUED" | "READY" | "FAILED";
+      }>(sql`
+        select e.id, e.requester_staff_user_id, e.request_id, e.report_type,
+               e.format, e.data_classification, e.filters, e.artifact, e.status
+          from report_export e
+         where e.id = ${exportId}
+         limit 1
+      `);
+      const row = result.rows[0];
+      if (row === undefined) return null;
+      const event = await internal.execute<{
+        event_type: "QUEUED" | "READY" | "FAILED";
+        artifact: Record<string, unknown>;
+      }>(sql`
+        select event_type, artifact
+          from report_export_event
+         where report_export_id = ${exportId}
+         order by created_at desc, id desc
+         limit 1
+      `);
+      const artifact = event.rows[0]?.artifact ?? row.artifact;
+      const filtersFingerprint =
+        typeof artifact.filtersFingerprint === "string"
+          ? artifact.filtersFingerprint
+          : sha256(canonicalJson(row.filters));
+      return {
+        exportId: row.id,
+        requesterStaffUserId: row.requester_staff_user_id,
+        requestId: row.request_id,
+        report: row.report_type.toLowerCase() as ReportName,
+        format: row.format,
+        dataClassification: row.data_classification,
+        filters: row.filters,
+        filtersFingerprint,
+        watermark: String(artifact.watermark ?? ""),
+        status: event.rows[0]?.event_type ?? row.status,
+      };
+    },
+    generate: (job) => databaseReportPages(internal, job),
     complete: (input) => appendReportExportReadyEvent(database, input),
+    fail: (input) => appendReportExportFailedEvent(database, input),
   };
 }
 
@@ -31,55 +116,343 @@ export function createReportExportHandler(
 ): OutboxHandler {
   return createOutboxHandler([], async (message: OutboxMessage) => {
     const payload = reportExportPayload(message.payload);
-    const contentHash = sha256(payload.content);
-    if (contentHash !== payload.expectedContentHash)
-      throw new PermanentWorkerError("REPORT_EXPORT_CONTENT_HASH_MISMATCH");
-    await port.complete({
-      exportId: payload.exportId,
-      eventKey: `report-export:${payload.exportId}:READY`,
-      contentHash,
-      artifact: {
-        content: payload.content,
+    if (
+      message.aggregateType !== "report_export" ||
+      message.aggregateId !== payload.exportId
+    )
+      return failPermanently(
+        port,
+        payload.exportId,
+        "REPORT_EXPORT_AGGREGATE_MISMATCH",
+        message,
+      );
+    const job = await port.load(payload.exportId);
+    if (job === null) throw new PermanentWorkerError("REPORT_EXPORT_NOT_FOUND");
+    if (job.status !== "QUEUED")
+      return { exportId: payload.exportId, status: job.status };
+    try {
+      if (
+        job.requesterStaffUserId !== payload.requesterStaffUserId ||
+        job.requestId !== payload.requestId ||
+        job.report !== payload.report ||
+        job.format !== payload.format ||
+        job.dataClassification !== payload.dataClassification ||
+        job.filtersFingerprint !== payload.filtersFingerprint ||
+        canonicalJson(job.filters) !== canonicalJson(payload.filters) ||
+        payload.version !== 1
+      )
+        throw new PermanentWorkerError("REPORT_EXPORT_REQUEST_MISMATCH");
+      const rows: Record<string, unknown>[] = [];
+      for await (const page of port.generate(job)) {
+        if (!Array.isArray(page.rows))
+          throw new PermanentWorkerError("REPORT_EXPORT_PAGE_INVALID");
+        for (const row of page.rows) {
+          if (typeof row !== "object" || row === null || Array.isArray(row))
+            throw new PermanentWorkerError("REPORT_EXPORT_ROW_INVALID");
+          rows.push(row as Record<string, unknown>);
+        }
+      }
+      const content = renderExport(job, rows);
+      const contentHash = sha256(content);
+      await port.complete({
+        exportId: job.exportId,
+        eventKey: `report-export:${job.exportId}:READY`,
         contentHash,
-        format: payload.format,
-        watermark: payload.watermark,
+        rowCount: rows.length,
+        artifact: {
+          content,
+          contentHash,
+          rowCount: rows.length,
+          requesterStaffUserId: job.requesterStaffUserId,
+          watermark: job.watermark,
+          format: job.format,
+          dataClassification: job.dataClassification,
+          noRawDocumentUrls: true,
+          workerOutboxMessageId: message.id,
+        },
+      });
+      return { exportId: job.exportId, status: "READY", rowCount: rows.length };
+    } catch (error) {
+      if (error instanceof PermanentWorkerError) {
+        await port.fail({
+          exportId: job.exportId,
+          eventKey: `report-export:${job.exportId}:FAILED:${error.code}`,
+          reasonCode: error.code,
+          artifact: {
+            requesterStaffUserId: job.requesterStaffUserId,
+            watermark: job.watermark,
+            format: job.format,
+            failureReasonCode: error.code,
+            noRawDocumentUrls: true,
+          },
+        });
+      }
+      throw error;
+    }
+  });
+}
+
+async function failPermanently(
+  port: ReportExportCompletionPort,
+  exportId: string,
+  reasonCode: string,
+  message: OutboxMessage,
+) {
+  const job = await port.load(exportId);
+  if (job !== null && job.status === "QUEUED")
+    await port.fail({
+      exportId,
+      eventKey: `report-export:${exportId}:FAILED:${reasonCode}`,
+      reasonCode,
+      artifact: {
+        requesterStaffUserId: job.requesterStaffUserId,
+        watermark: job.watermark,
+        failureReasonCode: reasonCode,
         noRawDocumentUrls: true,
         workerOutboxMessageId: message.id,
       },
     });
-    return { exportId: payload.exportId, status: "READY" };
-  });
+  throw new PermanentWorkerError(reasonCode);
 }
 
 function reportExportPayload(payload: unknown): {
   exportId: string;
-  content: string;
-  expectedContentHash: string;
-  format: "CSV" | "JSON";
-  watermark: string;
+  requesterStaffUserId: string;
+  requestId: string;
+  report: ReportName;
+  format: ReportFormat;
+  dataClassification: ReportClassification;
+  filters: Record<string, unknown>;
+  filtersFingerprint: string;
+  version: 1;
 } {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload))
     throw new PermanentWorkerError("REPORT_EXPORT_PAYLOAD_INVALID");
   const value = payload as Record<string, unknown>;
   if (
     typeof value.exportId !== "string" ||
-    typeof value.content !== "string" ||
-    typeof value.expectedContentHash !== "string" ||
-    !/^[0-9a-f]{64}$/.test(value.expectedContentHash) ||
+    typeof value.requesterStaffUserId !== "string" ||
+    typeof value.requestId !== "string" ||
+    !isReportName(value.report) ||
     (value.format !== "CSV" && value.format !== "JSON") ||
-    typeof value.watermark !== "string"
+    (value.dataClassification !== "REDACTED" &&
+      value.dataClassification !== "PERSONAL_DATA") ||
+    typeof value.filtersFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.filtersFingerprint) ||
+    typeof value.filters !== "object" ||
+    value.filters === null ||
+    Array.isArray(value.filters) ||
+    value.version !== 1 ||
+    "content" in value ||
+    "expectedContentHash" in value
   )
     throw new PermanentWorkerError("REPORT_EXPORT_PAYLOAD_INVALID");
   return {
     exportId: value.exportId,
-    content: value.content,
-    expectedContentHash: value.expectedContentHash,
+    requesterStaffUserId: value.requesterStaffUserId,
+    requestId: value.requestId,
+    report: value.report,
     format: value.format,
-    watermark: value.watermark,
+    dataClassification: value.dataClassification,
+    filters: value.filters as Record<string, unknown>,
+    filtersFingerprint: value.filtersFingerprint,
+    version: 1,
   };
+}
+
+async function* databaseReportPages(
+  db: ReturnType<typeof getInternalDatabase>,
+  job: ReportExportJob,
+): AsyncIterable<ReportExportPage> {
+  let cursor: { createdAt: string; id: string } | null = null;
+  for (;;) {
+    const result = await selectReportPage(db, job, cursor);
+    if (result.rows.length === 0) return;
+    yield {
+      rows: result.rows.map((row) => safeRow(row, job.dataClassification)),
+    };
+    if (result.rows.length < 500) return;
+    const last = result.rows.at(-1)! as Record<string, unknown>;
+    cursor = {
+      createdAt: String(last.created_at_cursor),
+      id: String(last.id),
+    };
+  }
+}
+
+async function selectReportPage(
+  db: ReturnType<typeof getInternalDatabase>,
+  job: ReportExportJob,
+  cursor: { createdAt: string; id: string } | null,
+) {
+  const status =
+    typeof job.filters.status === "string" ? job.filters.status : null;
+  const asOf =
+    typeof job.filters.asOfDate === "string" ? job.filters.asOfDate : null;
+  const statusClause =
+    status === null || job.report === "audit"
+      ? sql`true`
+      : sql`status::text = ${status}`;
+  const asOfClause =
+    asOf === null
+      ? sql`true`
+      : job.report === "audit"
+        ? sql`occurred_at < (${asOf}::date + interval '1 day')`
+        : sql`created_at < (${asOf}::date + interval '1 day')`;
+  const isDescending = job.report === "audit" || job.report === "migration";
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : isDescending
+        ? job.report === "audit"
+          ? sql`(occurred_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`
+          : sql`(created_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`
+        : sql`(created_at, id) > (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`;
+  const order = isDescending ? sql`desc` : sql`asc`;
+  const timeColumn =
+    job.report === "audit" ? sql`occurred_at` : sql`created_at`;
+  if (job.report === "operations")
+    return db.execute<{
+      id: string;
+      status: string;
+      created_at: Date;
+      created_at_cursor: string;
+    }>(sql`
+      select id, status, created_at, created_at::text as created_at_cursor from application
+       where ${statusClause} and ${asOfClause} and ${cursorClause}
+       order by ${timeColumn} ${order}, id ${order} limit 500
+    `);
+  if (job.report === "portfolio")
+    return db.execute<{
+      id: string;
+      status: string;
+      reference: string;
+      created_at: Date;
+      created_at_cursor: string;
+    }>(sql`
+      select id, status, reference, created_at, created_at::text as created_at_cursor from contract
+       where ${statusClause} and ${asOfClause} and ${cursorClause}
+       order by ${timeColumn} ${order}, id ${order} limit 500
+    `);
+  if (job.report === "audit")
+    return db.execute<{
+      id: string;
+      action: string;
+      aggregate_type: string;
+      created_at: Date;
+      created_at_cursor: string;
+    }>(sql`
+      select id, action, aggregate_type, occurred_at as created_at, occurred_at::text as created_at_cursor from audit_event
+       where ${asOfClause} and ${cursorClause}
+       order by occurred_at ${order}, id ${order} limit 500
+    `);
+  return db.execute<{
+    id: string;
+    status: string;
+    source: string;
+    source_batch_id: string;
+    created_at: Date;
+    created_at_cursor: string;
+  }>(sql`
+    select id, status, source, source_batch_id, created_at, created_at::text as created_at_cursor from migration_batch
+     where ${asOfClause} and ${cursorClause}
+     order by created_at ${order}, id ${order} limit 500
+  `);
+}
+
+function safeRow(
+  row: Record<string, unknown>,
+  classification: ReportClassification,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...row };
+  delete result.created_at;
+  delete result.created_at_cursor;
+  if (classification === "REDACTED" && typeof result.id === "string")
+    result.id = `ref-${sha256(result.id).slice(0, 12)}`;
+  return result;
+}
+
+function renderExport(
+  job: ReportExportJob,
+  rows: readonly Record<string, unknown>[],
+): string {
+  const safeRows = rows.map(
+    (row) => formulaSafeValue(row) as Record<string, unknown>,
+  );
+  if (job.format === "JSON")
+    return JSON.stringify({
+      watermark: job.watermark,
+      report: job.report,
+      rows: safeRows,
+    });
+  const columns = [
+    ...new Set(safeRows.flatMap((row) => Object.keys(row))),
+  ].sort();
+  const line = (row: Record<string, unknown>) =>
+    columns.map((column) => csvCell(row[column])).join(",");
+  const csv =
+    columns.length === 0
+      ? ""
+      : [columns.join(","), ...safeRows.map(line)].join("\r\n") + "\r\n";
+  return `# ${job.watermark}\r\n${csv}`;
+}
+
+function formulaSafeValue(value: unknown): unknown {
+  if (typeof value === "string")
+    return startsWithFormulaCharacter(value) ? `'${value}` : value;
+  if (Array.isArray(value)) return value.map(formulaSafeValue);
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        formulaSafeValue(item),
+      ]),
+    );
+  return value;
+}
+
+function csvCell(value: unknown): string {
+  let text = value === null || value === undefined ? "" : String(value);
+  if (startsWithFormulaCharacter(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function startsWithFormulaCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    const character = value.charAt(index);
+    if (code <= 0x1f || /\s/u.test(character)) continue;
+    return (
+      character === "=" ||
+      character === "+" ||
+      character === "-" ||
+      character === "@"
+    );
+  }
+  return false;
+}
+
+function isReportName(value: unknown): value is ReportName {
+  return (
+    value === "operations" ||
+    value === "portfolio" ||
+    value === "audit" ||
+    value === "migration"
+  );
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+    )
+    .join(",")}}`;
 }
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
-import { createHash } from "node:crypto";

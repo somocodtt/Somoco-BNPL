@@ -68,14 +68,22 @@ export function ReportsWorkspace({
           onClick={() => {
             setNotice("");
             void api.exportReport({ report: reportName, format: "CSV" }).then(
-              (value) => {
-                downloadArtifact(value, reportName);
+              async (created) => {
+                const value = await waitForExport(api, created);
+                if (
+                  stringValue(value.status) === "READY" &&
+                  stringValue(value.content) !== null
+                )
+                  downloadArtifact(value, reportName);
+                const failure = stringValue(value.failureReasonCode);
                 setNotice(
-                  stringValue(value.status) === "QUEUED"
-                    ? `Export ${stringValue(value.id) ?? "created"} is queued for worker delivery.`
-                    : stringValue(value.content) === null
-                      ? `Export ${stringValue(value.id) ?? "created"} attributed to the requester.`
-                      : `Export ${stringValue(value.id) ?? "created"} downloaded and attributed to the requester.`,
+                  stringValue(value.status) === "FAILED"
+                    ? `Export ${stringValue(value.id) ?? "created"} failed: ${failure ?? "worker error"}.`
+                    : stringValue(value.status) === "QUEUED"
+                      ? `Export ${stringValue(value.id) ?? "created"} is queued for worker delivery.`
+                      : stringValue(value.content) === null
+                        ? `Export ${stringValue(value.id) ?? "created"} attributed to the requester.`
+                        : `Export ${stringValue(value.id) ?? "created"} downloaded and attributed to the requester.`,
                 );
               },
               () => setNotice("The export could not be created."),
@@ -145,6 +153,9 @@ function MigrationPanel({
   const [migrationFile, setMigrationFile] = useState<File | null>(null);
   const [financialEvidenceHashes, setFinancialEvidenceHashes] = useState<
     Record<string, string>
+  >({});
+  const [selectedSamples, setSelectedSamples] = useState<
+    Record<string, readonly string[]>
   >({});
   const canVerify = roles.includes("VERIFICATION_OFFICER");
   const canImport = roles.some((role) =>
@@ -219,16 +230,57 @@ function MigrationPanel({
                   {stringValue(batch.activatedAt) ?? "—"}
                 </p>
                 {canVerify && status === "VALIDATED" ? (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void api
-                        .verify(id)
-                        .catch(() => setError("The batch verification failed."))
-                    }
-                  >
-                    Verify sample
-                  </button>
+                  <>
+                    <fieldset>
+                      <legend>
+                        Select sample rows ({selectedSamples[id]?.length ?? 0}/
+                        {stringValue(batch.sampleRequired) ?? "0"})
+                      </legend>
+                      {Array.isArray(batch.records)
+                        ? batch.records.map((record) => {
+                            if (!isRecord(record)) return null;
+                            const recordId = stringValue(record.id);
+                            if (recordId === null) return null;
+                            const selected = selectedSamples[id] ?? [];
+                            return (
+                              <label key={recordId}>
+                                <input
+                                  type="checkbox"
+                                  checked={selected.includes(recordId)}
+                                  onChange={(event) =>
+                                    setSelectedSamples((current) => ({
+                                      ...current,
+                                      [id]: event.target.checked
+                                        ? [...selected, recordId]
+                                        : selected.filter(
+                                            (value) => value !== recordId,
+                                          ),
+                                    }))
+                                  }
+                                />
+                                {recordId}
+                              </label>
+                            );
+                          })
+                        : null}
+                    </fieldset>
+                    <button
+                      type="button"
+                      disabled={
+                        (selectedSamples[id]?.length ?? 0) !==
+                        Number(batch.sampleRequired ?? 0)
+                      }
+                      onClick={() =>
+                        void api
+                          .verify(id, selectedSamples[id] ?? [])
+                          .catch(() =>
+                            setError("The batch verification failed."),
+                          )
+                      }
+                    >
+                      Verify sample
+                    </button>
+                  </>
                 ) : null}
                 {canImport && status === "QUARANTINED" ? (
                   <button
@@ -250,6 +302,7 @@ function MigrationPanel({
                         {
                           records: batch.records ?? [],
                           events: batch.events ?? [],
+                          sampleEvidence: batch.sampleEvidence ?? [],
                         },
                         null,
                         2,
@@ -334,6 +387,23 @@ function reportTitle(report: StaffReportName): string {
     default:
       return "Operations and portfolio reporting";
   }
+}
+
+async function waitForExport(
+  api: StaffReportsApi,
+  created: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const id = stringValue(created.id);
+  if (id === null || stringValue(created.status) !== "QUEUED") return created;
+  let latest = created;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const next = await api.getExport(id);
+    if (next !== undefined) latest = next;
+    const status = stringValue(latest.status);
+    if (status === "READY" || status === "FAILED") return latest;
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  }
+  return latest;
 }
 
 function downloadArtifact(

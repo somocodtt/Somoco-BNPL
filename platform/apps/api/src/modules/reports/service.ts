@@ -19,6 +19,7 @@ export interface ReportFilters {
   asOfDate?: string;
   includePersonalData?: boolean;
   staffUserId?: string;
+  cursor?: string;
   [key: string]: unknown;
 }
 
@@ -33,6 +34,7 @@ export interface ReportResult {
     limit: number;
     truncated: boolean;
     nextCursor: string | null;
+    totalRows: number | null;
   };
   migrationTotals: {
     batches: number;
@@ -55,6 +57,7 @@ export interface ReportExportResult {
   watermark: string;
   content: string;
   status: "QUEUED" | "READY" | "FAILED";
+  failureReasonCode?: string | null;
 }
 
 export interface ReportService {
@@ -116,26 +119,31 @@ export function createReportService(options: {
     const internal = getInternalDatabase(options.database);
     const safeFilters = sanitizeFilters(filters);
     const asOfDate = asOfDateFilter(safeFilters);
+    const cursor = decodeCursor(
+      typeof safeFilters.cursor === "string" ? safeFilters.cursor : null,
+    );
     const rows =
       report === "operations"
-        ? await listOperations(internal, safeFilters, dataClassification)
+        ? await listOperations(
+            internal,
+            safeFilters,
+            dataClassification,
+            cursor,
+          )
         : report === "portfolio"
-          ? await listPortfolio(internal, safeFilters, dataClassification)
+          ? await listPortfolio(
+              internal,
+              safeFilters,
+              dataClassification,
+              cursor,
+            )
           : report === "audit"
-            ? await listAudit(internal, safeFilters, dataClassification)
-            : await listMigration(internal, safeFilters);
+            ? await listAudit(internal, safeFilters, dataClassification, cursor)
+            : await listMigration(internal, safeFilters, cursor);
     const migrationTotals = await getMigrationTotals(internal, asOfDate);
     const truncated = rows.length === REPORT_PAGE_LIMIT;
     const lastRow = rows.at(-1);
-    const nextCursor = truncated
-      ? String(
-          lastRow?.applicationId ??
-            lastRow?.contractId ??
-            lastRow?.id ??
-            lastRow?.batchId ??
-            "",
-        )
-      : null;
+    const nextCursor = truncated ? cursorFromRow(report, lastRow) : null;
     return {
       report,
       generatedAt: new Date().toISOString(),
@@ -147,6 +155,7 @@ export function createReportService(options: {
         limit: REPORT_PAGE_LIMIT,
         truncated,
         nextCursor,
+        totalRows: truncated ? null : rows.length,
       },
       migrationTotals,
       summary: summarize(report, rows, migrationTotals),
@@ -172,24 +181,30 @@ export function createReportService(options: {
           "This role cannot export personal data.",
         );
       }
-      const content =
-        input.format === "CSV"
-          ? serializeCsv(report.rows)
-          : JSON.stringify({
-              report: report.report,
-              generatedAt: report.generatedAt,
-              dataClassification: report.dataClassification,
-              rows: report.rows,
-            });
-      const contentHash = sha256(content);
       const watermark = `SOMOCO CONFIDENTIAL | requester=${input.actor.staffUserId} | request=${input.requestId} | classification=${report.dataClassification}`;
+      const exportRowCount = report.pagination.truncated
+        ? await countReportRows(
+            getInternalDatabase(options.database),
+            report.report,
+            report.filters,
+          )
+        : report.rowCount;
       const status =
-        report.rowCount > INLINE_EXPORT_ROW_LIMIT ? "QUEUED" : "READY";
+        exportRowCount > INLINE_EXPORT_ROW_LIMIT ? "QUEUED" : "READY";
+      const content =
+        status === "READY"
+          ? exportContent(report, input.format, watermark)
+          : "";
+      const contentHash = status === "READY" ? sha256(content) : "0".repeat(64);
+      const filtersFingerprint = sha256(canonicalJson(report.filters));
       const artifact = {
         watermark,
         generatedAt: report.generatedAt,
         contentHash,
         format: input.format,
+        report: report.report,
+        filtersFingerprint,
+        version: 1,
         noRawDocumentUrls: true,
         ...(status === "READY" ? { content } : {}),
       };
@@ -205,7 +220,7 @@ export function createReportService(options: {
           format: input.format,
           dataClassification: report.dataClassification,
           filters: report.filters,
-          rowCount: report.rowCount,
+          rowCount: exportRowCount,
           contentHash,
           artifact,
           status,
@@ -215,11 +230,14 @@ export function createReportService(options: {
           reportExportId: id,
           eventKey: `report-export:${id}:${status === "QUEUED" ? "QUEUED" : "READY"}`,
           eventType: status,
-          contentHash,
+          contentHash: status === "READY" ? contentHash : null,
           artifact: {
             watermark,
             generatedAt: report.generatedAt,
             format: input.format,
+            report: report.report,
+            filtersFingerprint,
+            version: 1,
             noRawDocumentUrls: true,
             ...(status === "READY" ? { content } : {}),
           },
@@ -239,10 +257,9 @@ export function createReportService(options: {
               requesterStaffUserId: input.actor.staffUserId,
               requestId: input.requestId,
               dataClassification: report.dataClassification,
-              expectedRowCount: report.rowCount,
-              expectedContentHash: contentHash,
-              watermark,
-              content,
+              expectedRowCount: exportRowCount,
+              filtersFingerprint,
+              version: 1,
             },
           });
         }
@@ -257,7 +274,7 @@ export function createReportService(options: {
                report: report.report,
                format: input.format,
                dataClassification: report.dataClassification,
-               rowCount: report.rowCount,
+               rowCount: exportRowCount,
                contentHash,
                filters: report.filters,
              })}::jsonb, now())
@@ -270,10 +287,11 @@ export function createReportService(options: {
         dataClassification: report.dataClassification,
         requesterStaffUserId: input.actor.staffUserId,
         requestId: input.requestId,
-        rowCount: report.rowCount,
+        rowCount: exportRowCount,
         contentHash,
         watermark,
         content: status === "READY" ? content : "",
+        failureReasonCode: null,
         status,
       };
     },
@@ -312,9 +330,10 @@ export function createReportService(options: {
       const eventResult = await internal.execute<{
         event_type: "QUEUED" | "READY" | "FAILED";
         content_hash: string | null;
+        reason_code: string | null;
         artifact: Record<string, unknown>;
       }>(sql`
-        select event_type, content_hash, artifact
+        select event_type, content_hash, reason_code, artifact
           from report_export_event
          where report_export_id = ${input.exportId}
          order by created_at desc, id desc
@@ -329,10 +348,14 @@ export function createReportService(options: {
         dataClassification: row.data_classification,
         requesterStaffUserId: row.requester_staff_user_id,
         requestId: row.request_id,
-        rowCount: row.row_count,
+        rowCount:
+          typeof artifact.rowCount === "number"
+            ? artifact.rowCount
+            : row.row_count,
         contentHash: event?.content_hash ?? row.content_hash,
         watermark: String(artifact.watermark ?? ""),
         content: typeof artifact.content === "string" ? artifact.content : "",
+        failureReasonCode: event?.reason_code ?? null,
         status: event?.event_type ?? row.status,
       };
     },
@@ -399,6 +422,7 @@ async function listOperations(
   db: ReturnType<typeof getInternalDatabase>,
   filters: Record<string, unknown>,
   classification: ReportClassification,
+  cursor: ReportCursor | null,
 ): Promise<readonly Record<string, unknown>[]> {
   const status = typeof filters.status === "string" ? filters.status : null;
   const statusClause =
@@ -446,10 +470,15 @@ async function listOperations(
       : sql`rc.created_at < (${asOfDate}::date + interval '1 day')`;
   const snapshotClause =
     asOfDate === null ? sql`true` : sql`x.as_of_date <= ${asOfDate}::date`;
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : sql`(a.created_at > ${cursor.createdAt}::timestamptz or (a.created_at = ${cursor.createdAt}::timestamptz and a.id > ${cursor.id}::uuid))`;
   const result = await db.execute<{
     id: string;
     status: string;
     created_at: Date;
+    created_at_cursor: string;
     submitted_at: Date | null;
     applicant_person_id: string;
     nia_exceptions: number;
@@ -463,7 +492,7 @@ async function listOperations(
     recovery_cases: number;
     integration_exceptions: number;
   }>(sql`
-    select a.id, a.status, a.created_at, a.submitted_at,
+    select a.id, a.status, a.created_at, a.created_at::text as created_at_cursor, a.submitted_at,
            a.applicant_person_id,
            (select count(*)::int from privacy.identity_check i
              where i.person_id = a.applicant_person_id
@@ -495,13 +524,14 @@ async function listOperations(
            (select count(*)::int from recovery_case r join contract c on c.id = r.contract_id where c.application_id = a.id and ${recoveryAsOfClause} and ${contractAsOfClause} and r.status <> 'CLOSED') as recovery_cases,
            (select count(*)::int from reconciliation_case rc join payment_transaction p on p.id = rc.payment_transaction_id join contract c on c.id = p.contract_id where c.application_id = a.id and ${reconciliationAsOfClause} and ${paymentAsOfClause} and ${contractAsOfClause} and rc.status <> 'RESOLVED') as integration_exceptions
       from application a
-     where ${statusClause} and ${applicationAsOfClause}
+     where ${statusClause} and ${applicationAsOfClause} and ${cursorClause}
      order by a.created_at asc, a.id asc
      limit 1000
   `);
   return result.rows.map((row) => {
     const base: Record<string, unknown> = {
       applicationId: row.id,
+      createdAt: row.created_at_cursor,
       status: row.status,
       stageAgeSeconds: Math.max(
         0,
@@ -539,6 +569,7 @@ async function listPortfolio(
   db: ReturnType<typeof getInternalDatabase>,
   filters: Record<string, unknown>,
   classification: ReportClassification,
+  cursor: ReportCursor | null,
 ): Promise<readonly Record<string, unknown>[]> {
   const statusClause =
     typeof filters.status === "string"
@@ -583,10 +614,16 @@ async function listPortfolio(
       : sql`p.created_at < (${asOfDate}::date + interval '1 day')`;
   const snapshotClause =
     asOfDate === null ? sql`true` : sql`a.as_of_date <= ${asOfDate}::date`;
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : sql`(c.created_at > ${cursor.createdAt}::timestamptz or (c.created_at = ${cursor.createdAt}::timestamptz and c.id > ${cursor.id}::uuid))`;
   const result = await db.execute<{
     id: string;
     reference: string;
     status: string;
+    created_at: Date;
+    created_at_cursor: string;
     balance: bigint | string;
     ownership_holder: string;
     vehicle_status: string;
@@ -597,7 +634,7 @@ async function listPortfolio(
     recovery_cases: number;
     integration_exceptions: number;
   }>(sql`
-    select c.id, c.reference, c.status, c.outstanding_balance_minor_units as balance,
+    select c.id, c.reference, c.status, c.created_at, c.created_at::text as created_at_cursor, c.outstanding_balance_minor_units as balance,
            c.ownership_holder, vu.status::text as vehicle_status,
            coalesce((select max(a.consecutive_missed_installments)::int from arrears_snapshot a where a.contract_id = c.id and ${snapshotClause}), 0) as consecutive_missed,
            coalesce((select max(a.unpaid_installments)::int from arrears_snapshot a where a.contract_id = c.id and ${snapshotClause}), 0) as total_unpaid,
@@ -628,11 +665,12 @@ async function listPortfolio(
                        and ${paymentAsOfClause}
                        and rc.status <> 'RESOLVED'), 0) as integration_exceptions
       from contract c join vehicle_unit vu on vu.id = c.vehicle_unit_id and ${vehicleAsOfClause}
-     where ${statusClause} and ${asOfClause}
+     where ${statusClause} and ${asOfClause} and ${cursorClause}
      order by c.created_at asc, c.id asc limit 1000
   `);
   return result.rows.map((row) => ({
     contractId: row.id,
+    createdAt: row.created_at_cursor,
     contractReference: row.reference,
     status: row.status,
     currentBalanceMinorUnits: String(row.balance),
@@ -655,12 +693,17 @@ async function listAudit(
   db: ReturnType<typeof getInternalDatabase>,
   filters: Record<string, unknown>,
   classification: ReportClassification,
+  cursor: ReportCursor | null,
 ): Promise<readonly Record<string, unknown>[]> {
   const asOfDate = asOfDateFilter(filters);
   const asOfClause =
     asOfDate === null
       ? sql`true`
       : sql`occurred_at < (${asOfDate}::date + interval '1 day')`;
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : sql`(occurred_at < ${cursor.createdAt}::timestamptz or (occurred_at = ${cursor.createdAt}::timestamptz and id < ${cursor.id}::uuid))`;
   const result = await db.execute<{
     id: string;
     aggregate_type: string;
@@ -668,40 +711,54 @@ async function listAudit(
     actor_staff_user_id: string | null;
     request_id: string | null;
     occurred_at: Date;
+    occurred_at_cursor: string;
     data: unknown;
   }>(sql`
     select id, aggregate_type, action, actor_staff_user_id, request_id,
-           occurred_at, data
+           occurred_at, occurred_at::text as occurred_at_cursor, data
       from audit_event
-     where ${asOfClause}
+     where ${asOfClause} and ${cursorClause}
      order by occurred_at desc, id desc limit 1000
   `);
-  return result.rows.map((row) => ({
-    id: classification === "PERSONAL_DATA" ? row.id : maskedReference(row.id),
-    aggregateType: row.aggregate_type,
-    action: row.action,
-    actorStaffUserId:
-      classification === "PERSONAL_DATA" || row.actor_staff_user_id === null
-        ? row.actor_staff_user_id
-        : maskedReference(row.actor_staff_user_id),
-    requestId:
-      classification === "PERSONAL_DATA" || row.request_id === null
-        ? row.request_id
-        : maskedReference(row.request_id),
-    occurredAt: new Date(row.occurred_at).toISOString(),
-    data: safeAuditData(row.data),
-  }));
+  return result.rows.map((row) => {
+    const mapped: Record<string, unknown> = {
+      id: classification === "PERSONAL_DATA" ? row.id : maskedReference(row.id),
+      aggregateType: row.aggregate_type,
+      action: row.action,
+      actorStaffUserId:
+        classification === "PERSONAL_DATA" || row.actor_staff_user_id === null
+          ? row.actor_staff_user_id
+          : maskedReference(row.actor_staff_user_id),
+      requestId:
+        classification === "PERSONAL_DATA" || row.request_id === null
+          ? row.request_id
+          : maskedReference(row.request_id),
+      occurredAt: new Date(row.occurred_at).toISOString(),
+      cursorCreatedAt: row.occurred_at_cursor,
+      data: safeAuditData(row.data),
+    };
+    Object.defineProperty(mapped, "__cursorId", {
+      value: row.id,
+      enumerable: false,
+    });
+    return mapped;
+  });
 }
 
 async function listMigration(
   db: ReturnType<typeof getInternalDatabase>,
   filters: Record<string, unknown>,
+  cursor: ReportCursor | null,
 ): Promise<readonly Record<string, unknown>[]> {
   const asOfDate = asOfDateFilter(filters);
   const asOfClause =
     asOfDate === null
       ? sql`true`
-      : sql`created_at < (${asOfDate}::date + interval '1 day')`;
+      : sql`b.created_at < (${asOfDate}::date + interval '1 day')`;
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : sql`(b.created_at < ${cursor.createdAt}::timestamptz or (b.created_at = ${cursor.createdAt}::timestamptz and b.id < ${cursor.id}::uuid))`;
   const result = await db.execute<{
     id: string;
     source: string;
@@ -714,20 +771,36 @@ async function listMigration(
     sample_required: number;
     sample_passed: number;
     created_at: Date;
+    created_at_cursor: string;
     verified_by: string | null;
     approved_by: string | null;
     activated_at: Date | null;
   }>(sql`
-      select id, source, source_batch_id, status, expected_records,
-           imported_records, expected_total_minor_units,
-           reconciled_total_minor_units, sample_required, sample_passed,
-           created_at, verified_by, approved_by, activated_at
-      from migration_batch
-     where ${asOfClause}
-     order by created_at desc, id desc limit 1000
+      select b.id, b.source, b.source_batch_id,
+           case when t.id is null then b.status else t.status end as status,
+           b.expected_records,
+           case when t.id is null then b.imported_records else t.imported_records end as imported_records,
+           case when t.id is null then b.expected_total_minor_units else t.expected_total_minor_units end as expected_total_minor_units,
+           case when t.id is null then b.reconciled_total_minor_units else t.reconciled_total_minor_units end as reconciled_total_minor_units,
+           case when t.id is null then b.sample_required else t.sample_required end as sample_required,
+           case when t.id is null then b.sample_passed else t.sample_passed end as sample_passed,
+           b.created_at, b.created_at::text as created_at_cursor,
+           case when t.id is null then b.verified_by else t.verified_by end as verified_by,
+           case when t.id is null then b.approved_by else t.approved_by end as approved_by,
+           case when t.id is null then b.activated_at else t.activated_at end as activated_at
+        from migration_batch b
+        left join lateral (
+          select * from migration_batch_transition
+           where migration_batch_id = b.id
+           order by created_at desc, id desc
+           limit 1
+        ) t on true
+       where ${asOfClause} and ${cursorClause}
+       order by b.created_at desc, b.id desc limit 1000
   `);
   return result.rows.map((row) => ({
     batchId: row.id,
+    createdAt: row.created_at_cursor,
     source: row.source,
     sourceBatchId: row.source_batch_id,
     status: row.status,
@@ -787,19 +860,178 @@ function summarize(
   };
 }
 
+async function countReportRows(
+  db: ReturnType<typeof getInternalDatabase>,
+  report: ReportName,
+  filters: Record<string, unknown>,
+): Promise<number> {
+  const status = typeof filters.status === "string" ? filters.status : null;
+  const asOfDate = asOfDateFilter(filters);
+  const statusClause =
+    status === null || report === "audit"
+      ? sql`true`
+      : report === "operations"
+        ? sql`status::text = ${status}`
+        : sql`status::text = ${status}`;
+  const asOfClause =
+    asOfDate === null
+      ? sql`true`
+      : report === "audit"
+        ? sql`occurred_at < (${asOfDate}::date + interval '1 day')`
+        : sql`created_at < (${asOfDate}::date + interval '1 day')`;
+  const result =
+    report === "operations"
+      ? await db.execute<{ count: number }>(
+          sql`select count(*)::int as count from application where ${statusClause} and ${asOfClause}`,
+        )
+      : report === "portfolio"
+        ? await db.execute<{ count: number }>(
+            sql`select count(*)::int as count from contract where ${statusClause} and ${asOfClause}`,
+          )
+        : report === "audit"
+          ? await db.execute<{ count: number }>(
+              sql`select count(*)::int as count from audit_event where ${asOfClause}`,
+            )
+          : await db.execute<{ count: number }>(
+              sql`select count(*)::int as count from migration_batch where ${asOfClause}`,
+            );
+  return Number(result.rows[0]?.count ?? 0);
+}
+
+interface ReportCursor {
+  createdAt: string;
+  id: string;
+}
+
+function decodeCursor(value: string | null): ReportCursor | null {
+  if (value === null || value.trim() === "") return null;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    if (
+      typeof decoded.createdAt !== "string" ||
+      typeof decoded.id !== "string" ||
+      !isIsoDateTime(decoded.createdAt) ||
+      !/^[0-9a-f-]{36}$/i.test(decoded.id)
+    )
+      throw new Error("invalid");
+    return { createdAt: decoded.createdAt, id: decoded.id };
+  } catch {
+    throw new AppError(
+      400,
+      "REPORT_CURSOR_INVALID",
+      "The report cursor is invalid.",
+    );
+  }
+}
+
+function cursorFromRow(
+  report: ReportName,
+  row: Record<string, unknown> | undefined,
+): string | null {
+  if (row === undefined) return null;
+  const createdAt =
+    report === "audit"
+      ? stringValue(row.cursorCreatedAt)
+      : stringValue(row.createdAt);
+  const id =
+    typeof row.__cursorId === "string"
+      ? row.__cursorId
+      : report === "operations"
+        ? stringValue(row.applicationId)
+        : report === "portfolio"
+          ? stringValue(row.contractId)
+          : report === "migration"
+            ? stringValue(row.batchId)
+            : null;
+  if (createdAt === null || id === null) return null;
+  return Buffer.from(JSON.stringify({ createdAt, id }), "utf8").toString(
+    "base64url",
+  );
+}
+
+function isIsoDateTime(value: string): boolean {
+  return !Number.isNaN(Date.parse(value));
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
 export function serializeCsv(rows: readonly Record<string, unknown>[]): string {
   const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))].sort();
   if (columns.length === 0) return "";
   const line = (row: Record<string, unknown>) =>
-    columns.map((column) => csvCell(row[column])).join(",");
+    columns.map((column) => csvCell(formulaSafeValue(row[column]))).join(",");
   return [columns.join(","), ...rows.map(line)].join("\r\n") + "\r\n";
 }
 
 function csvCell(value: unknown): string {
   let text = value === null || value === undefined ? "" : String(value);
-  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  if (startsWithFormulaCharacter(text)) text = `'${text}`;
   if (/[",\r\n]/.test(text)) return `"${text.replaceAll('"', '""')}"`;
   return text;
+}
+
+function exportContent(
+  report: ReportResult,
+  format: ReportFormat,
+  watermark: string,
+): string {
+  const rows = report.rows.map(
+    (row) => formulaSafeValue(row) as Record<string, unknown>,
+  );
+  if (format === "CSV") return `# ${watermark}\r\n${serializeCsv(rows)}`;
+  return JSON.stringify({
+    watermark,
+    report: report.report,
+    generatedAt: report.generatedAt,
+    dataClassification: report.dataClassification,
+    rows,
+  });
+}
+
+function formulaSafeValue(value: unknown): unknown {
+  if (typeof value === "string")
+    return startsWithFormulaCharacter(value) ? `'${value}` : value;
+  if (Array.isArray(value)) return value.map(formulaSafeValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        formulaSafeValue(item),
+      ]),
+    );
+  }
+  return value;
+}
+
+function startsWithFormulaCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    const character = value.charAt(index);
+    if (code <= 0x1f || /\s/u.test(character)) continue;
+    return (
+      character === "=" ||
+      character === "+" ||
+      character === "-" ||
+      character === "@"
+    );
+  }
+  return false;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+    )
+    .join(",")}}`;
 }
 
 function safeAuditData(value: unknown): Record<string, unknown> {

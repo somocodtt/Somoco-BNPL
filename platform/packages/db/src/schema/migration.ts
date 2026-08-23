@@ -102,6 +102,116 @@ export const migrationBatch = pgTable(
   ],
 );
 
+export const migrationBatchTransition = pgTable(
+  "migration_batch_transition",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    migrationBatchId: uuid("migration_batch_id")
+      .notNull()
+      .references(() => migrationBatch.id, { onDelete: "restrict" }),
+    eventKey: text("event_key").notNull(),
+    eventType: text("event_type").notNull(),
+    status: text("status").notNull(),
+    importedRecords: integer("imported_records").notNull().default(0),
+    expectedTotalMinorUnits: bigint("expected_total_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    reconciledTotalMinorUnits: bigint("reconciled_total_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    sampleRequired: integer("sample_required").notNull(),
+    samplePassed: integer("sample_passed").notNull(),
+    verifiedBy: uuid("verified_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    approvedBy: uuid("approved_by").references(() => staffUser.id, {
+      onDelete: "restrict",
+    }),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    financialEvidenceHash: text("financial_evidence_hash"),
+    activatedAt: timestamp("activated_at", { withTimezone: true }),
+    actorStaffUserId: uuid("actor_staff_user_id").references(
+      () => staffUser.id,
+      {
+        onDelete: "restrict",
+      },
+    ),
+    requestId: uuid("request_id"),
+    reasonCode: text("reason_code"),
+    data: jsonb("data").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("migration_batch_transition_key_unique").on(table.eventKey),
+    index("migration_batch_transition_batch_created_idx").on(
+      table.migrationBatchId,
+      table.createdAt,
+    ),
+    check(
+      "migration_batch_transition_event_type_allowed",
+      sql`${table.eventType} in ('IMPORTED', 'VALIDATED', 'SAMPLED', 'APPROVED', 'ACTIVATED', 'QUARANTINED', 'REJECTED', 'CORRECTED')`,
+    ),
+    check(
+      "migration_batch_transition_status_allowed",
+      sql`${table.status} in ('QUARANTINED', 'VALIDATED', 'APPROVED', 'IMPORTED', 'REJECTED')`,
+    ),
+    check(
+      "migration_batch_transition_totals_nonnegative",
+      sql`${table.expectedTotalMinorUnits} >= 0 and ${table.reconciledTotalMinorUnits} >= 0`,
+    ),
+    check(
+      "migration_batch_transition_sample_counts_nonnegative",
+      sql`${table.sampleRequired} >= 0 and ${table.samplePassed} >= 0 and ${table.samplePassed} <= ${table.sampleRequired}`,
+    ),
+    check(
+      "migration_batch_transition_financial_hash_sha256",
+      sql`${table.financialEvidenceHash} is null or ${table.financialEvidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+export const migrationSampleEvidence = pgTable(
+  "migration_sample_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    migrationBatchId: uuid("migration_batch_id")
+      .notNull()
+      .references(() => migrationBatch.id, { onDelete: "restrict" }),
+    migrationRecordId: uuid("migration_record_id")
+      .notNull()
+      .references(() => migrationRecord.id, { onDelete: "restrict" }),
+    verifierStaffUserId: uuid("verifier_staff_user_id")
+      .notNull()
+      .references(() => staffUser.id, { onDelete: "restrict" }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    result: text("result").notNull(),
+    evidenceHash: text("evidence_hash"),
+  },
+  (table) => [
+    uniqueIndex("migration_sample_evidence_row_unique").on(
+      table.migrationBatchId,
+      table.migrationRecordId,
+    ),
+    index("migration_sample_evidence_batch_idx").on(
+      table.migrationBatchId,
+      table.verifiedAt,
+    ),
+    check(
+      "migration_sample_evidence_result_allowed",
+      sql`${table.result} in ('PASS', 'FAIL')`,
+    ),
+    check(
+      "migration_sample_evidence_hash_sha256",
+      sql`${table.evidenceHash} is null or ${table.evidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
 export const migrationRecord = pgTable(
   "migration_record",
   {

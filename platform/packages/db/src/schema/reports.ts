@@ -72,6 +72,7 @@ export const reportExportEvent = pgTable(
     eventKey: text("event_key").notNull(),
     eventType: text("event_type").notNull(),
     contentHash: text("content_hash"),
+    reasonCode: text("reason_code"),
     artifact: jsonb("artifact").$type<Record<string, unknown>>().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -90,6 +91,10 @@ export const reportExportEvent = pgTable(
     check(
       "report_export_event_content_hash_sha256",
       sql`${table.contentHash} is null or ${table.contentHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "report_export_event_reason_code_safe",
+      sql`${table.reasonCode} is null or ${table.reasonCode} ~ '^[A-Z][A-Z0-9_]{0,63}$'`,
     ),
   ],
 );

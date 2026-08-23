@@ -109,7 +109,9 @@ export async function registerMigrationRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          properties: { sampleRecordIds: { type: "array", items: uuid } },
+          properties: {
+            sampleRecordIds: { type: "array", items: uuid, uniqueItems: true },
+          },
         },
       },
     },
