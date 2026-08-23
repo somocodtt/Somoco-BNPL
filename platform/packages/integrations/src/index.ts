@@ -10,6 +10,7 @@ export * from "./guarantor-invitation-delivery.js";
 export * from "./payments.js";
 export * from "./sms.js";
 export * from "./tracker.js";
+export * from "./telemetry.js";
 export {
   createProductionConnectorBoundary,
   hasProductionAdapterCapability,

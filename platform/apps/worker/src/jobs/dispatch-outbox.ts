@@ -6,6 +6,7 @@ import {
   type GuarantorInvitationDeliveryPolicyBinding,
   type ProductionAdapterCapability,
 } from "@somo/integrations";
+import type { Telemetry } from "@somo/integrations";
 
 const failureCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -129,6 +130,7 @@ export interface DispatchOutboxOptions {
   claimLeaseMs: number;
   now: () => Date;
   logger: WorkerLogger;
+  telemetry?: Telemetry;
 }
 
 export class PermanentWorkerError extends Error {
@@ -205,9 +207,18 @@ async function dispatchMessage(
     if (handler === undefined) {
       throw new PermanentWorkerError("OUTBOX_HANDLER_NOT_FOUND");
     }
-    await runWithHeartbeat(options, message, () =>
-      handler(toHandlerMessage(message)),
-    );
+    await runWithHeartbeat(options, message, () => {
+      const correlationId = options.telemetry?.correlationIdFromJob(
+        message.payload,
+      );
+      const run = () => handler(toHandlerMessage(message));
+      return options.telemetry === undefined
+        ? run()
+        : options.telemetry.withCorrelationId(
+            correlationId ?? options.telemetry.correlationId(),
+            run,
+          );
+    });
     const persisted = await options.store.complete({
       messageId: message.id,
       workerId: options.workerId,

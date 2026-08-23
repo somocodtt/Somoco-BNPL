@@ -1,0 +1,44 @@
+name: somo-bnpl-dev
+
+# Local integration fixtures only. These images, credentials, and network
+# settings are not Somoco-approved production infrastructure.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: somo_test
+      POSTGRES_PASSWORD: somo_test_only
+      POSTGRES_DB: somo_bnpl_test
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U somo_test -d somo_bnpl_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  object-storage:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: local-only-access
+      MINIO_ROOT_PASSWORD: local-only-secret-at-least-32-characters
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - object-storage-data:/data
+
+  clamav:
+    image: clamav/clamav:1.4
+    ports:
+      - "53310:3310"
+    volumes:
+      - clamav-data:/var/lib/clamav
+
+volumes:
+  postgres-data:
+  object-storage-data:
+  clamav-data:

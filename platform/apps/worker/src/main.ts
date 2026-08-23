@@ -10,6 +10,7 @@ import {
   type OutboxHandler,
   type WorkerLogger,
 } from "./jobs/dispatch-outbox.js";
+import { createTelemetry, type Telemetry } from "@somo/integrations";
 
 export interface StartWorkerOptions {
   store: OutboxClaimStore;
@@ -24,6 +25,7 @@ export interface StartWorkerOptions {
   pollIntervalMs?: number;
   now?: () => Date;
   signal?: AbortSignal;
+  telemetry?: Telemetry;
 }
 
 export interface WorkerController {
@@ -67,6 +69,9 @@ export function startWorker(options: StartWorkerOptions): WorkerController {
     claimLeaseMs: options.claimLeaseMs ?? 30_000,
     pollIntervalMs: options.pollIntervalMs ?? 1_000,
     now: options.now ?? (() => new Date()),
+    ...(options.telemetry === undefined
+      ? {}
+      : { telemetry: options.telemetry }),
   };
   validateDispatchOutboxOptions(configuration);
   if (
@@ -193,6 +198,8 @@ export async function runWorkerProcess(
   config: WorkerProcessConfig,
 ): Promise<void> {
   const connection = createDatabase(config.databaseUrl);
+  const telemetry = createTelemetry();
+  telemetry.setDependency("postgres", "UP");
   const stopController = new AbortController();
   const stop = () => stopController.abort();
   process.once("SIGINT", stop);
@@ -209,6 +216,7 @@ export async function runWorkerProcess(
       handlers,
       logger: processLogger,
       signal: stopController.signal,
+      telemetry,
     });
     await worker.completion;
   } finally {
@@ -264,13 +272,18 @@ function workerEnvironment(
 
 const processLoggerImplementation: WorkerLogger = {
   info(record) {
-    process.stdout.write(`${JSON.stringify(record)}\n`);
+    process.stdout.write(
+      `${JSON.stringify(processTelemetry.redactLogRecord(record))}\n`,
+    );
   },
   error(record) {
-    process.stderr.write(`${JSON.stringify(record)}\n`);
+    process.stderr.write(
+      `${JSON.stringify(processTelemetry.redactLogRecord(record))}\n`,
+    );
   },
 };
 const processLogger = Object.freeze(processLoggerImplementation);
+const processTelemetry = createTelemetry();
 
 function waitForPoll(
   delayMs: number,

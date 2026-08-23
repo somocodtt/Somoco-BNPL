@@ -21,6 +21,8 @@ import {
   type ObjectStoragePort,
   type SmsPort,
   type TrackerPort,
+  createTelemetry,
+  type Telemetry,
 } from "@somo/integrations";
 import { validateProductionIdentityComposition } from "./production-composition.js";
 import { registerDocumentRoutes } from "./modules/documents/routes.js";
@@ -80,6 +82,11 @@ import { createReportService } from "./modules/reports/service.js";
 import { registerReportRoutes } from "./modules/reports/routes.js";
 import { createMigrationService } from "./modules/migration/service.js";
 import { registerMigrationRoutes } from "./modules/migration/routes.js";
+import { registerPrivacyRoutes } from "./modules/privacy/routes.js";
+import {
+  createPrivacyService,
+  type PrivacyService,
+} from "./modules/privacy/service.js";
 
 export { authorize } from "./modules/access/policy.js";
 export type {
@@ -128,6 +135,12 @@ export interface BuildAppOptions {
     accountLinkBaseUrl: string;
     ussdInstructions?: string;
   };
+  privacy?: { service: PrivacyService };
+  telemetry?: Telemetry;
+  dependencyChecks?: readonly {
+    name: string;
+    check: () => Promise<boolean>;
+  }[];
 }
 
 export async function buildApp(
@@ -152,6 +165,25 @@ export async function buildApp(
       ? createDatabase(config.databaseUrl)
       : undefined;
   const database = options.database ?? connection!.db;
+  if (
+    config.environment === "production" &&
+    config.productionControlsConfigured === true &&
+    options.privacy?.service === undefined
+  ) {
+    throw new Error("PRODUCTION_PRIVACY_COMPOSITION_REQUIRED");
+  }
+  const telemetry = options.telemetry ?? createTelemetry();
+  telemetry.setDependency("postgres", "UP");
+  for (const dependency of options.dependencyChecks ?? []) {
+    try {
+      telemetry.setDependency(
+        dependency.name,
+        (await dependency.check()) ? "UP" : "DOWN",
+      );
+    } catch {
+      telemetry.setDependency(dependency.name, "DOWN");
+    }
+  }
   const app = fastify({
     ajv: {
       customOptions: {
@@ -192,6 +224,7 @@ export async function buildApp(
   }
 
   await registerRequestContext(app);
+  registerHealthRoutes(app, telemetry);
   await registerProblemErrors(app);
   await registerSecurity(app, config);
   const accessService = await createAccessService({
@@ -392,7 +425,26 @@ export async function buildApp(
   await registerReportRoutes(app, config, accessService, reports);
   const migration = createMigrationService({ database });
   await registerMigrationRoutes(app, config, accessService, migration);
+  const privacy = options.privacy?.service ?? createPrivacyService();
+  await registerPrivacyRoutes(app, config, accessService, privacy, customerOtp);
   return app;
+}
+
+function registerHealthRoutes(
+  app: FastifyInstance,
+  telemetry: Telemetry,
+): void {
+  for (const path of ["/health/live", "/health/liveness"] as const) {
+    app.get(path, async (_request, reply) => reply.send(telemetry.liveness()));
+  }
+  for (const path of ["/health/ready", "/health/readiness"] as const) {
+    app.get(path, async (_request, reply) => {
+      const status = telemetry.readiness();
+      return status.status === "ok"
+        ? reply.send(status)
+        : reply.code(503).send(status);
+    });
+  }
 }
 
 function assertProductionIdentityDependencies(

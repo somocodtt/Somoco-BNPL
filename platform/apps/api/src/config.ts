@@ -18,6 +18,15 @@ export interface AppConfig {
   argon2TimeCost: number;
   argon2Parallelism: number;
   requireVerifiedMfa: boolean;
+  /** Names are configuration evidence only; adapter instances are injected separately. */
+  niaAdapter?: string;
+  smsAdapter?: string;
+  paymentAdapter?: string;
+  objectStoragePublic?: boolean;
+  encryptionKeyRef?: string;
+  backupLastVerifiedAt?: string;
+  /** Set only by loadConfig after required production environment checks. */
+  productionControlsConfigured?: boolean;
   mainHeadOfficeId?: string;
   mainHeadOfficeLocation?: string;
 }
@@ -69,6 +78,62 @@ export function loadConfig(
       env.REQUIRE_VERIFIED_MFA,
       "REQUIRE_VERIFIED_MFA",
     ),
+    ...(environment === "production"
+      ? {
+          niaAdapter: required(env.NIA_ADAPTER, "NIA_ADAPTER"),
+          smsAdapter: required(env.SMS_ADAPTER, "SMS_ADAPTER"),
+          paymentAdapter: required(env.PAYMENT_ADAPTER, "PAYMENT_ADAPTER"),
+          objectStoragePublic: boolean(
+            env.OBJECT_STORAGE_PUBLIC,
+            "OBJECT_STORAGE_PUBLIC",
+          ),
+          encryptionKeyRef: required(
+            env.ENCRYPTION_KEY_REF ?? env.ENCRYPTION_KEY_REFERENCE,
+            "ENCRYPTION_KEY_REF",
+          ),
+          backupLastVerifiedAt: required(
+            env.BACKUP_LAST_VERIFIED_AT ?? env.BACKUP_VERIFICATION_AT,
+            "BACKUP_LAST_VERIFIED_AT",
+          ),
+          productionControlsConfigured: true,
+        }
+      : {
+          ...(env.NIA_ADAPTER === undefined
+            ? {}
+            : { niaAdapter: env.NIA_ADAPTER.trim() }),
+          ...(env.SMS_ADAPTER === undefined
+            ? {}
+            : { smsAdapter: env.SMS_ADAPTER.trim() }),
+          ...(env.PAYMENT_ADAPTER === undefined
+            ? {}
+            : { paymentAdapter: env.PAYMENT_ADAPTER.trim() }),
+          ...(env.OBJECT_STORAGE_PUBLIC === undefined
+            ? {}
+            : {
+                objectStoragePublic: boolean(
+                  env.OBJECT_STORAGE_PUBLIC,
+                  "OBJECT_STORAGE_PUBLIC",
+                ),
+              }),
+          ...(env.ENCRYPTION_KEY_REF === undefined &&
+          env.ENCRYPTION_KEY_REFERENCE === undefined
+            ? {}
+            : {
+                encryptionKeyRef: required(
+                  env.ENCRYPTION_KEY_REF ?? env.ENCRYPTION_KEY_REFERENCE,
+                  "ENCRYPTION_KEY_REF",
+                ),
+              }),
+          ...(env.BACKUP_LAST_VERIFIED_AT === undefined &&
+          env.BACKUP_VERIFICATION_AT === undefined
+            ? {}
+            : {
+                backupLastVerifiedAt: required(
+                  env.BACKUP_LAST_VERIFIED_AT ?? env.BACKUP_VERIFICATION_AT,
+                  "BACKUP_LAST_VERIFIED_AT",
+                ),
+              }),
+        }),
     ...(env.SOMOCO_MAIN_HEAD_OFFICE_ID === undefined &&
     env.SOMOCO_MAIN_HEAD_OFFICE_LOCATION === undefined
       ? {}
@@ -139,6 +204,35 @@ export function validateConfig(config: AppConfig): AppConfig {
     if (!config.requireVerifiedMfa) {
       throw new Error("production staff sessions must require verified MFA");
     }
+    validateAdapterName(config.niaAdapter);
+    validateAdapterName(config.smsAdapter);
+    validateAdapterName(config.paymentAdapter);
+    if (
+      config.objectStoragePublic !== undefined &&
+      config.objectStoragePublic
+    ) {
+      throw new Error("PRODUCTION_OBJECT_STORAGE_MUST_BE_PRIVATE");
+    }
+    if (
+      config.encryptionKeyRef !== undefined &&
+      config.encryptionKeyRef.trim() === ""
+    ) {
+      throw new Error("PRODUCTION_ENCRYPTION_KEY_REFERENCE_REQUIRED");
+    }
+    if (config.backupLastVerifiedAt !== undefined) {
+      validateBackupVerification(config.backupLastVerifiedAt);
+    }
+    if (config.productionControlsConfigured === true) {
+      if (config.objectStoragePublic !== false) {
+        throw new Error("PRODUCTION_OBJECT_STORAGE_CONFIGURATION_REQUIRED");
+      }
+      if (config.encryptionKeyRef === undefined) {
+        throw new Error("PRODUCTION_ENCRYPTION_KEY_REFERENCE_REQUIRED");
+      }
+      if (config.backupLastVerifiedAt === undefined) {
+        throw new Error("PRODUCTION_BACKUP_VERIFICATION_REQUIRED");
+      }
+    }
   }
   if (
     (config.mainHeadOfficeId === undefined) !==
@@ -152,6 +246,24 @@ export function validateConfig(config: AppConfig): AppConfig {
     ...config,
     allowedOrigins: Object.freeze([...config.allowedOrigins]),
   });
+}
+
+function validateAdapterName(value: string | undefined): void {
+  if (value === undefined || value.trim() === "") return;
+  if (/simulator/i.test(value) || /wrapped[-_]?simulator/i.test(value)) {
+    throw new Error("PRODUCTION_SIMULATOR_ADAPTER_FORBIDDEN");
+  }
+}
+
+function validateBackupVerification(value: string): void {
+  const verifiedAt = new Date(value);
+  if (Number.isNaN(verifiedAt.getTime())) {
+    throw new Error("PRODUCTION_BACKUP_VERIFICATION_INVALID");
+  }
+  const ageMs = Date.now() - verifiedAt.getTime();
+  if (ageMs < 0 || ageMs > 48 * 60 * 60 * 1_000) {
+    throw new Error("PRODUCTION_BACKUP_VERIFICATION_STALE");
+  }
 }
 
 function required(value: string | undefined, name: string): string {
