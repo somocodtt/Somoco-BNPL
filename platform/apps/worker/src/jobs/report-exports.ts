@@ -6,6 +6,10 @@ import {
   type Database,
   type OutboxMessage,
 } from "@somo/db";
+import {
+  readCanonicalReportPage,
+  sanitizeReportFilters,
+} from "../../../api/src/modules/reports/service.js";
 import { getInternalDatabase } from "../../../../packages/db/src/client.js";
 import {
   createOutboxHandler,
@@ -105,7 +109,7 @@ export function createDatabaseReportExportCompletionPort(
         status: event.rows[0]?.event_type ?? row.status,
       };
     },
-    generate: (job) => databaseReportPages(internal, job),
+    generate: (job) => databaseReportPages(database, job),
     complete: (input) => appendReportExportReadyEvent(database, input),
     fail: (input) => appendReportExportFailedEvent(database, input),
   };
@@ -142,6 +146,18 @@ export function createReportExportHandler(
         payload.version !== 1
       )
         throw new PermanentWorkerError("REPORT_EXPORT_REQUEST_MISMATCH");
+      try {
+        const persistedFilters = sanitizeReportFilters(job.report, job.filters);
+        const payloadFilters = sanitizeReportFilters(
+          payload.report,
+          payload.filters,
+        );
+        if (canonicalJson(persistedFilters) !== canonicalJson(payloadFilters))
+          throw new PermanentWorkerError("REPORT_EXPORT_FILTER_MISMATCH");
+      } catch (error) {
+        if (error instanceof PermanentWorkerError) throw error;
+        throw new PermanentWorkerError("REPORT_EXPORT_FILTER_INVALID");
+      }
       const rows: Record<string, unknown>[] = [];
       for await (const page of port.generate(job)) {
         if (!Array.isArray(page.rows))
@@ -261,115 +277,29 @@ function reportExportPayload(payload: unknown): {
 }
 
 async function* databaseReportPages(
-  db: ReturnType<typeof getInternalDatabase>,
+  database: Database,
   job: ReportExportJob,
 ): AsyncIterable<ReportExportPage> {
-  let cursor: { createdAt: string; id: string } | null = null;
+  let cursor: string | undefined;
   for (;;) {
-    const result = await selectReportPage(db, job, cursor);
-    if (result.rows.length === 0) return;
+    const page = await readCanonicalReportPage({
+      database,
+      report: job.report,
+      filters: {
+        ...job.filters,
+        ...(cursor === undefined ? {} : { cursor }),
+      },
+      dataClassification: job.dataClassification,
+    });
+    if (page.rows.length === 0) return;
     yield {
-      rows: result.rows.map((row) => safeRow(row, job.dataClassification)),
+      rows: page.rows,
     };
-    if (result.rows.length < 500) return;
-    const last = result.rows.at(-1)! as Record<string, unknown>;
-    cursor = {
-      createdAt: String(last.created_at_cursor),
-      id: String(last.id),
-    };
+    if (!page.pagination.truncated) return;
+    if (page.pagination.nextCursor === null)
+      throw new PermanentWorkerError("REPORT_EXPORT_CURSOR_INVALID");
+    cursor = page.pagination.nextCursor;
   }
-}
-
-async function selectReportPage(
-  db: ReturnType<typeof getInternalDatabase>,
-  job: ReportExportJob,
-  cursor: { createdAt: string; id: string } | null,
-) {
-  const status =
-    typeof job.filters.status === "string" ? job.filters.status : null;
-  const asOf =
-    typeof job.filters.asOfDate === "string" ? job.filters.asOfDate : null;
-  const statusClause =
-    status === null || job.report === "audit"
-      ? sql`true`
-      : sql`status::text = ${status}`;
-  const asOfClause =
-    asOf === null
-      ? sql`true`
-      : job.report === "audit"
-        ? sql`occurred_at < (${asOf}::date + interval '1 day')`
-        : sql`created_at < (${asOf}::date + interval '1 day')`;
-  const isDescending = job.report === "audit" || job.report === "migration";
-  const cursorClause =
-    cursor === null
-      ? sql`true`
-      : isDescending
-        ? job.report === "audit"
-          ? sql`(occurred_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`
-          : sql`(created_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`
-        : sql`(created_at, id) > (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`;
-  const order = isDescending ? sql`desc` : sql`asc`;
-  const timeColumn =
-    job.report === "audit" ? sql`occurred_at` : sql`created_at`;
-  if (job.report === "operations")
-    return db.execute<{
-      id: string;
-      status: string;
-      created_at: Date;
-      created_at_cursor: string;
-    }>(sql`
-      select id, status, created_at, created_at::text as created_at_cursor from application
-       where ${statusClause} and ${asOfClause} and ${cursorClause}
-       order by ${timeColumn} ${order}, id ${order} limit 500
-    `);
-  if (job.report === "portfolio")
-    return db.execute<{
-      id: string;
-      status: string;
-      reference: string;
-      created_at: Date;
-      created_at_cursor: string;
-    }>(sql`
-      select id, status, reference, created_at, created_at::text as created_at_cursor from contract
-       where ${statusClause} and ${asOfClause} and ${cursorClause}
-       order by ${timeColumn} ${order}, id ${order} limit 500
-    `);
-  if (job.report === "audit")
-    return db.execute<{
-      id: string;
-      action: string;
-      aggregate_type: string;
-      created_at: Date;
-      created_at_cursor: string;
-    }>(sql`
-      select id, action, aggregate_type, occurred_at as created_at, occurred_at::text as created_at_cursor from audit_event
-       where ${asOfClause} and ${cursorClause}
-       order by occurred_at ${order}, id ${order} limit 500
-    `);
-  return db.execute<{
-    id: string;
-    status: string;
-    source: string;
-    source_batch_id: string;
-    created_at: Date;
-    created_at_cursor: string;
-  }>(sql`
-    select id, status, source, source_batch_id, created_at, created_at::text as created_at_cursor from migration_batch
-     where ${asOfClause} and ${cursorClause}
-     order by created_at ${order}, id ${order} limit 500
-  `);
-}
-
-function safeRow(
-  row: Record<string, unknown>,
-  classification: ReportClassification,
-): Record<string, unknown> {
-  const result: Record<string, unknown> = { ...row };
-  delete result.created_at;
-  delete result.created_at_cursor;
-  if (classification === "REDACTED" && typeof result.id === "string")
-    result.id = `ref-${sha256(result.id).slice(0, 12)}`;
-  return result;
 }
 
 function renderExport(

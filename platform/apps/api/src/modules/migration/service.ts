@@ -37,6 +37,9 @@ export interface LegacyImportRow {
     reference?: string;
     startDate?: string;
     endDate?: string;
+    totalMinorUnits?: string;
+    principalMinorUnits?: string;
+    openingBalanceMinorUnits?: string;
   };
   vehicle?: {
     legacyId?: string;
@@ -49,6 +52,10 @@ export interface LegacyImportRow {
   arrearsMinorUnits?: string;
   repayment_history?: readonly Record<string, unknown>[];
   arrears_minor_units?: string;
+  arrearsAsOfDate?: string;
+  arrears_as_of_date?: string;
+  totalPaidMinorUnits?: string;
+  total_paid_minor_units?: string;
   repayment_frequency?: string;
   tenure_months?: number | string;
   schedule?: { frequency?: string; tenureMonths?: number | string };
@@ -500,13 +507,41 @@ export function createMigrationService(options: {
           );
         for (const recordId of input.sampleRecordIds) {
           const row = rows.find((candidate) => candidate.id === recordId);
+          const existing = await getInternalExecutor(tx).execute<{
+            verifier_staff_user_id: string;
+            result: string;
+            verification_command_id: string | null;
+          }>(sql`
+            select verifier_staff_user_id, result, verification_command_id
+              from migration_sample_evidence
+             where migration_batch_id = ${input.batchId}
+               and migration_record_id = ${recordId}
+             for update
+          `);
+          const prior = existing.rows[0];
+          if (prior?.result === "FAIL")
+            throw new AppError(
+              409,
+              "MIGRATION_SAMPLE_PREVIOUS_FAIL",
+              "A previously failed sample cannot be auto-passed.",
+            );
+          if (
+            prior !== undefined &&
+            (prior.verifier_staff_user_id !== input.actor.staffUserId ||
+              prior.verification_command_id !== input.requestId)
+          )
+            throw new AppError(
+              409,
+              "MIGRATION_SAMPLE_EVIDENCE_CONFLICT",
+              "Existing sample evidence does not match this verification command.",
+            );
           await getInternalExecutor(tx).execute(sql`
             insert into migration_sample_evidence
               (migration_batch_id, migration_record_id, verifier_staff_user_id,
-               verified_at, result, evidence_hash)
+               verified_at, result, verification_command_id, evidence_hash)
             values
               (${input.batchId}, ${recordId}, ${input.actor.staffUserId}, now(),
-               'PASS', ${row?.payload_hash ?? null})
+               'PASS', ${input.requestId}, ${row?.payload_hash ?? null})
             on conflict (migration_batch_id, migration_record_id) do nothing
           `);
         }
@@ -867,6 +902,28 @@ async function validateRows(
     const guarantor = guarantorFromPayload(payload);
     const contract = contractFromPayload(payload);
     const vehicle = vehicleFromPayload(payload);
+    const contractTotalValue =
+      contract.totalMinorUnits ??
+      stringField(
+        payload,
+        "contractTotalMinorUnits",
+        "contract_total_minor_units",
+      );
+    const principalValue =
+      contract.principalMinorUnits ??
+      stringField(payload, "principalMinorUnits", "principal_minor_units");
+    const openingBalanceValue =
+      contract.openingBalanceMinorUnits ??
+      stringField(
+        payload,
+        "openingBalanceMinorUnits",
+        "opening_balance_minor_units",
+      );
+    const totalPaidValue =
+      payload.totalPaidMinorUnits ??
+      stringField(payload, "total_paid_minor_units");
+    const arrearsAsOfDate =
+      payload.arrearsAsOfDate ?? stringField(payload, "arrears_as_of_date");
     const repaymentFrequency = String(
       payload.repaymentFrequency ??
         payload.schedule?.frequency ??
@@ -884,13 +941,15 @@ async function validateRows(
         payload.repayment_history ??
         stringField(payload, "repaymentHistoryJson", "repayment_history_json"),
     );
-    const installmentSchedule = parseInstallmentSchedule(
+    const installmentScheduleInput =
       payload.installmentSchedule ??
-        stringField(
-          payload,
-          "installmentScheduleJson",
-          "installment_schedule_json",
-        ),
+      stringField(
+        payload,
+        "installmentScheduleJson",
+        "installment_schedule_json",
+      );
+    const installmentSchedule = parseInstallmentSchedule(
+      installmentScheduleInput,
     );
     if (!customer.legacyId?.trim())
       errors.push({
@@ -968,6 +1027,48 @@ async function validateRows(
         });
       seenContract.add(contractReference);
     }
+    let contractTotal = 0n;
+    let principal = 0n;
+    let openingBalance = 0n;
+    let totalPaid = 0n;
+    try {
+      contractTotal = parseRequiredAmount(
+        contractTotalValue,
+        "CONTRACT_TOTAL_REQUIRED",
+      );
+    } catch {
+      errors.push({
+        code: "CONTRACT_TOTAL_REQUIRED",
+        message: "An explicit contract total is required.",
+      });
+    }
+    try {
+      principal = parseRequiredAmount(principalValue, "PRINCIPAL_REQUIRED");
+    } catch {
+      errors.push({
+        code: "PRINCIPAL_REQUIRED",
+        message: "An explicit principal amount is required.",
+      });
+    }
+    try {
+      openingBalance = parseRequiredAmount(
+        openingBalanceValue,
+        "OPENING_BALANCE_REQUIRED",
+      );
+    } catch {
+      errors.push({
+        code: "OPENING_BALANCE_REQUIRED",
+        message: "An explicit opening balance is required.",
+      });
+    }
+    try {
+      totalPaid = parseRequiredAmount(totalPaidValue, "TOTAL_PAID_REQUIRED");
+    } catch {
+      errors.push({
+        code: "TOTAL_PAID_REQUIRED",
+        message: "An explicit net paid total is required.",
+      });
+    }
     if (!contract.legacyId?.trim())
       errors.push({
         code: "CONTRACT_LEGACY_ID_REQUIRED",
@@ -1026,6 +1127,16 @@ async function validateRows(
         code: "TENURE_INVALID",
         message: "Tenure must be one of 6, 8, 12, 24, 36, or 48 months.",
       });
+    if (
+      isIsoCalendarDate(contract.startDate) &&
+      isIsoCalendarDate(contract.endDate) &&
+      [6, 8, 12, 24, 36, 48].includes(tenure) &&
+      contract.endDate! > addMonths(contract.startDate!, tenure)
+    )
+      errors.push({
+        code: "TENURE_DATE_RANGE_INVALID",
+        message: "The contract dates exceed the supplied tenure.",
+      });
     let arrears = 0n;
     if (typeof arrearsValue !== "string")
       errors.push({
@@ -1048,6 +1159,31 @@ async function validateRows(
         message:
           "A repayment history array is required, including an empty array when none exists.",
       });
+    const rawSchedule = parseJsonArray(installmentScheduleInput);
+    if (
+      Array.isArray(rawSchedule) &&
+      rawSchedule.some((entry, index) => {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+          return false;
+        const value = entry as Record<string, unknown>;
+        const previous = rawSchedule[index - 1];
+        const previousDate =
+          typeof previous === "object" &&
+          previous !== null &&
+          !Array.isArray(previous) &&
+          typeof (previous as Record<string, unknown>).dueDate === "string"
+            ? String((previous as Record<string, unknown>).dueDate)
+            : null;
+        return (
+          value.number !== index + 1 ||
+          (previousDate !== null && String(value.dueDate) <= previousDate)
+        );
+      })
+    )
+      errors.push({
+        code: "INSTALLMENT_SCHEDULE_ORDER_INVALID",
+        message: "Installment numbers and due dates must be strictly ordered.",
+      });
     if (!Array.isArray(installmentSchedule) || installmentSchedule.length === 0)
       errors.push({
         code: "INSTALLMENT_SCHEDULE_REQUIRED",
@@ -1055,6 +1191,36 @@ async function validateRows(
           "At least one reconciled installment schedule entry is required.",
       });
     else {
+      const rawSchedule = parseJsonArray(installmentScheduleInput);
+      if (
+        Array.isArray(rawSchedule) &&
+        rawSchedule.some((entry, index) => {
+          if (
+            typeof entry !== "object" ||
+            entry === null ||
+            Array.isArray(entry)
+          )
+            return false;
+          const value = entry as Record<string, unknown>;
+          const previous = rawSchedule[index - 1];
+          const previousDate =
+            typeof previous === "object" &&
+            previous !== null &&
+            !Array.isArray(previous) &&
+            typeof (previous as Record<string, unknown>).dueDate === "string"
+              ? String((previous as Record<string, unknown>).dueDate)
+              : null;
+          return (
+            value.number !== index + 1 ||
+            (previousDate !== null && String(value.dueDate) <= previousDate)
+          );
+        })
+      )
+        errors.push({
+          code: "INSTALLMENT_SCHEDULE_ORDER_INVALID",
+          message:
+            "Installment numbers and due dates must be strictly ordered.",
+        });
       const scheduleTotal = installmentSchedule.reduce(
         (total, entry) => total + BigInt(String(entry.amountMinorUnits)),
         0n,
@@ -1092,6 +1258,73 @@ async function validateRows(
         code: "REPAYMENT_DATE_OUT_OF_RANGE",
         message: "Repayment dates must fall within the contract dates.",
       });
+    if (contractTotal > 0n && principal > contractTotal)
+      errors.push({
+        code: "PRINCIPAL_EXCEEDS_CONTRACT_TOTAL",
+        message: "Principal cannot exceed the explicit contract total.",
+      });
+    if (contractTotal > 0n && openingBalance > contractTotal)
+      errors.push({
+        code: "OPENING_BALANCE_EXCEEDS_CONTRACT_TOTAL",
+        message: "Opening balance cannot exceed the explicit contract total.",
+      });
+    if (Array.isArray(installmentSchedule)) {
+      const scheduleTotal = installmentSchedule.reduce(
+        (total, entry) => total + BigInt(String(entry.amountMinorUnits)),
+        0n,
+      );
+      if (contractTotal > 0n && scheduleTotal !== contractTotal)
+        errors.push({
+          code: "INSTALLMENT_SCHEDULE_TOTAL_MISMATCH",
+          message: "The installment schedule must equal the contract total.",
+        });
+      if (Array.isArray(repaymentHistory)) {
+        const netPaid = repaymentHistory.reduce(
+          (total, entry) =>
+            total +
+            BigInt(
+              String(entry.signedAmountMinorUnits ?? entry.amountMinorUnits),
+            ),
+          0n,
+        );
+        if (netPaid !== totalPaid)
+          errors.push({
+            code: "REPAYMENT_TOTAL_MISMATCH",
+            message:
+              "Repayment history net does not equal the explicit paid total.",
+          });
+        if (contractTotal >= netPaid && amount !== contractTotal - netPaid)
+          errors.push({
+            code: "CURRENT_BALANCE_RECONCILIATION_MISMATCH",
+            message:
+              "Current balance does not reconcile to contract total and net paid.",
+          });
+      }
+      if (!isIsoCalendarDate(arrearsAsOfDate))
+        errors.push({
+          code: "ARREARS_AS_OF_DATE_REQUIRED",
+          message: "A valid arrears as-of date is required.",
+        });
+      else {
+        const expectedArrears = installmentSchedule.reduce((total, entry) => {
+          const status = String(entry.status);
+          if (
+            String(entry.dueDate) > arrearsAsOfDate! ||
+            !["DUE", "MISSED", "PENDING"].includes(status)
+          )
+            return total;
+          const amountDue = BigInt(String(entry.amountMinorUnits));
+          const paid = BigInt(String(entry.paidAmountMinorUnits ?? "0"));
+          return total + amountDue - paid;
+        }, 0n);
+        if (arrears !== expectedArrears)
+          errors.push({
+            code: "ARREARS_RECONCILIATION_MISMATCH",
+            message:
+              "Arrears does not reconcile to overdue unpaid installments.",
+          });
+      }
+    }
     let attachment: ValidatedRow["attachment"] = null;
     const attachmentDocumentId =
       payload.attachmentDocumentId ??
@@ -1159,6 +1392,12 @@ async function validateRows(
         reference: contractReference ?? null,
         startDate: contract.startDate ?? null,
         endDate: contract.endDate ?? null,
+        totalMinorUnits:
+          typeof contractTotalValue === "string" ? contractTotalValue : null,
+        principalMinorUnits:
+          typeof principalValue === "string" ? principalValue : null,
+        openingBalanceMinorUnits:
+          typeof openingBalanceValue === "string" ? openingBalanceValue : null,
       },
       vehicle: {
         legacyId: vehicle.legacyId ?? null,
@@ -1168,6 +1407,9 @@ async function validateRows(
       },
       currentBalanceMinorUnits: amount.toString(),
       arrearsMinorUnits: arrears.toString(),
+      arrearsAsOfDate: arrearsAsOfDate ?? null,
+      totalPaidMinorUnits:
+        typeof totalPaidValue === "string" ? totalPaidValue : null,
       repaymentFrequency,
       tenureMonths: tenure,
       repaymentHistory: Array.isArray(repaymentHistory) ? repaymentHistory : [],
@@ -1343,6 +1585,9 @@ function contractFromPayload(payload: LegacyImportRow): {
   reference?: string | undefined;
   startDate?: string | undefined;
   endDate?: string | undefined;
+  totalMinorUnits?: string | undefined;
+  principalMinorUnits?: string | undefined;
+  openingBalanceMinorUnits?: string | undefined;
 } {
   const nested = payload.contract ?? {};
   return {
@@ -1359,6 +1604,23 @@ function contractFromPayload(payload: LegacyImportRow): {
     endDate:
       nested.endDate ??
       stringField(payload, "contractEndDate", "contract_end_date"),
+    totalMinorUnits:
+      nested.totalMinorUnits ??
+      stringField(
+        payload,
+        "contractTotalMinorUnits",
+        "contract_total_minor_units",
+      ),
+    principalMinorUnits:
+      nested.principalMinorUnits ??
+      stringField(payload, "principalMinorUnits", "principal_minor_units"),
+    openingBalanceMinorUnits:
+      nested.openingBalanceMinorUnits ??
+      stringField(
+        payload,
+        "openingBalanceMinorUnits",
+        "opening_balance_minor_units",
+      ),
   };
 }
 
@@ -1420,6 +1682,16 @@ function isIsoCalendarDate(value: string | undefined): boolean {
   );
 }
 
+function addMonths(value: string, months: number): string {
+  const [year, month, day] = value.split("-").map(Number);
+  const result = new Date(Date.UTC(year!, month! - 1 + months, day!));
+  return [
+    result.getUTCFullYear().toString().padStart(4, "0"),
+    (result.getUTCMonth() + 1).toString().padStart(2, "0"),
+    result.getUTCDate().toString().padStart(2, "0"),
+  ].join("-");
+}
+
 function parseRepaymentHistory(
   value: unknown,
 ): readonly Record<string, unknown>[] | undefined {
@@ -1435,19 +1707,37 @@ function parseRepaymentHistory(
     const type = row.type;
     const reference = row.reference;
     const currency = row.currency;
+    const normalizedType = typeof type === "string" ? type.toUpperCase() : "";
     if (
       typeof date !== "string" ||
       !isIsoCalendarDate(date) ||
       typeof amount !== "string" ||
-      !/^(0|[1-9][0-9]*)$/.test(amount) ||
+      !/^-?(0|[1-9][0-9]*)$/.test(amount) ||
+      (amount.startsWith("-") && normalizedType !== "REVERSAL") ||
       typeof type !== "string" ||
-      !/^[A-Z][A-Z0-9_]{1,31}$/.test(type) ||
+      !/^[A-Z][A-Z0-9_]{1,31}$/.test(normalizedType) ||
       typeof reference !== "string" ||
       !/^[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$/.test(reference) ||
       currency !== "GHS"
     )
       return undefined;
-    result.push({ date, amountMinorUnits: amount, type, reference, currency });
+    const absoluteAmount = BigInt(
+      amount.startsWith("-") ? amount.slice(1) : amount,
+    );
+    const signedAmount =
+      amount.startsWith("-") ||
+      normalizedType === "REVERSAL" ||
+      normalizedType === "REFUND"
+        ? -absoluteAmount
+        : absoluteAmount;
+    result.push({
+      date,
+      amountMinorUnits: amount,
+      signedAmountMinorUnits: signedAmount.toString(),
+      type: normalizedType,
+      reference,
+      currency,
+    });
   }
   return result;
 }
@@ -1467,17 +1757,26 @@ function parseInstallmentSchedule(
     const dueDate = row.dueDate;
     const amount = row.amountMinorUnits ?? row.amount;
     const status = row.status;
+    const paidAmount = row.paidAmountMinorUnits ?? row.paidAmount ?? "0";
     if (
       typeof number !== "number" ||
       !Number.isSafeInteger(number) ||
       number < 1 ||
       seen.has(number) ||
+      number !== result.length + 1 ||
       typeof dueDate !== "string" ||
       !isIsoCalendarDate(dueDate) ||
+      (result.length > 0 && dueDate <= String(result.at(-1)?.dueDate)) ||
       typeof amount !== "string" ||
       !/^(0|[1-9][0-9]*)$/.test(amount) ||
       typeof status !== "string" ||
       !["DUE", "PAID", "MISSED", "WAIVED", "PENDING"].includes(status) ||
+      typeof paidAmount !== "string" ||
+      !/^(0|[1-9][0-9]*)$/.test(paidAmount) ||
+      (status === "PAID" &&
+        row.paidAmountMinorUnits === undefined &&
+        row.paidAmount === undefined) ||
+      BigInt(paidAmount) > BigInt(amount) ||
       row.currency !== "GHS"
     )
       return undefined;
@@ -1486,6 +1785,7 @@ function parseInstallmentSchedule(
       number,
       dueDate,
       amountMinorUnits: amount,
+      paidAmountMinorUnits: paidAmount,
       status,
       currency: "GHS",
     });
@@ -1835,6 +2135,12 @@ function parseAmount(value: string, code: string): bigint {
     );
   return BigInt(value);
 }
+
+function parseRequiredAmount(value: unknown, code: string): bigint {
+  if (typeof value !== "string") throw new Error(code);
+  return parseAmount(value, code);
+}
+
 function normalizeFingerprint(value: string | undefined): string | null {
   if (value === undefined || value.trim() === "") return null;
   return /^[0-9a-f]{64}$/.test(value)

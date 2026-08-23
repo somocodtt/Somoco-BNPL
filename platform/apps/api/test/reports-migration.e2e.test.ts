@@ -11,6 +11,7 @@ import {
 } from "../src/modules/reports/service.js";
 import {
   createMigrationService,
+  type LegacyImportRow,
   type MigrationService,
 } from "../src/modules/migration/service.js";
 
@@ -119,6 +120,58 @@ describe("reporting and quarantined legacy import", () => {
     expect(serializeCsv([{ nested: { value: "\t@cmd" } }])).not.toContain(
       "\t@cmd",
     );
+  });
+
+  it("authorizes export polling from the persisted report scope and rejects unsafe filters", async () => {
+    const service = createReportService({ database });
+    const importer = principal("MIGRATION_IMPORTER");
+    const support = principal("CUSTOMER_SUPPORT");
+    await seedActor(database, importer);
+    await seedActor(database, support);
+    const migration = await service.export({
+      actor: importer,
+      requestId: randomUUID(),
+      report: "migration",
+      format: "JSON",
+    });
+    await expect(
+      service.getExport({ actor: importer, exportId: migration.id }),
+    ).resolves.toMatchObject({ id: migration.id, report: "migration" });
+
+    const operations = await service.export({
+      actor: support,
+      requestId: randomUUID(),
+      report: "operations",
+      format: "JSON",
+    });
+    await expect(
+      service.getExport({ actor: importer, exportId: operations.id }),
+    ).rejects.toThrow("FORBIDDEN");
+    await expect(
+      service.getExport({ actor: support, exportId: migration.id }),
+    ).rejects.toThrow("FORBIDDEN");
+
+    await expect(
+      service.operations({
+        actor: support,
+        filters: { unknownFilter: "not allowed" },
+      }),
+    ).rejects.toThrow("REPORT_FILTER_NOT_ALLOWED");
+    await expect(
+      service.operations({
+        actor: support,
+        filters: { status: "x".repeat(129) },
+      }),
+    ).rejects.toThrow("REPORT_FILTER_TOO_LARGE");
+    await expect(
+      service.export({
+        actor: support,
+        requestId: randomUUID(),
+        report: "operations",
+        filters: { status: "ACTIVE", oversized: ["x".repeat(128)] },
+        format: "JSON",
+      }),
+    ).rejects.toThrow("REPORT_FILTER_NOT_ALLOWED");
   });
 
   it("queues large exports durably without embedding a raw report payload", async () => {
@@ -682,6 +735,143 @@ describe("reporting and quarantined legacy import", () => {
     );
   });
 
+  it("does not treat a prior failed sample as a passing verification", async () => {
+    const service = createMigrationService({ database });
+    const verifier = principal("VERIFICATION_OFFICER");
+    await seedActor(database, verifier);
+    const { batch } = await createApprovedBoundBatch(
+      database,
+      service,
+      "previous-fail",
+      true,
+    );
+    const recordId = batch.records[0]!.id;
+    await getInternalDatabase(database).execute(sql`
+      insert into migration_sample_evidence
+        (migration_batch_id, migration_record_id, verifier_staff_user_id,
+         result, evidence_hash)
+      values (${batch.id}, ${recordId}, ${verifier.staffUserId}, 'FAIL', NULL)
+    `);
+    await expect(
+      service.verifyBatch({
+        batchId: batch.id,
+        actor: verifier,
+        requestId: randomUUID(),
+        sampleRecordIds: [recordId],
+      }),
+    ).rejects.toThrow("MIGRATION_SAMPLE_PREVIOUS_FAIL");
+    const evidence = await getInternalDatabase(database).execute<{
+      result: string;
+    }>(sql`
+      select result
+        from migration_sample_evidence
+       where migration_batch_id = ${batch.id}
+         and migration_record_id = ${recordId}
+    `);
+    expect(evidence.rows).toEqual([{ result: "FAIL" }]);
+  });
+
+  it("quarantines inconsistent contract, schedule, repayment, arrears, and term evidence", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const cases: readonly {
+      suffix: string;
+      code: string;
+      overrides: Record<string, unknown>;
+    }[] = [
+      {
+        suffix: "schedule-total",
+        code: "INSTALLMENT_SCHEDULE_TOTAL_MISMATCH",
+        overrides: {
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "90",
+              status: "DUE",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "schedule-order",
+        code: "INSTALLMENT_SCHEDULE_ORDER_INVALID",
+        overrides: {
+          installmentSchedule: [
+            {
+              number: 2,
+              dueDate: "2025-03-01",
+              amountMinorUnits: "50",
+              status: "DUE",
+              currency: "GHS",
+            },
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "50",
+              status: "DUE",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "repayment-net",
+        code: "REPAYMENT_TOTAL_MISMATCH",
+        overrides: {
+          totalPaidMinorUnits: "70",
+          currentBalanceMinorUnits: "30",
+          repaymentHistory: [
+            {
+              date: "2025-01-10",
+              amountMinorUnits: "80",
+              type: "PAYMENT",
+              reference: "PAY-1",
+              currency: "GHS",
+            },
+            {
+              date: "2025-01-11",
+              amountMinorUnits: "20",
+              type: "REVERSAL",
+              reference: "REV-1",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "arrears",
+        code: "ARREARS_RECONCILIATION_MISMATCH",
+        overrides: { arrearsMinorUnits: "0", arrearsAsOfDate: "2025-03-01" },
+      },
+      {
+        suffix: "term",
+        code: "TENURE_DATE_RANGE_INVALID",
+        overrides: { tenureMonths: 6 },
+      },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const row = financialRow(item.suffix, item.overrides);
+      const batch = await service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        source: "LEGACY_EXCEL",
+        sourceBatchId: `financial-${item.suffix}`,
+        sourceFileHash: ["6", "7", "8", "9", "a"][index]!.repeat(64),
+        templateVersion: "legacy-v1",
+        expectedRecords: 1,
+        controlTotalMinorUnits: row.currentBalanceMinorUnits,
+        rows: [row],
+      });
+      expect(batch.status).toBe("QUARANTINED");
+      expect(batch.records[0]?.errors).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: item.code })]),
+      );
+    }
+  });
+
   it("activates only a clean bound attachment after verification and finance approval", async () => {
     const service = createMigrationService({ database });
     const importer = principal("VERIFICATION_OFFICER");
@@ -739,6 +929,9 @@ describe("reporting and quarantined legacy import", () => {
             reference: "LEGACY-CONTRACT-1",
             startDate: "2025-01-01",
             endDate: "2026-01-01",
+            totalMinorUnits: "100",
+            principalMinorUnits: "100",
+            openingBalanceMinorUnits: "100",
           },
           vehicle: {
             legacyId: "LEGACY-VEHICLE-1",
@@ -748,6 +941,8 @@ describe("reporting and quarantined legacy import", () => {
           repaymentFrequency: "WEEKLY",
           tenureMonths: 12,
           arrearsMinorUnits: "0",
+          arrearsAsOfDate: "2025-01-15",
+          totalPaidMinorUnits: "0",
           repaymentHistory: [],
           installmentSchedule: [
             {
@@ -827,6 +1022,71 @@ function principal(role: string): StaffPrincipal {
   };
 }
 
+function financialRow(
+  suffix: string,
+  overrides: Record<string, unknown> = {},
+): LegacyImportRow {
+  const base = {
+    sourceRecordId: `financial-${suffix}`,
+    sourceRowNumber: 1,
+    customer: {
+      legacyId: `FIN-APP-${suffix}`,
+      fullName: "Financial Applicant",
+      phoneE164: "+233200000091",
+      ghanaCardFingerprint: "8".repeat(64),
+      dateOfBirth: "1990-01-01",
+    },
+    guarantor: {
+      legacyId: `FIN-GUA-${suffix}`,
+      fullName: "Financial Guarantor",
+      phoneE164: "+233200000092",
+      ghanaCardFingerprint: "9".repeat(64),
+      dateOfBirth: "1985-01-01",
+    },
+    contract: {
+      legacyId: `FIN-CON-${suffix}`,
+      reference: `FIN-REF-${suffix}`,
+      startDate: "2025-01-01",
+      endDate: "2025-12-31",
+      totalMinorUnits: "100",
+      principalMinorUnits: "100",
+      openingBalanceMinorUnits: "100",
+    },
+    vehicle: {
+      legacyId: `FIN-VIN-${suffix}`,
+      vin: `FIN-VIN-${suffix}`,
+      model: "Somoco Model One",
+    },
+    repaymentFrequency: "WEEKLY",
+    tenureMonths: 12,
+    arrearsMinorUnits: "0",
+    arrearsAsOfDate: "2025-01-15",
+    totalPaidMinorUnits: "0",
+    repaymentHistory: [],
+    installmentSchedule: [
+      {
+        number: 1,
+        dueDate: "2025-02-01",
+        amountMinorUnits: "100",
+        status: "DUE",
+        currency: "GHS",
+      },
+    ],
+    currentBalanceMinorUnits: "100",
+  };
+  const overrideContract = overrides.contract;
+  return {
+    ...base,
+    ...overrides,
+    contract: {
+      ...base.contract,
+      ...(typeof overrideContract === "object" && overrideContract !== null
+        ? overrideContract
+        : {}),
+    },
+  } as unknown as LegacyImportRow;
+}
+
 async function seedActor(
   database: Database,
   actor: StaffPrincipal,
@@ -841,6 +1101,7 @@ async function createApprovedBoundBatch(
   database: Database,
   service: MigrationService,
   suffix: string,
+  skipVerification = false,
 ): Promise<{
   batch: Awaited<ReturnType<MigrationService["importBatch"]>>;
   finance: StaffPrincipal;
@@ -902,6 +1163,9 @@ async function createApprovedBoundBatch(
           reference: `APPROVED-${suffix}`,
           startDate: "2025-01-01",
           endDate: "2026-01-01",
+          totalMinorUnits: "100",
+          principalMinorUnits: "100",
+          openingBalanceMinorUnits: "100",
         },
         vehicle: {
           legacyId: `LEGACY-VEHICLE-${suffix}`,
@@ -911,6 +1175,8 @@ async function createApprovedBoundBatch(
         repaymentFrequency: "WEEKLY",
         tenureMonths: 12,
         arrearsMinorUnits: "0",
+        arrearsAsOfDate: "2025-01-15",
+        totalPaidMinorUnits: "0",
         repaymentHistory: [],
         installmentSchedule: [
           {
@@ -926,6 +1192,7 @@ async function createApprovedBoundBatch(
       },
     ],
   });
+  if (skipVerification) return { batch, finance, applicantFingerprint };
   await service.verifyBatch({
     batchId: batch.id,
     actor: verifier,

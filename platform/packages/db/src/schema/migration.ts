@@ -4,6 +4,7 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 import {
   bigint,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -180,9 +181,7 @@ export const migrationSampleEvidence = pgTable(
     migrationBatchId: uuid("migration_batch_id")
       .notNull()
       .references(() => migrationBatch.id, { onDelete: "restrict" }),
-    migrationRecordId: uuid("migration_record_id")
-      .notNull()
-      .references(() => migrationRecord.id, { onDelete: "restrict" }),
+    migrationRecordId: uuid("migration_record_id").notNull(),
     verifierStaffUserId: uuid("verifier_staff_user_id")
       .notNull()
       .references(() => staffUser.id, { onDelete: "restrict" }),
@@ -190,6 +189,7 @@ export const migrationSampleEvidence = pgTable(
       .defaultNow()
       .notNull(),
     result: text("result").notNull(),
+    verificationCommandId: uuid("verification_command_id"),
     evidenceHash: text("evidence_hash"),
   },
   (table) => [
@@ -197,6 +197,11 @@ export const migrationSampleEvidence = pgTable(
       table.migrationBatchId,
       table.migrationRecordId,
     ),
+    foreignKey({
+      columns: [table.migrationBatchId, table.migrationRecordId],
+      foreignColumns: [migrationRecord.migrationBatchId, migrationRecord.id],
+      name: "migration_sample_evidence_batch_record_fk",
+    }).onDelete("restrict"),
     index("migration_sample_evidence_batch_idx").on(
       table.migrationBatchId,
       table.verifiedAt,
@@ -266,6 +271,10 @@ export const migrationRecord = pgTable(
     uniqueIndex("migration_record_source_unique").on(
       table.migrationBatchId,
       table.sourceRecordId,
+    ),
+    uniqueIndex("migration_record_batch_id_id_unique").on(
+      table.migrationBatchId,
+      table.id,
     ),
     index("migration_record_status_idx").on(table.status),
     index("migration_record_source_hash_idx").on(

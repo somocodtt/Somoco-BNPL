@@ -115,4 +115,16 @@ describe("report export worker", () => {
       { reasonCode: "REPORT_EXPORT_REQUEST_MISMATCH" },
     ]);
   });
+
+  it("revalidates persisted filters before generation", async () => {
+    const invalidJob = { ...job(), filters: { unknownFilter: "x" } };
+    const { port, failures } = portFor(invalidJob);
+    const handler = createReportExportHandler(port);
+    await expect(
+      handler(message({ filters: { unknownFilter: "x" } })),
+    ).rejects.toThrow("PERMANENT_WORKER_FAILURE");
+    expect(failures).toMatchObject([
+      { reasonCode: "REPORT_EXPORT_FILTER_INVALID" },
+    ]);
+  });
 });

@@ -106,6 +106,62 @@ const PERSONAL_DATA_ROLES = new Set(["CFO", "MD", "COMPLIANCE_AUDITOR"]);
 const INLINE_EXPORT_ROW_LIMIT = 500;
 const REPORT_PAGE_LIMIT = 1000;
 
+export async function readCanonicalReportPage(input: {
+  database: Database;
+  report: ReportName;
+  filters?: ReportFilters;
+  dataClassification: ReportClassification;
+}): Promise<ReportResult> {
+  const safeFilters = sanitizeReportFilters(input.report, input.filters ?? {});
+  const internal = getInternalDatabase(input.database);
+  const asOfDate = asOfDateFilter(safeFilters);
+  const cursor = decodeCursor(
+    typeof safeFilters.cursor === "string" ? safeFilters.cursor : null,
+  );
+  const rows =
+    input.report === "operations"
+      ? await listOperations(
+          internal,
+          safeFilters,
+          input.dataClassification,
+          cursor,
+        )
+      : input.report === "portfolio"
+        ? await listPortfolio(
+            internal,
+            safeFilters,
+            input.dataClassification,
+            cursor,
+          )
+        : input.report === "audit"
+          ? await listAudit(
+              internal,
+              safeFilters,
+              input.dataClassification,
+              cursor,
+            )
+          : await listMigration(internal, safeFilters, cursor);
+  const migrationTotals = await getMigrationTotals(internal, asOfDate);
+  const truncated = rows.length === REPORT_PAGE_LIMIT;
+  const lastRow = rows.at(-1);
+  return {
+    report: input.report,
+    generatedAt: new Date().toISOString(),
+    dataClassification: input.dataClassification,
+    filters: safeFilters,
+    rows,
+    rowCount: rows.length,
+    pagination: {
+      limit: REPORT_PAGE_LIMIT,
+      truncated,
+      nextCursor: truncated ? cursorFromRow(input.report, lastRow) : null,
+      totalRows: truncated ? null : rows.length,
+    },
+    migrationTotals,
+    summary: summarize(input.report, rows, migrationTotals),
+  };
+}
+
 export function createReportService(options: {
   database: Database;
 }): ReportService {
@@ -116,50 +172,12 @@ export function createReportService(options: {
   ): Promise<ReportResult> {
     requireReportRead(actor, report);
     const dataClassification = classify(actor, filters);
-    const internal = getInternalDatabase(options.database);
-    const safeFilters = sanitizeFilters(filters);
-    const asOfDate = asOfDateFilter(safeFilters);
-    const cursor = decodeCursor(
-      typeof safeFilters.cursor === "string" ? safeFilters.cursor : null,
-    );
-    const rows =
-      report === "operations"
-        ? await listOperations(
-            internal,
-            safeFilters,
-            dataClassification,
-            cursor,
-          )
-        : report === "portfolio"
-          ? await listPortfolio(
-              internal,
-              safeFilters,
-              dataClassification,
-              cursor,
-            )
-          : report === "audit"
-            ? await listAudit(internal, safeFilters, dataClassification, cursor)
-            : await listMigration(internal, safeFilters, cursor);
-    const migrationTotals = await getMigrationTotals(internal, asOfDate);
-    const truncated = rows.length === REPORT_PAGE_LIMIT;
-    const lastRow = rows.at(-1);
-    const nextCursor = truncated ? cursorFromRow(report, lastRow) : null;
-    return {
+    return readCanonicalReportPage({
+      database: options.database,
       report,
-      generatedAt: new Date().toISOString(),
+      filters,
       dataClassification,
-      filters: safeFilters,
-      rows,
-      rowCount: rows.length,
-      pagination: {
-        limit: REPORT_PAGE_LIMIT,
-        truncated,
-        nextCursor,
-        totalRows: truncated ? null : rows.length,
-      },
-      migrationTotals,
-      summary: summarize(report, rows, migrationTotals),
-    };
+    });
   }
 
   return {
@@ -296,7 +314,6 @@ export function createReportService(options: {
       };
     },
     async getExport(input) {
-      requireReportRead(input.actor, "operations");
       const internal = getInternalDatabase(options.database);
       const result = await internal.execute<{
         id: string;
@@ -318,6 +335,17 @@ export function createReportService(options: {
       `);
       const row = result.rows[0];
       if (row === undefined) return null;
+      const persistedReport = row.report_type.toLowerCase() as ReportName;
+      requireReportRead(input.actor, persistedReport);
+      if (
+        row.data_classification === "PERSONAL_DATA" &&
+        !canViewPersonalData(input.actor)
+      )
+        throw new AppError(
+          403,
+          "REPORT_EXPORT_FORBIDDEN",
+          "This export is not available to the staff role.",
+        );
       if (
         row.requester_staff_user_id !== input.actor.staffUserId &&
         !canViewPersonalData(input.actor)
@@ -343,7 +371,7 @@ export function createReportService(options: {
       const artifact = event?.artifact ?? row.artifact;
       return {
         id: row.id,
-        report: row.report_type.toLowerCase() as ReportName,
+        report: persistedReport,
         format: row.format,
         dataClassification: row.data_classification,
         requesterStaffUserId: row.requester_staff_user_id,
@@ -407,14 +435,72 @@ function classify(
   return "REDACTED";
 }
 
-function sanitizeFilters(filters: ReportFilters): Record<string, unknown> {
+const REPORT_FILTER_ALLOWLIST: Record<ReportName, ReadonlySet<string>> = {
+  operations: new Set(["status", "asOfDate", "cursor", "includePersonalData"]),
+  portfolio: new Set(["status", "asOfDate", "cursor", "includePersonalData"]),
+  audit: new Set(["asOfDate", "cursor", "includePersonalData"]),
+  migration: new Set(["asOfDate", "cursor", "includePersonalData"]),
+};
+const MAX_FILTER_KEYS = 8;
+const MAX_FILTER_STRING_LENGTH = 128;
+const MAX_FILTER_ARRAY_LENGTH = 32;
+const MAX_FILTER_BYTES = 2048;
+
+export function sanitizeReportFilters(
+  report: ReportName,
+  filters: ReportFilters,
+): Record<string, unknown> {
+  const entries = Object.entries(filters);
+  if (entries.length > MAX_FILTER_KEYS)
+    throw new AppError(
+      400,
+      "REPORT_FILTER_TOO_LARGE",
+      "Too many report filters were supplied.",
+    );
   const safe: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(filters)) {
-    if (key === "staffUserId" || key === "includePersonalData") continue;
-    if (typeof value === "string") safe[key] = value.slice(0, 128);
-    else if (typeof value === "number" || typeof value === "boolean")
-      safe[key] = value;
+  for (const [key, value] of entries) {
+    if (!REPORT_FILTER_ALLOWLIST[report].has(key))
+      throw new AppError(
+        400,
+        "REPORT_FILTER_NOT_ALLOWED",
+        "The supplied report filter is not permitted.",
+      );
+    if (key === "includePersonalData") {
+      if (typeof value !== "boolean")
+        throw new AppError(
+          400,
+          "REPORT_FILTER_INVALID",
+          "The personal-data filter must be boolean.",
+        );
+      continue;
+    }
+    if (typeof value !== "string") {
+      if (Array.isArray(value) && value.length > MAX_FILTER_ARRAY_LENGTH)
+        throw new AppError(
+          400,
+          "REPORT_FILTER_TOO_LARGE",
+          "The report filter array is too large.",
+        );
+      throw new AppError(
+        400,
+        "REPORT_FILTER_INVALID",
+        "Report filters must use bounded strings.",
+      );
+    }
+    if (value.length > MAX_FILTER_STRING_LENGTH)
+      throw new AppError(
+        400,
+        "REPORT_FILTER_TOO_LARGE",
+        "The report filter value is too large.",
+      );
+    safe[key] = value;
   }
+  if (Buffer.byteLength(canonicalJson(safe), "utf8") > MAX_FILTER_BYTES)
+    throw new AppError(
+      400,
+      "REPORT_FILTER_TOO_LARGE",
+      "The canonical report filters are too large.",
+    );
   return safe;
 }
 

@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(28);
+    expect(before.rows[0]?.count).toBe(29);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1489,6 +1489,28 @@ describe("populated legacy schema migration", () => {
       pool,
       "0027_complete_export_and_migration_lifecycles.sql",
     );
+    const otherBatchId = randomUUID();
+    const otherRecordId = randomUUID();
+    const verifierId = randomUUID();
+    await pool.query(
+      `insert into staff_user (id, email, password_hash, status)
+       values ($1, $2, 'hash', 'ACTIVE')`,
+      [verifierId, `${verifierId}@example.test`],
+    );
+    await pool.query(
+      `insert into migration_batch (id, source, source_batch_id, expected_records)
+       values ($1, 'LEGACY_CSV', $2, 1)`,
+      [otherBatchId, `other-${randomUUID()}`],
+    );
+    await pool.query(
+      `insert into migration_record (id, migration_batch_id, source_record_id, payload)
+       values ($1, $2, $3, '{}'::jsonb)`,
+      [otherRecordId, otherBatchId, `other-row-${randomUUID()}`],
+    );
+    await applyMigrationFile(
+      pool,
+      "0028_composite_migration_sample_binding.sql",
+    );
 
     const preserved = await pool.query<{
       source_record_id: string;
@@ -1543,6 +1565,15 @@ describe("populated legacy schema migration", () => {
         transitionId.rows[0]!.id,
       ]),
     ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(
+        `insert into migration_sample_evidence
+          (migration_batch_id, migration_record_id, verifier_staff_user_id,
+           result)
+         values ($1, $2, $3, 'PASS')`,
+        [batchId, otherRecordId, verifierId],
+      ),
+    ).rejects.toMatchObject({ code: "23503" });
 
     await expect(
       pool.query(`update migration_record set status = 'VALID' where id = $1`, [

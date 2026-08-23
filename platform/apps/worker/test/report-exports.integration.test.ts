@@ -8,6 +8,7 @@ import {
   createDatabaseReportExportCompletionPort,
   createReportExportHandler,
 } from "../src/jobs/report-exports.js";
+import { createReportService } from "../../api/src/modules/reports/service.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (databaseUrl === undefined)
@@ -220,5 +221,75 @@ describe("PostgreSQL report export worker", () => {
        where report_export_id = ${exportId} and event_type = 'READY'
     `);
     expect(ready.rows[0]?.artifact.rowCount).toBe(1001);
+  });
+
+  it("matches the API report projection for a queued export", async () => {
+    const staffId = randomUUID();
+    await getInternalDatabase(database).execute(sql`
+      insert into staff_user (id, email, password_hash, status)
+      values (${staffId}, ${staffId + "@example.test"}, 'hash', 'ACTIVE')
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.person (id, phone_e164)
+      select gen_random_uuid(), '+233230' || lpad(series::text, 7, '0')
+        from generate_series(1, 501) as series
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into application (applicant_person_id, status)
+      select id, 'ACTIVE'::application_status
+        from privacy.person where phone_e164 like '+233230%'
+    `);
+    const actor = {
+      kind: "staff" as const,
+      staffUserId: staffId,
+      roles: ["CUSTOMER_SUPPORT" as const],
+      sessionId: randomUUID(),
+    };
+    const reportService = createReportService({ database });
+    const apiReport = await reportService.operations({
+      actor,
+      filters: { status: "ACTIVE" },
+    });
+    const exported = await reportService.export({
+      actor,
+      requestId: randomUUID(),
+      report: "operations",
+      filters: { status: "ACTIVE" },
+      format: "JSON",
+    });
+    expect(exported.status).toBe("QUEUED");
+    const outbox = await getInternalDatabase(database).execute<{
+      id: string;
+      payload: Record<string, unknown>;
+    }>(sql`
+      select id, payload
+        from outbox_message
+       where aggregate_id = ${exported.id}
+         and topic = 'report.export.requested'
+       limit 1
+    `);
+    const message = {
+      id: outbox.rows[0]!.id,
+      topic: "report.export.requested",
+      aggregateType: "report_export",
+      aggregateId: exported.id,
+      occurredAt: new Date(),
+      attempts: 1,
+      payload: outbox.rows[0]!.payload,
+    };
+    const handler = createReportExportHandler(
+      createDatabaseReportExportCompletionPort(database),
+    );
+    await handler(message);
+    const ready = await getInternalDatabase(database).execute<{
+      artifact: { content?: string };
+    }>(sql`
+      select artifact
+        from report_export_event
+       where report_export_id = ${exported.id}
+         and event_type = 'READY'
+    `);
+    const workerRows = JSON.parse(ready.rows[0]!.artifact.content!).rows;
+    expect(workerRows).toEqual(apiReport.rows);
   });
 });
