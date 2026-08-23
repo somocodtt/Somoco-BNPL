@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "./schema/index.js";
@@ -38,4 +39,13 @@ export function getInternalDatabase(db: Database): InternalDatabase {
     throw new Error("DATABASE_CAPABILITY_INVALID");
   }
   return executor;
+}
+
+export async function probeDatabase(db: Database): Promise<boolean> {
+  try {
+    await getInternalDatabase(db).execute(sql`select 1`);
+    return true;
+  } catch {
+    return false;
+  }
 }

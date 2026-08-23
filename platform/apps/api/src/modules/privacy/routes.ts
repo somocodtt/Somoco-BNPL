@@ -65,14 +65,17 @@ export async function registerPrivacyRoutes(
         },
       },
     },
-    async (request, reply) =>
-      reply.send(
+    async (request, reply) => {
+      const actor = complianceActor(request);
+      return reply.send(
         await privacy.listRequests({
+          actor,
           ...(request.query.status === undefined
             ? {}
             : { status: request.query.status }),
         }),
-      ),
+      );
+    },
   );
 
   app.post<{
@@ -116,7 +119,7 @@ export async function registerPrivacyRoutes(
     },
     async (request, reply) => {
       const actor = complianceActor(request);
-      const requests = await privacy.listRequests();
+      const requests = await privacy.listRequests({ actor });
       const target = requests.find(
         (item) => item.id === request.params.requestId,
       );
@@ -155,7 +158,7 @@ export async function registerPrivacyRoutes(
     },
     async (request, reply) => {
       const actor = complianceActor(request);
-      const target = (await privacy.listRequests()).find(
+      const target = (await privacy.listRequests({ actor })).find(
         (item) => item.id === request.params.requestId,
       );
       if (target === undefined) {
@@ -299,7 +302,13 @@ export async function registerPrivacyRoutes(
 function complianceActor(request: Parameters<typeof requireStaffPrincipal>[0]) {
   const principal = requireStaffPrincipal(request);
   const role = principal.roles.find((item) =>
-    ["COMPLIANCE_AUDITOR", "SYSTEM_ADMIN"].includes(item),
+    [
+      "COMPLIANCE",
+      "COMPLIANCE_OFFICER",
+      "COMPLIANCE_AUDITOR",
+      "DPO",
+      "SYSTEM_ADMIN",
+    ].includes(item),
   );
   if (role === undefined) {
     throw new AppError(

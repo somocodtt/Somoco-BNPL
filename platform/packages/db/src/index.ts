@@ -1,8 +1,13 @@
 export {
   createDatabase,
+  probeDatabase,
   type Database,
   type DatabaseConnection,
 } from "./client.js";
+export {
+  currentOutboxCorrelationId,
+  enterOutboxCorrelationId,
+} from "./outbox-context.js";
 export {
   completeInboxMessage,
   receiveInboxMessage,

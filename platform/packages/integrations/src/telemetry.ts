@@ -18,6 +18,7 @@ export interface PublicHealthSnapshot {
 export interface Telemetry {
   correlationId(candidate?: string): string;
   currentCorrelationId(): string | undefined;
+  enterCorrelationId(correlationId: string): void;
   withCorrelationId<T>(
     correlationId: string,
     operation: () => Promise<T>,
@@ -60,6 +61,10 @@ export function createTelemetry(): Telemetry {
 
     currentCorrelationId() {
       return context.getStore();
+    },
+
+    enterCorrelationId(correlationId) {
+      context.enterWith(api.correlationId(correlationId));
     },
 
     async withCorrelationId(correlationId, operation) {
@@ -123,9 +128,11 @@ export function createTelemetry(): Telemetry {
 
     readiness() {
       return {
-        status: [...dependencies.values()].every((status) => status === "UP")
-          ? "ok"
-          : "not_ready",
+        status:
+          dependencies.size > 0 &&
+          [...dependencies.values()].every((status) => status === "UP")
+            ? "ok"
+            : "not_ready",
       };
     },
 

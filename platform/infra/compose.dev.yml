@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: somo_test_only
       POSTGRES_DB: somo_bnpl_test
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -26,15 +26,15 @@ services:
       MINIO_ROOT_USER: local-only-access
       MINIO_ROOT_PASSWORD: local-only-secret-at-least-32-characters
     ports:
-      - "59000:9000"
-      - "59001:9001"
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"
     volumes:
       - object-storage-data:/data
 
   clamav:
     image: clamav/clamav:1.4
     ports:
-      - "53310:3310"
+      - "127.0.0.1:53310:3310"
     volumes:
       - clamav-data:/var/lib/clamav
 

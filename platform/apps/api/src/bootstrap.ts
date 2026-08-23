@@ -5,6 +5,7 @@ import {
   validateProductionIdentityComposition,
   type ProductionIdentityComposition,
 } from "./production-composition.js";
+import { verifyPilotGates } from "./pilot-gates.js";
 
 export { validateProductionIdentityComposition };
 
@@ -36,6 +37,15 @@ export async function bootstrapApi(
         : await options.loadComposition();
     identity = validateProductionIdentityComposition(loaded);
     applications = loadProductionApplicationPolicy(env);
+    await verifyPilotGates({
+      environment: "production",
+      ...(env.PILOT_GATE_EVIDENCE_FILE === undefined
+        ? {}
+        : { evidenceFile: env.PILOT_GATE_EVIDENCE_FILE }),
+      ...(env.PILOT_GATE_PUBLIC_KEY_PEM === undefined
+        ? {}
+        : { publicKey: env.PILOT_GATE_PUBLIC_KEY_PEM }),
+    });
   }
   const build = options.build ?? buildApp;
   const app = await build({

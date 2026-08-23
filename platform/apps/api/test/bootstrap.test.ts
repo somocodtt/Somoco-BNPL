@@ -31,6 +31,12 @@ const config: AppConfig = {
   argon2TimeCost: 2,
   argon2Parallelism: 1,
   requireVerifiedMfa: true,
+  niaAdapter: "approved-nia",
+  smsAdapter: "approved-sms",
+  paymentAdapter: "approved-payment",
+  objectStoragePublic: false,
+  encryptionKeyRef: "secret/somo/prod/document-encryption",
+  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
 };
 
 describe("production API bootstrap", () => {
@@ -77,7 +83,7 @@ describe("production API bootstrap", () => {
     expect(build).not.toHaveBeenCalled();
   });
 
-  it("uses actual NODE_ENV, validates every leaf, and listens only afterward", async () => {
+  it("uses actual NODE_ENV and blocks listen without signed pilot gates", async () => {
     const events: string[] = [];
     const build = vi.fn(async () => ({
       async listen() {
@@ -89,31 +95,23 @@ describe("production API bootstrap", () => {
       return productionComposition();
     });
 
-    await bootstrapApi({
-      config: { ...config, environment: "test", port: 0 },
-      env: {
-        NODE_ENV: "production",
-        APPLICATION_INVITATION_HASH_SECRET:
-          "production-test-invitation-secret-at-least-32-chars",
-        APPLICATION_INVITATION_TTL_MS: "1800000",
-        APPLICATION_REQUIRED_DOCUMENT_TYPES: "GHANA_CARD_FRONT",
-      },
-      build,
-      loadComposition,
-    });
-
-    expect(events).toEqual(["composition", "listen"]);
-    expect(build).toHaveBeenCalledOnce();
-    expect(build).toHaveBeenCalledWith(
-      expect.objectContaining({
-        applications: {
-          invitationHashSecret:
+    await expect(
+      bootstrapApi({
+        config: { ...config, environment: "test", port: 0 },
+        env: {
+          NODE_ENV: "production",
+          APPLICATION_INVITATION_HASH_SECRET:
             "production-test-invitation-secret-at-least-32-chars",
-          invitationTtlMs: 1_800_000,
-          requiredDocumentTypes: ["GHANA_CARD_FRONT"],
+          APPLICATION_INVITATION_TTL_MS: "1800000",
+          APPLICATION_REQUIRED_DOCUMENT_TYPES: "GHANA_CARD_FRONT",
         },
+        build,
+        loadComposition,
       }),
-    );
+    ).rejects.toThrow("PILOT_GATE_EVIDENCE_FILE_REQUIRED");
+
+    expect(events).toEqual(["composition"]);
+    expect(build).not.toHaveBeenCalled();
   });
 });
 

@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-import { createDatabase, type Database } from "@somo/db";
+import { createDatabase, probeDatabase, type Database } from "@somo/db";
 import { createDatabaseOutboxStore } from "./database-outbox-store.js";
 import {
   dispatchOutboxBatch,
@@ -196,15 +196,20 @@ export function validateWorkerHandlerRegistry(
 
 export async function runWorkerProcess(
   config: WorkerProcessConfig,
+  options: { databaseProbe?: (database: Database) => Promise<boolean> } = {},
 ): Promise<void> {
   const connection = createDatabase(config.databaseUrl);
   const telemetry = createTelemetry();
-  telemetry.setDependency("postgres", "UP");
   const stopController = new AbortController();
   const stop = () => stopController.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
+    await assertWorkerDatabaseReady(
+      connection.db,
+      options.databaseProbe ?? probeDatabase,
+    );
+    telemetry.setDependency("postgres", "UP");
     const handlers = await loadWorkerHandlers(
       config.handlersModule,
       connection.db,
@@ -224,6 +229,19 @@ export async function runWorkerProcess(
     process.removeListener("SIGTERM", stop);
     await connection.close();
   }
+}
+
+export async function assertWorkerDatabaseReady(
+  database: Database,
+  probe: (database: Database) => Promise<boolean> = probeDatabase,
+): Promise<void> {
+  let ready: boolean;
+  try {
+    ready = await probe(database);
+  } catch {
+    ready = false;
+  }
+  if (!ready) throw new Error("WORKER_DATABASE_NOT_READY");
 }
 
 async function loadWorkerHandlers(

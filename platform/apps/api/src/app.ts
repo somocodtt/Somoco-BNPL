@@ -1,4 +1,4 @@
-import { createDatabase, type Database } from "@somo/db";
+import { createDatabase, probeDatabase, type Database } from "@somo/db";
 import type { Writable } from "node:stream";
 import fastify, { type FastifyInstance, LogController } from "fastify";
 import { type AppConfig, loadConfig, validateConfig } from "./config.js";
@@ -141,6 +141,7 @@ export interface BuildAppOptions {
     name: string;
     check: () => Promise<boolean>;
   }[];
+  databaseProbe?: (database: Database) => Promise<boolean>;
 }
 
 export async function buildApp(
@@ -150,6 +151,9 @@ export async function buildApp(
     options.config === undefined
       ? loadConfig()
       : validateConfig(options.config);
+  const productionRuntime =
+    config.environment === "production" ||
+    process.env.NODE_ENV === "production";
   if (
     config.environment === "production" &&
     options.financing?.fixtureGate !== undefined &&
@@ -165,15 +169,26 @@ export async function buildApp(
       ? createDatabase(config.databaseUrl)
       : undefined;
   const database = options.database ?? connection!.db;
-  if (
-    config.environment === "production" &&
-    config.productionControlsConfigured === true &&
-    options.privacy?.service === undefined
-  ) {
+  if (productionRuntime && options.privacy?.service === undefined) {
     throw new Error("PRODUCTION_PRIVACY_COMPOSITION_REQUIRED");
   }
   const telemetry = options.telemetry ?? createTelemetry();
-  telemetry.setDependency("postgres", "UP");
+  const databaseReady = await (options.databaseProbe ?? probeDatabase)(
+    database,
+  );
+  telemetry.setDependency("postgres", databaseReady ? "UP" : "DOWN");
+  if (productionRuntime) {
+    for (const dependency of [
+      "nia",
+      "sms",
+      "payment",
+      "object-storage",
+      "malware-scanner",
+      "privacy",
+    ]) {
+      telemetry.setDependency(dependency, "DOWN");
+    }
+  }
   for (const dependency of options.dependencyChecks ?? []) {
     try {
       telemetry.setDependency(
@@ -223,7 +238,7 @@ export async function buildApp(
     });
   }
 
-  await registerRequestContext(app);
+  await registerRequestContext(app, telemetry);
   registerHealthRoutes(app, telemetry);
   await registerProblemErrors(app);
   await registerSecurity(app, config);

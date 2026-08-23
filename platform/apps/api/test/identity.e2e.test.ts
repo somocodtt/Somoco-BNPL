@@ -61,6 +61,12 @@ const testConfig: AppConfig = {
   argon2TimeCost: 2,
   argon2Parallelism: 1,
   requireVerifiedMfa: false,
+  niaAdapter: "approved-nia",
+  smsAdapter: "approved-sms",
+  paymentAdapter: "approved-payment",
+  objectStoragePublic: false,
+  encryptionKeyRef: "secret/somo/test/document-encryption",
+  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
 };
 
 const otpPolicy: OtpPolicy = {

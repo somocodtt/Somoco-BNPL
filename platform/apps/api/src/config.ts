@@ -25,8 +25,6 @@ export interface AppConfig {
   objectStoragePublic?: boolean;
   encryptionKeyRef?: string;
   backupLastVerifiedAt?: string;
-  /** Set only by loadConfig after required production environment checks. */
-  productionControlsConfigured?: boolean;
   mainHeadOfficeId?: string;
   mainHeadOfficeLocation?: string;
 }
@@ -95,7 +93,6 @@ export function loadConfig(
             env.BACKUP_LAST_VERIFIED_AT ?? env.BACKUP_VERIFICATION_AT,
             "BACKUP_LAST_VERIFIED_AT",
           ),
-          productionControlsConfigured: true,
         }
       : {
           ...(env.NIA_ADAPTER === undefined
@@ -207,32 +204,30 @@ export function validateConfig(config: AppConfig): AppConfig {
     validateAdapterName(config.niaAdapter);
     validateAdapterName(config.smsAdapter);
     validateAdapterName(config.paymentAdapter);
+    if (config.niaAdapter === undefined || config.niaAdapter.trim() === "")
+      throw new Error("PRODUCTION_NIA_ADAPTER_REQUIRED");
+    if (config.smsAdapter === undefined || config.smsAdapter.trim() === "")
+      throw new Error("PRODUCTION_SMS_ADAPTER_REQUIRED");
     if (
-      config.objectStoragePublic !== undefined &&
-      config.objectStoragePublic
-    ) {
-      throw new Error("PRODUCTION_OBJECT_STORAGE_MUST_BE_PRIVATE");
+      config.paymentAdapter === undefined ||
+      config.paymentAdapter.trim() === ""
+    )
+      throw new Error("PRODUCTION_PAYMENT_ADAPTER_REQUIRED");
+    if (config.objectStoragePublic !== false) {
+      if (config.objectStoragePublic === true)
+        throw new Error("PRODUCTION_OBJECT_STORAGE_MUST_BE_PRIVATE");
+      throw new Error("PRODUCTION_OBJECT_STORAGE_CONFIGURATION_REQUIRED");
     }
     if (
-      config.encryptionKeyRef !== undefined &&
+      config.encryptionKeyRef === undefined ||
       config.encryptionKeyRef.trim() === ""
     ) {
       throw new Error("PRODUCTION_ENCRYPTION_KEY_REFERENCE_REQUIRED");
     }
-    if (config.backupLastVerifiedAt !== undefined) {
-      validateBackupVerification(config.backupLastVerifiedAt);
+    if (config.backupLastVerifiedAt === undefined) {
+      throw new Error("PRODUCTION_BACKUP_VERIFICATION_REQUIRED");
     }
-    if (config.productionControlsConfigured === true) {
-      if (config.objectStoragePublic !== false) {
-        throw new Error("PRODUCTION_OBJECT_STORAGE_CONFIGURATION_REQUIRED");
-      }
-      if (config.encryptionKeyRef === undefined) {
-        throw new Error("PRODUCTION_ENCRYPTION_KEY_REFERENCE_REQUIRED");
-      }
-      if (config.backupLastVerifiedAt === undefined) {
-        throw new Error("PRODUCTION_BACKUP_VERIFICATION_REQUIRED");
-      }
-    }
+    validateBackupVerification(config.backupLastVerifiedAt);
   }
   if (
     (config.mainHeadOfficeId === undefined) !==

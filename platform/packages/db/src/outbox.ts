@@ -5,6 +5,7 @@ import {
   getInternalExecutor,
   type DatabaseTransaction,
 } from "./transaction.js";
+import { currentOutboxCorrelationId } from "./outbox-context.js";
 
 export interface OutboxMessage {
   id: string;
@@ -59,12 +60,32 @@ export async function enqueueOutbox(
   db: Database | DatabaseTransaction,
   message: NewOutboxMessage,
 ): Promise<OutboxMessage> {
+  const correlationId = currentOutboxCorrelationId();
+  const payload = addCorrelationId(message.payload, correlationId);
   const [inserted] = await getInternalExecutor(db)
     .insert(outboxMessage)
-    .values({ ...message, availableAt: message.occurredAt })
+    .values({ ...message, payload, availableAt: message.occurredAt })
     .returning();
   if (inserted === undefined) throw new Error("OUTBOX_ENQUEUE_FAILED");
   return toOutboxMessage(inserted);
+}
+
+function addCorrelationId(
+  payload: unknown,
+  correlationId: string | undefined,
+): unknown {
+  if (
+    correlationId === undefined ||
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload)
+  ) {
+    return payload;
+  }
+  const record = payload as Record<string, unknown>;
+  return typeof record.correlationId === "string"
+    ? payload
+    : { ...record, correlationId };
 }
 
 export async function claimOutboxBatch(

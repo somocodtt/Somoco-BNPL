@@ -81,3 +81,56 @@ Bank of Ghana/licence, legal contract/disclosure, DPC registration/DPIA/privacy,
 real NIA/SMS/payment adapters, approved hosting/TLS/secrets/object storage,
 finance calculation, encrypted backup/restore rehearsal, independent security
 testing, and operational ownership evidence remain required release gates.
+
+## Review fix round (3278a98..fix commit)
+
+The independent review findings were addressed without widening the Task 14
+scope:
+
+- Every production `AppConfig`, including direct object construction, now
+  requires non-simulator NIA/SMS/payment declarations, private object storage,
+  key reference, and current backup verification. The caller-set
+  `productionControlsConfigured` bypass was removed. Production composition
+  cannot fall back to the in-memory privacy service.
+- Bootstrap verifies the same signed, current, environment-bound ten-gate
+  contract before build/listen. Synthetic signed evidence is available only
+  when the verifier is explicitly run in test mode.
+- API readiness probes PostgreSQL with `select 1`, starts required production
+  dependency statuses DOWN until explicit checks pass, and exposes only the
+  public status. Worker startup probes PostgreSQL and fails with
+  `WORKER_DATABASE_NOT_READY` before loading handlers or dispatching work.
+- Staff privacy listing and internal request lookup require a compliance role;
+  terminal requests cannot be reviewed, corrected, restricted, or reopened.
+  Retention policy versions are immutable and identical approvals are
+  idempotent. Retention marks subject state and exports only an anonymized
+  marker while retaining internal correction/restriction evidence.
+- API request hooks enter the telemetry and durable outbox correlation
+  contexts. `enqueueOutbox` carries the correlation ID into object payloads;
+  worker dispatch reuses it rather than creating a new trace.
+- Local compose ports are bound to `127.0.0.1`.
+
+Fix-round TDD evidence:
+
+- RED: `vitest run apps/api/test/task14-security-gaps.test.ts packages/db/src/outbox-context.test.ts`
+  failed **8/8** adversarial API assertions and could not import the missing
+  outbox-context module before implementation.
+- GREEN: the adversarial API/worker/db suites pass **13/13**; the prior focused
+  suites plus the new suites pass **9 files, 28 tests**.
+
+Fresh fix-round verification:
+
+- API, worker, DB, integrations, customer-web, and staff-web TypeScript
+  checks — **exit 0**.
+- API and worker TypeScript builds plus integrations build — **exit 0**.
+- Affected ESLint — **exit 0**.
+- Affected Prettier check — **exit 0**.
+- `node scripts/verify-pilot-gates.mjs --environment test` — **10 signed gates
+  verified**.
+- `git diff --check` — **exit 0**.
+
+The earlier worker esbuild wrapper limitation remains documented above; it was
+an environment sandbox path-resolution failure, while the worker TypeScript
+build and focused worker tests pass. This fix round likewise does not claim
+real production launch readiness; signed provider, legal/privacy, hosting,
+restore, independent security, and operational release gates remain external
+blockers.

@@ -55,6 +55,7 @@ export interface PrivacyService {
   listRequests(input?: {
     subjectId?: string;
     status?: PrivacyRequestStatus;
+    actor?: PrivacyActor;
   }): Promise<readonly PrivacyRequest[]>;
   reviewRequest(input: {
     requestId: string;
@@ -135,6 +136,7 @@ export interface RetentionResult {
 }
 
 interface SubjectRecord {
+  createdAt: string;
   corrections: PrivacyCorrection[];
   restrictions: PrivacyRestriction[];
   legalHold: { reason: string; placedAt: string } | null;
@@ -174,7 +176,7 @@ export function createPrivacyService(
   const subjects = new Map<string, SubjectRecord>();
   const policies = new Map<string, RetentionPolicy>();
   for (const subjectId of options.subjectIds ?? [])
-    ensureSubject(subjects, subjectId);
+    ensureSubject(subjects, subjectId, now().toISOString());
 
   return {
     async openRequest(input) {
@@ -194,11 +196,14 @@ export function createPrivacyService(
         updatedAt: createdAt,
       };
       requests.set(request.id, request);
-      ensureSubject(subjects, request.subjectId);
+      ensureSubject(subjects, request.subjectId, createdAt);
       return request;
     },
 
     async listRequests(input = {}) {
+      if (input.actor !== undefined || input.subjectId === undefined) {
+        assertComplianceActor(input.actor);
+      }
       return [...requests.values()].filter(
         (request) =>
           (input.subjectId === undefined ||
@@ -210,8 +215,7 @@ export function createPrivacyService(
     async reviewRequest(input) {
       assertComplianceActor(input.actor);
       const request = getRequest(requests, input.requestId);
-      if (request.status === "CLOSED" || request.status === "COMPLETED")
-        throw privacyError("PRIVACY_REQUEST_ALREADY_CLOSED", 409);
+      assertRequestMutable(request);
       const updated = {
         ...request,
         status: "IN_REVIEW" as const,
@@ -224,8 +228,7 @@ export function createPrivacyService(
     async closeRequest(input) {
       assertComplianceActor(input.actor);
       const request = getRequest(requests, input.requestId);
-      if (request.status === "CLOSED")
-        throw privacyError("PRIVACY_REQUEST_ALREADY_CLOSED", 409);
+      assertRequestMutable(request);
       const updated = {
         ...request,
         status: input.outcome ?? "COMPLETED",
@@ -245,6 +248,17 @@ export function createPrivacyService(
       if (request.status === "REJECTED" || request.status === "CLOSED")
         throw privacyError("PRIVACY_EXPORT_NOT_AUTHORIZED", 403);
       const record = ensureSubject(subjects, input.subjectId);
+      if (record.anonymizedAt !== null) {
+        return {
+          subjectId: input.subjectId,
+          profile: {
+            anonymized: true,
+            anonymizedAt: record.anonymizedAt,
+          },
+          restrictions: [],
+          corrections: [],
+        };
+      }
       const raw = await subjectData(input.subjectId);
       const profile =
         raw.profile !== null &&
@@ -268,6 +282,7 @@ export function createPrivacyService(
         request.subjectId !== input.subjectId
       )
         throw privacyError("PRIVACY_CORRECTION_NOT_AUTHORIZED", 403);
+      assertRequestMutable(request);
       if (!correctionFieldPattern.test(input.field))
         throw privacyError("PRIVACY_CORRECTION_FIELD_INVALID", 400);
       if (immutableFieldPattern.test(input.field))
@@ -299,6 +314,7 @@ export function createPrivacyService(
         request.subjectId !== input.subjectId
       )
         throw privacyError("PRIVACY_RESTRICTION_NOT_AUTHORIZED", 403);
+      assertRequestMutable(request);
       if (input.reason.trim() === "")
         throw privacyError("PRIVACY_RESTRICTION_REASON_REQUIRED", 400);
       const record = ensureSubject(subjects, input.subjectId);
@@ -344,6 +360,13 @@ export function createPrivacyService(
         throw privacyError("PRIVACY_RETENTION_POLICY_INVALID", 400);
       if (!Number.isSafeInteger(input.retentionDays) || input.retentionDays < 1)
         throw privacyError("PRIVACY_RETENTION_POLICY_INVALID", 400);
+      const existing = policies.get(input.version);
+      if (existing !== undefined) {
+        if (existing.retentionDays !== input.retentionDays) {
+          throw privacyError("PRIVACY_RETENTION_POLICY_IMMUTABLE", 409);
+        }
+        return existing;
+      }
       const policy: RetentionPolicy = {
         version: input.version,
         retentionDays: input.retentionDays,
@@ -372,7 +395,8 @@ export function createPrivacyService(
           retained += 1;
           continue;
         }
-        const latestActivity = record.corrections.at(-1)?.recordedAt;
+        const latestActivity =
+          record.corrections.at(-1)?.recordedAt ?? record.createdAt;
         if (
           latestActivity === undefined ||
           asOf.getTime() - new Date(latestActivity).getTime() <
@@ -399,10 +423,12 @@ export function createPrivacyService(
 function ensureSubject(
   subjects: Map<string, SubjectRecord>,
   subjectId: string,
+  createdAt = new Date().toISOString(),
 ): SubjectRecord {
   const existing = subjects.get(subjectId);
   if (existing !== undefined) return existing;
   const created: SubjectRecord = {
+    createdAt,
     corrections: [],
     restrictions: [],
     legalHold: null,
@@ -422,6 +448,16 @@ function getRequest(
   return request;
 }
 
+function assertRequestMutable(request: PrivacyRequest): void {
+  if (
+    request.status === "COMPLETED" ||
+    request.status === "REJECTED" ||
+    request.status === "CLOSED"
+  ) {
+    throw privacyError("PRIVACY_REQUEST_TERMINAL", 409);
+  }
+}
+
 function assertSubjectId(value: string): void {
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -431,8 +467,12 @@ function assertSubjectId(value: string): void {
     throw privacyError("PRIVACY_SUBJECT_INVALID", 400);
 }
 
-function assertComplianceActor(actor: PrivacyActor): void {
-  if (!actor.id.trim() || !complianceRoles.has(actor.role?.toUpperCase() ?? ""))
+function assertComplianceActor(actor: PrivacyActor | undefined): void {
+  if (
+    actor === undefined ||
+    !actor.id.trim() ||
+    !complianceRoles.has(actor.role?.toUpperCase() ?? "")
+  )
     throw privacyError("PRIVACY_COMPLIANCE_AUTHORIZATION_REQUIRED", 403);
 }
 
