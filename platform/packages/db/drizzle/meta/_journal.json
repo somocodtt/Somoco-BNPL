@@ -204,6 +204,13 @@
       "when": 1787446000000,
       "tag": "0028_composite_migration_sample_binding",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1787447000000,
+      "tag": "0030_require_sample_verification_command",
+      "breakpoints": true
     }
   ]
 }

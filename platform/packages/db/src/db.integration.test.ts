@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(29);
+    expect(before.rows[0]?.count).toBe(30);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -1544,6 +1544,10 @@ describe("populated legacy schema migration", () => {
       pool,
       "0028_composite_migration_sample_binding.sql",
     );
+    await applyMigrationFile(
+      pool,
+      "0030_require_sample_verification_command.sql",
+    );
 
     const preserved = await pool.query<{
       source_record_id: string;
@@ -1592,6 +1596,15 @@ describe("populated legacy schema migration", () => {
         verification_command_id: validCommandId,
       },
     ]);
+    await expect(
+      pool.query(
+        `insert into migration_sample_evidence
+          (migration_batch_id, migration_record_id, verifier_staff_user_id,
+           result, verification_command_id)
+         values ($1, $2, $3, 'PASS', null)`,
+        [batchId, recordId, verifierId],
+      ),
+    ).rejects.toMatchObject({ code: "23502" });
     const quarantinedEvidence = await pool.query<{
       original_evidence_id: string;
       migration_record_id: string;
@@ -1668,9 +1681,9 @@ describe("populated legacy schema migration", () => {
       pool.query(
         `insert into migration_sample_evidence
           (migration_batch_id, migration_record_id, verifier_staff_user_id,
-           result)
-         values ($1, $2, $3, 'PASS')`,
-        [batchId, otherRecordId, verifierId],
+           result, verification_command_id)
+         values ($1, $2, $3, 'PASS', $4)`,
+        [batchId, otherRecordId, verifierId, randomUUID()],
       ),
     ).rejects.toMatchObject({ code: "23503" });
 

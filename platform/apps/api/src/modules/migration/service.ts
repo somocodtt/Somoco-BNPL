@@ -1159,6 +1159,13 @@ async function validateRows(
         message:
           "A repayment history array is required, including an empty array when none exists.",
       });
+    else
+      for (const code of repaymentHistoryValidationErrors(repaymentHistory))
+        errors.push({
+          code,
+          message:
+            "Repayment history contains an invalid transaction invariant.",
+        });
     const rawSchedule = parseJsonArray(installmentScheduleInput);
     if (
       Array.isArray(rawSchedule) &&
@@ -1287,7 +1294,9 @@ async function validateRows(
           const expected =
             repaymentFrequency === "WEEKLY"
               ? addDays(previous, 7)
-              : addMonths(previous, 1);
+              : isIsoCalendarDate(contract.startDate)
+                ? addMonths(contract.startDate!, index + 1)
+                : addMonths(previous, 1);
           if (current !== expected) cadenceValid = false;
         }
         if (!cadenceValid)
@@ -1761,17 +1770,35 @@ function isIsoCalendarDate(value: string | undefined): boolean {
   );
 }
 
-function addMonths(value: string, months: number): string {
+export function addMonths(value: string, months: number): string {
   const [year, month, day] = value.split("-").map(Number);
-  const result = new Date(Date.UTC(year!, month! - 1 + months, day!));
+  const targetMonthIndex = month! - 1 + months;
+  const targetYear = year! + Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const leapYear =
+    targetYear % 4 === 0 && (targetYear % 100 !== 0 || targetYear % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][targetMonth]!;
   return [
-    result.getUTCFullYear().toString().padStart(4, "0"),
-    (result.getUTCMonth() + 1).toString().padStart(2, "0"),
-    result.getUTCDate().toString().padStart(2, "0"),
+    targetYear.toString().padStart(4, "0"),
+    (targetMonth + 1).toString().padStart(2, "0"),
+    Math.min(day!, daysInMonth).toString().padStart(2, "0"),
   ].join("-");
 }
 
-function addDays(value: string, days: number): string {
+export function addDays(value: string, days: number): string {
   const [year, month, day] = value.split("-").map(Number);
   const result = new Date(Date.UTC(year!, month! - 1, day! + days));
   return [
@@ -1796,17 +1823,26 @@ function parseRepaymentHistory(
     const type = row.type;
     const reference = row.reference;
     const currency = row.currency;
+    const reversesReference = row.reversesReference ?? row.reverses_reference;
+    const providerReference = row.providerReference ?? row.provider_reference;
     const normalizedType = typeof type === "string" ? type.toUpperCase() : "";
     if (
       typeof date !== "string" ||
       !isIsoCalendarDate(date) ||
       typeof amount !== "string" ||
       !/^-?(0|[1-9][0-9]*)$/.test(amount) ||
-      (amount.startsWith("-") && normalizedType !== "REVERSAL") ||
+      (amount.startsWith("-") &&
+        !["REVERSAL", "REFUND"].includes(normalizedType)) ||
       typeof type !== "string" ||
       !/^[A-Z][A-Z0-9_]{1,31}$/.test(normalizedType) ||
       typeof reference !== "string" ||
       !/^[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$/.test(reference) ||
+      (reversesReference !== undefined &&
+        (typeof reversesReference !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$/.test(reversesReference))) ||
+      (providerReference !== undefined &&
+        (typeof providerReference !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$/.test(providerReference))) ||
       currency !== "GHS"
     )
       return undefined;
@@ -1825,10 +1861,71 @@ function parseRepaymentHistory(
       signedAmountMinorUnits: signedAmount.toString(),
       type: normalizedType,
       reference,
+      ...(reversesReference === undefined ? {} : { reversesReference }),
+      ...(providerReference === undefined ? {} : { providerReference }),
       currency,
     });
   }
   return result;
+}
+
+function repaymentHistoryValidationErrors(
+  history: readonly Record<string, unknown>[],
+): readonly string[] {
+  const errors: string[] = [];
+  const references = new Set<string>();
+  const providerReferences = new Set<string>();
+  const payments = new Map<string, { amount: bigint; date: string }>();
+  const reversalTotals = new Map<string, bigint>();
+  let previousDate: string | undefined;
+  for (const entry of history) {
+    const date = String(entry.date);
+    const reference = String(entry.reference);
+    const providerReference =
+      typeof entry.providerReference === "string"
+        ? entry.providerReference
+        : undefined;
+    const type = String(entry.type).toUpperCase();
+    const rawAmount = String(entry.amountMinorUnits);
+    const amount = BigInt(
+      rawAmount.startsWith("-") ? rawAmount.slice(1) : rawAmount,
+    );
+    if (previousDate !== undefined && date < previousDate)
+      errors.push("REPAYMENT_HISTORY_ORDER_INVALID");
+    previousDate = date;
+    if (references.has(reference)) errors.push("REPAYMENT_REFERENCE_DUPLICATE");
+    references.add(reference);
+    if (providerReference !== undefined) {
+      if (providerReferences.has(providerReference))
+        errors.push("REPAYMENT_PROVIDER_REFERENCE_DUPLICATE");
+      providerReferences.add(providerReference);
+    }
+    if (type === "PAYMENT") {
+      if (amount <= 0n) errors.push("PAYMENT_AMOUNT_INVALID");
+      payments.set(reference, { amount, date });
+      continue;
+    }
+    if (type !== "REVERSAL" && type !== "REFUND") continue;
+    const reversesReference =
+      typeof entry.reversesReference === "string"
+        ? entry.reversesReference
+        : undefined;
+    if (reversesReference === undefined) {
+      errors.push("REVERSAL_REFERENCE_REQUIRED");
+      continue;
+    }
+    const payment = payments.get(reversesReference);
+    if (payment === undefined || date < payment.date) {
+      errors.push("REVERSAL_REFERENCE_INVALID");
+      continue;
+    }
+    const reversedAmount =
+      (reversalTotals.get(reversesReference) ?? 0n) + amount;
+    reversalTotals.set(reversesReference, reversedAmount);
+    if (reversedAmount > payment.amount)
+      errors.push("REVERSAL_AMOUNT_EXCEEDS_PAYMENT");
+  }
+  return [...new Set(errors)];
 }
 
 function parseInstallmentSchedule(

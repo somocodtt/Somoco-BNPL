@@ -189,7 +189,7 @@ export const migrationSampleEvidence = pgTable(
       .defaultNow()
       .notNull(),
     result: text("result").notNull(),
-    verificationCommandId: uuid("verification_command_id"),
+    verificationCommandId: uuid("verification_command_id").notNull(),
     evidenceHash: text("evidence_hash"),
   },
   (table) => [

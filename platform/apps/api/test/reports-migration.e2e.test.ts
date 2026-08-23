@@ -11,6 +11,8 @@ import {
 } from "../src/modules/reports/service.js";
 import {
   createMigrationService,
+  addDays,
+  addMonths,
   type LegacyImportRow,
   type MigrationService,
 } from "../src/modules/migration/service.js";
@@ -34,6 +36,45 @@ describe("reporting and quarantined legacy import", () => {
   });
 
   afterAll(async () => close());
+
+  it("uses calendar-safe month ends without changing weekly day arithmetic", () => {
+    expect(addMonths("2024-01-31", 1)).toBe("2024-02-29");
+    expect(addMonths("2023-01-31", 1)).toBe("2023-02-28");
+    expect(addMonths("2024-08-31", 6)).toBe("2025-02-28");
+    expect(addMonths("2024-01-31", 12)).toBe("2025-01-31");
+    expect(addDays("2025-01-31", 7)).toBe("2025-02-07");
+  });
+
+  it("keeps a month-end schedule anchored through maturity", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const batch = await service.importBatch({
+      actor,
+      requestId: randomUUID(),
+      source: "LEGACY_EXCEL",
+      sourceBatchId: "calendar-month-end",
+      sourceFileHash: "b".repeat(64),
+      templateVersion: "legacy-v1",
+      expectedRecords: 1,
+      controlTotalMinorUnits: "100",
+      rows: [
+        financialRow("calendar-month-end", {
+          contract: {
+            startDate: "2024-01-31",
+            endDate: "2025-01-31",
+          },
+          installmentSchedule: monthEndMonthlySchedule(),
+          arrearsAsOfDate: "2024-02-01",
+        }),
+      ],
+    });
+    const codes = (batch.records[0]?.errors ?? []).map((error) =>
+      String(error.code),
+    );
+    expect(codes).not.toContain("INSTALLMENT_SCHEDULE_CADENCE_INVALID");
+    expect(codes).not.toContain("INSTALLMENT_SCHEDULE_COVERAGE_INVALID");
+  });
 
   it("redacts personal data by role and durably attributes a safe export", async () => {
     const service = createReportService({ database });
@@ -741,8 +782,9 @@ describe("reporting and quarantined legacy import", () => {
     await getInternalDatabase(database).execute(sql`
       insert into migration_sample_evidence
         (migration_batch_id, migration_record_id, verifier_staff_user_id,
-         result, evidence_hash)
-      values (${batch.id}, ${recordId}, ${verifier.staffUserId}, 'FAIL', NULL)
+         result, verification_command_id, evidence_hash)
+      values (${batch.id}, ${recordId}, ${verifier.staffUserId}, 'FAIL',
+               ${randomUUID()}, NULL)
     `);
     await expect(
       service.verifyBatch({
@@ -961,6 +1003,199 @@ describe("reporting and quarantined legacy import", () => {
     }
   });
 
+  it("enforces chronological, linked, and bounded repayment reversals", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const cases: readonly {
+      suffix: string;
+      code: string;
+      history: readonly Record<string, unknown>[];
+      totalPaid: string;
+      currentBalance: string;
+      schedule?: readonly Record<string, unknown>[];
+      assertAbsent?: readonly string[];
+    }[] = [
+      {
+        suffix: "duplicate-reference",
+        code: "REPAYMENT_REFERENCE_DUPLICATE",
+        history: [
+          {
+            date: "2025-01-10",
+            amountMinorUnits: "50",
+            type: "PAYMENT",
+            reference: "DUP-1",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "50",
+            type: "PAYMENT",
+            reference: "DUP-1",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "100",
+        currentBalance: "0",
+      },
+      {
+        suffix: "out-of-order",
+        code: "REPAYMENT_HISTORY_ORDER_INVALID",
+        history: [
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "50",
+            type: "PAYMENT",
+            reference: "ORDER-1",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-10",
+            amountMinorUnits: "50",
+            type: "PAYMENT",
+            reference: "ORDER-2",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "100",
+        currentBalance: "0",
+      },
+      {
+        suffix: "unlinked-reversal",
+        code: "REVERSAL_REFERENCE_REQUIRED",
+        history: [
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "10",
+            type: "REVERSAL",
+            reference: "REV-MISSING",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "0",
+        currentBalance: "100",
+      },
+      {
+        suffix: "future-reversal-link",
+        code: "REVERSAL_REFERENCE_INVALID",
+        history: [
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "10",
+            type: "REVERSAL",
+            reference: "REV-FUTURE",
+            reversesReference: "PAY-FUTURE",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-12",
+            amountMinorUnits: "10",
+            type: "PAYMENT",
+            reference: "PAY-FUTURE",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "10",
+        currentBalance: "90",
+      },
+      {
+        suffix: "over-reversal-net-zero",
+        code: "REVERSAL_AMOUNT_EXCEEDS_PAYMENT",
+        history: [
+          {
+            date: "2025-01-10",
+            amountMinorUnits: "100",
+            type: "PAYMENT",
+            reference: "PAY-OVER-REV",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "100",
+            type: "REVERSAL",
+            reference: "REV-OVER-1",
+            reversesReference: "PAY-OVER-REV",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-12",
+            amountMinorUnits: "100",
+            type: "REVERSAL",
+            reference: "REV-OVER-2",
+            reversesReference: "PAY-OVER-REV",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "0",
+        currentBalance: "100",
+      },
+      {
+        suffix: "partial-reversal-valid",
+        code: "REVERSAL_REFERENCE_INVALID",
+        history: [
+          {
+            date: "2025-01-10",
+            amountMinorUnits: "100",
+            type: "PAYMENT",
+            reference: "PAY-PARTIAL",
+            currency: "GHS",
+          },
+          {
+            date: "2025-01-11",
+            amountMinorUnits: "40",
+            type: "REVERSAL",
+            reference: "REV-PARTIAL",
+            reversesReference: "PAY-PARTIAL",
+            currency: "GHS",
+          },
+        ],
+        totalPaid: "60",
+        currentBalance: "40",
+        schedule: partiallyPaidMonthlySchedule(),
+        assertAbsent: [
+          "REPAYMENT_REFERENCE_DUPLICATE",
+          "REPAYMENT_HISTORY_ORDER_INVALID",
+          "REVERSAL_REFERENCE_REQUIRED",
+          "REVERSAL_REFERENCE_INVALID",
+          "REVERSAL_AMOUNT_EXCEEDS_PAYMENT",
+          "REPAYMENT_TOTAL_MISMATCH",
+          "INSTALLMENT_PAID_TOTAL_MISMATCH",
+          "CURRENT_BALANCE_RECONCILIATION_MISMATCH",
+        ],
+      },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const batch = await service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        source: "LEGACY_EXCEL",
+        sourceBatchId: `repayment-invariant-${item.suffix}`,
+        sourceFileHash: ["1", "2", "3", "4", "5", "6"][index]!.repeat(64),
+        templateVersion: "legacy-v1",
+        expectedRecords: 1,
+        controlTotalMinorUnits: item.currentBalance,
+        rows: [
+          financialRow(`repayment-invariant-${item.suffix}`, {
+            totalPaidMinorUnits: item.totalPaid,
+            currentBalanceMinorUnits: item.currentBalance,
+            repaymentHistory: item.history,
+            ...(item.schedule === undefined
+              ? {}
+              : { installmentSchedule: item.schedule }),
+          }),
+        ],
+      });
+      const codes = (batch.records[0]?.errors ?? []).map((error) =>
+        String(error.code),
+      );
+      if (item.assertAbsent === undefined) {
+        expect(codes).toContain(item.code);
+      } else {
+        for (const code of item.assertAbsent) expect(codes).not.toContain(code);
+      }
+    }
+  });
+
   it("activates only a clean bound attachment after verification and finance approval", async () => {
     const service = createMigrationService({ database });
     const importer = principal("VERIFICATION_OFFICER");
@@ -1117,6 +1352,38 @@ function monthlySchedule(): readonly Record<string, unknown>[] {
     "2025-11-01",
     "2025-12-01",
     "2026-01-01",
+  ];
+  return dates.map((dueDate, index) => ({
+    number: index + 1,
+    dueDate,
+    amountMinorUnits: index === dates.length - 1 ? "12" : "8",
+    status: "UNPAID",
+    currency: "GHS",
+  }));
+}
+
+function partiallyPaidMonthlySchedule(): readonly Record<string, unknown>[] {
+  return monthlySchedule().map((entry, index) => ({
+    ...entry,
+    paidAmountMinorUnits: index < 7 ? "8" : index === 7 ? "4" : "0",
+    status: index < 7 ? "PAID" : index === 7 ? "PARTIAL" : "UNPAID",
+  }));
+}
+
+function monthEndMonthlySchedule(): readonly Record<string, unknown>[] {
+  const dates = [
+    "2024-02-29",
+    "2024-03-31",
+    "2024-04-30",
+    "2024-05-31",
+    "2024-06-30",
+    "2024-07-31",
+    "2024-08-31",
+    "2024-09-30",
+    "2024-10-31",
+    "2024-11-30",
+    "2024-12-31",
+    "2025-01-31",
   ];
   return dates.map((dueDate, index) => ({
     number: index + 1,
