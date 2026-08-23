@@ -1284,21 +1284,26 @@ async function validateRows(
         [6, 8, 12, 24, 36, 48].includes(tenure) &&
         installmentSchedule.length > 0
       ) {
+        const expectedInstallmentCount =
+          repaymentFrequency === "MONTHLY"
+            ? tenure
+            : Math.ceil((tenure * 52) / 12);
+        if (installmentSchedule.length !== expectedInstallmentCount)
+          errors.push({
+            code: "INSTALLMENT_SCHEDULE_COUNT_INVALID",
+            message:
+              "The installment schedule count must match the declared frequency and tenure.",
+          });
         const maturity = addMonths(contract.startDate!, tenure);
-        const firstDueDate = String(installmentSchedule[0]!.dueDate);
         const lastDueDate = String(installmentSchedule.at(-1)!.dueDate);
-        let cadenceValid = firstDueDate > contract.startDate!;
-        for (let index = 1; index < installmentSchedule.length; index += 1) {
-          const previous = String(installmentSchedule[index - 1]!.dueDate);
-          const current = String(installmentSchedule[index]!.dueDate);
-          const expected =
-            repaymentFrequency === "WEEKLY"
-              ? addDays(previous, 7)
-              : isIsoCalendarDate(contract.startDate)
-                ? addMonths(contract.startDate!, index + 1)
-                : addMonths(previous, 1);
-          if (current !== expected) cadenceValid = false;
-        }
+        const canonicalDates = installmentSchedule.map((_, index) =>
+          repaymentFrequency === "WEEKLY"
+            ? addDays(contract.startDate!, (index + 1) * 7)
+            : addMonths(contract.startDate!, index + 1),
+        );
+        const cadenceValid = installmentSchedule.every(
+          (entry, index) => String(entry.dueDate) === canonicalDates[index],
+        );
         if (!cadenceValid)
           errors.push({
             code: "INSTALLMENT_SCHEDULE_CADENCE_INVALID",

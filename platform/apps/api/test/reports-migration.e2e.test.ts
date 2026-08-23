@@ -76,6 +76,90 @@ describe("reporting and quarantined legacy import", () => {
     expect(codes).not.toContain("INSTALLMENT_SCHEDULE_COVERAGE_INVALID");
   });
 
+  it("enforces canonical installment count and first-due anchoring", async () => {
+    const service = createMigrationService({ database });
+    const actor = principal("MIGRATION_IMPORTER");
+    await seedActor(database, actor);
+    const cases: readonly {
+      suffix: string;
+      code: string;
+      overrides: Record<string, unknown>;
+      assertAbsent?: readonly string[];
+    }[] = [
+      {
+        suffix: "monthly-one-row",
+        code: "INSTALLMENT_SCHEDULE_COUNT_INVALID",
+        overrides: {
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "100",
+              status: "UNPAID",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "monthly-arbitrary-first-due",
+        code: "INSTALLMENT_SCHEDULE_CADENCE_INVALID",
+        overrides: {
+          installmentSchedule: monthlyScheduleWithArbitraryFirstDue(),
+        },
+      },
+      {
+        suffix: "weekly-undersized",
+        code: "INSTALLMENT_SCHEDULE_COUNT_INVALID",
+        overrides: {
+          repaymentFrequency: "WEEKLY",
+          contract: { endDate: "2025-07-01" },
+          installmentSchedule: weeklySchedule(25),
+        },
+      },
+      {
+        suffix: "valid-leap-month-end",
+        code: "INSTALLMENT_SCHEDULE_COUNT_INVALID",
+        overrides: {
+          contract: {
+            startDate: "2024-01-31",
+            endDate: "2025-01-31",
+          },
+          installmentSchedule: monthEndMonthlySchedule(),
+          arrearsAsOfDate: "2024-02-01",
+        },
+        assertAbsent: [
+          "INSTALLMENT_SCHEDULE_COUNT_INVALID",
+          "INSTALLMENT_SCHEDULE_CADENCE_INVALID",
+          "INSTALLMENT_SCHEDULE_COVERAGE_INVALID",
+        ],
+      },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const row = financialRow(
+        `canonical-schedule-${item.suffix}`,
+        item.overrides,
+      );
+      const batch = await service.importBatch({
+        actor,
+        requestId: randomUUID(),
+        source: "LEGACY_EXCEL",
+        sourceBatchId: `canonical-schedule-${item.suffix}`,
+        sourceFileHash: ["c", "d", "e", "f"][index]!.repeat(64),
+        templateVersion: "legacy-v1",
+        expectedRecords: 1,
+        controlTotalMinorUnits: row.currentBalanceMinorUnits,
+        rows: [row],
+      });
+      const codes = (batch.records[0]?.errors ?? []).map((error) =>
+        String(error.code),
+      );
+      if (item.assertAbsent === undefined) expect(codes).toContain(item.code);
+      else
+        for (const code of item.assertAbsent) expect(codes).not.toContain(code);
+    }
+  });
+
   it("redacts personal data by role and durably attributes a safe export", async () => {
     const service = createReportService({ database });
     const auditor = principal("COMPLIANCE_AUDITOR");
@@ -1367,6 +1451,25 @@ function partiallyPaidMonthlySchedule(): readonly Record<string, unknown>[] {
     ...entry,
     paidAmountMinorUnits: index < 7 ? "8" : index === 7 ? "4" : "0",
     status: index < 7 ? "PAID" : index === 7 ? "PARTIAL" : "UNPAID",
+  }));
+}
+
+function monthlyScheduleWithArbitraryFirstDue(): readonly Record<
+  string,
+  unknown
+>[] {
+  return monthlySchedule().map((entry, index) =>
+    index === 0 ? { ...entry, dueDate: "2025-02-02" } : entry,
+  );
+}
+
+function weeklySchedule(count: number): readonly Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, index) => ({
+    number: index + 1,
+    dueDate: addDays("2025-01-01", (index + 1) * 7),
+    amountMinorUnits: "4",
+    status: "UNPAID",
+    currency: "GHS",
   }));
 }
 
