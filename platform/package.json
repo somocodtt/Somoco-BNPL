@@ -10,16 +10,20 @@
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
+    "e2e": "playwright test",
+    "test:load": "tsx test/load/application-flow.ts",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "verify:workspace": "node scripts/verify-workspace.mjs",
     "verify:pilot-gates": "node scripts/verify-pilot-gates.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.62.1",
     "eslint": "^10.8.1",
     "prettier": "^3.9.6",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.67.0",
+    "tsx": "^4.23.12",
     "vitest": "^4.1.10"
   }
 }
