@@ -83,7 +83,7 @@ describe("production API bootstrap", () => {
     expect(build).not.toHaveBeenCalled();
   });
 
-  it("uses actual NODE_ENV and blocks listen without signed pilot gates", async () => {
+  it("rejects mismatched injected and runtime environments before composition", async () => {
     const events: string[] = [];
     const build = vi.fn(async () => ({
       async listen() {
@@ -108,9 +108,9 @@ describe("production API bootstrap", () => {
         build,
         loadComposition,
       }),
-    ).rejects.toThrow("PILOT_GATE_EVIDENCE_FILE_REQUIRED");
+    ).rejects.toThrow("BOOTSTRAP_ENVIRONMENT_MISMATCH");
 
-    expect(events).toEqual(["composition"]);
+    expect(events).toEqual([]);
     expect(build).not.toHaveBeenCalled();
   });
 });

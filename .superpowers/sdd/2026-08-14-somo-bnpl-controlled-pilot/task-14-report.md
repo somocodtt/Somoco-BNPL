@@ -134,3 +134,40 @@ build and focused worker tests pass. This fix round likewise does not claim
 real production launch readiness; signed provider, legal/privacy, hosting,
 restore, independent security, and operational release gates remain external
 blockers.
+
+## Review fix round 2 (1c5e33e..fix commit)
+
+The second independent review was closed within the Task 14 scope:
+
+- Bootstrap now rejects disagreement between the injected `AppConfig` environment
+  and `NODE_ENV` before production composition, build, or listen. Production
+  configuration cannot be downgraded by a non-production runtime value, and a
+  production runtime cannot bypass production controls with a test/development
+  config.
+- `/health/ready` reruns the real PostgreSQL probe and every custom dependency
+  check on every request. The reserved `postgres` dependency cannot be supplied
+  or overwritten by a custom check. Probe/check failures return only the generic
+  public `{ status: "not_ready" }` response, and recovery is reflected on the
+  next request.
+
+Fix-round TDD evidence:
+
+- RED: the initial `vitest run apps/api/test/task14-fix2.test.ts` run failed all
+  three adversarial cases; the bootstrap cases reached the pre-fix production
+  validation path instead of rejecting the environment mismatch, and the live
+  readiness case exposed a test assertion-shape issue that was corrected before
+  the GREEN run.
+- GREEN: `vitest run apps/api/test/task14-fix2.test.ts` passed **3/3** after the
+  corrected adversarial assertions and implementation.
+
+Fresh fix-round verification:
+
+- Focused Task 14 regression suite — **7 files, 25 tests passed**.
+- API and worker TypeScript checks — **exit 0**.
+- Affected ESLint — **exit 0**.
+- Affected Prettier check — **exit 0**.
+- `git diff --check` — **exit 0**.
+
+This fix round does not claim real production launch readiness. External signed
+provider, legal/privacy, hosting, restore, independent security, and operational
+release gates remain blockers.

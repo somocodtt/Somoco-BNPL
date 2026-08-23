@@ -173,9 +173,8 @@ export async function buildApp(
     throw new Error("PRODUCTION_PRIVACY_COMPOSITION_REQUIRED");
   }
   const telemetry = options.telemetry ?? createTelemetry();
-  const databaseReady = await (options.databaseProbe ?? probeDatabase)(
-    database,
-  );
+  const databaseProbe = options.databaseProbe ?? probeDatabase;
+  const databaseReady = await runDatabaseProbe(database, databaseProbe);
   telemetry.setDependency("postgres", databaseReady ? "UP" : "DOWN");
   if (productionRuntime) {
     for (const dependency of [
@@ -190,14 +189,7 @@ export async function buildApp(
     }
   }
   for (const dependency of options.dependencyChecks ?? []) {
-    try {
-      telemetry.setDependency(
-        dependency.name,
-        (await dependency.check()) ? "UP" : "DOWN",
-      );
-    } catch {
-      telemetry.setDependency(dependency.name, "DOWN");
-    }
+    await refreshDependency(telemetry, dependency);
   }
   const app = fastify({
     ajv: {
@@ -239,7 +231,11 @@ export async function buildApp(
   }
 
   await registerRequestContext(app, telemetry);
-  registerHealthRoutes(app, telemetry);
+  registerHealthRoutes(app, telemetry, {
+    database,
+    databaseProbe,
+    dependencyChecks: options.dependencyChecks ?? [],
+  });
   await registerProblemErrors(app);
   await registerSecurity(app, config);
   const accessService = await createAccessService({
@@ -448,17 +444,84 @@ export async function buildApp(
 function registerHealthRoutes(
   app: FastifyInstance,
   telemetry: Telemetry,
+  readiness: {
+    database: Database;
+    databaseProbe: (database: Database) => Promise<boolean>;
+    dependencyChecks: readonly {
+      name: string;
+      check: () => Promise<boolean>;
+    }[];
+  },
 ): void {
   for (const path of ["/health/live", "/health/liveness"] as const) {
     app.get(path, async (_request, reply) => reply.send(telemetry.liveness()));
   }
   for (const path of ["/health/ready", "/health/readiness"] as const) {
     app.get(path, async (_request, reply) => {
-      const status = telemetry.readiness();
+      const status = await refreshReadiness(telemetry, readiness);
       return status.status === "ok"
         ? reply.send(status)
         : reply.code(503).send(status);
     });
+  }
+}
+
+async function refreshReadiness(
+  telemetry: Telemetry,
+  readiness: {
+    database: Database;
+    databaseProbe: (database: Database) => Promise<boolean>;
+    dependencyChecks: readonly {
+      name: string;
+      check: () => Promise<boolean>;
+    }[];
+  },
+): Promise<{ status: "ok" | "not_ready" }> {
+  try {
+    const databaseReady = await runDatabaseProbe(
+      readiness.database,
+      readiness.databaseProbe,
+    );
+    telemetry.setDependency("postgres", databaseReady ? "UP" : "DOWN");
+    for (const dependency of readiness.dependencyChecks) {
+      await refreshDependency(telemetry, dependency);
+    }
+    return telemetry.readiness();
+  } catch {
+    return { status: "not_ready" };
+  }
+}
+
+async function runDatabaseProbe(
+  database: Database,
+  databaseProbe: (database: Database) => Promise<boolean>,
+): Promise<boolean> {
+  try {
+    return (await databaseProbe(database)) === true;
+  } catch {
+    return false;
+  }
+}
+
+async function refreshDependency(
+  telemetry: Telemetry,
+  dependency: {
+    name: string;
+    check: () => Promise<boolean>;
+  },
+): Promise<void> {
+  if (dependency.name.toLowerCase() === "postgres") return;
+  try {
+    telemetry.setDependency(
+      dependency.name,
+      (await dependency.check()) === true ? "UP" : "DOWN",
+    );
+  } catch {
+    try {
+      telemetry.setDependency(dependency.name, "DOWN");
+    } catch {
+      // Invalid dependency names remain fail-closed without exposing details.
+    }
   }
 }
 
