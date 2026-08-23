@@ -1,5 +1,10 @@
 import { buildApp, type BuildAppOptions } from "./app.js";
-import { loadConfig, validateConfig, type AppConfig } from "./config.js";
+import {
+  assertEnvironmentAgreement,
+  loadConfig,
+  validateConfig,
+  type AppConfig,
+} from "./config.js";
 import {
   loadProductionIdentityComposition,
   validateProductionIdentityComposition,
@@ -26,7 +31,7 @@ export async function bootstrapApi(
     options.config === undefined
       ? loadConfig(env)
       : validateConfig(options.config);
-  assertBootstrapEnvironmentAgreement(config.environment, env.NODE_ENV);
+  assertEnvironmentAgreement(config.environment, env.NODE_ENV);
   const productionRuntime =
     config.environment === "production" || env.NODE_ENV === "production";
   let identity: ProductionIdentityComposition | undefined;
@@ -82,13 +87,4 @@ function loadProductionApplicationPolicy(
     throw new Error("PRODUCTION_APPLICATION_POLICY_REQUIRED");
   }
   return { invitationHashSecret, invitationTtlMs, requiredDocumentTypes };
-}
-
-function assertBootstrapEnvironmentAgreement(
-  configEnvironment: AppConfig["environment"],
-  nodeEnvironment: string | undefined,
-): void {
-  if (nodeEnvironment !== undefined && nodeEnvironment !== configEnvironment) {
-    throw new Error("BOOTSTRAP_ENVIRONMENT_MISMATCH");
-  }
 }

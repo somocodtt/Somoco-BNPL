@@ -171,3 +171,41 @@ Fresh fix-round verification:
 This fix round does not claim real production launch readiness. External signed
 provider, legal/privacy, hosting, restore, independent security, and operational
 release gates remain blockers.
+
+## Review fix round 3 (1642df7..fix commit)
+
+The direct application-factory environment gap was closed without widening the
+Task 14 scope:
+
+- `assertEnvironmentAgreement` is centralized in API config code and reused by
+  both `bootstrapApi` and `buildApp`. Direct factory calls now reject either
+  process/config direction before production composition validation, database
+  creation or probing, telemetry mutation, and route construction. Config-less
+  `buildApp` calls continue to use `loadConfig(process.env)` as the canonical
+  path.
+- Adversarial direct `buildApp` tests cover production process plus test config
+  and test process plus production config, with valid production identity/payment
+  composition and spies proving probe, dependency, and telemetry side effects do
+  not occur.
+
+Fix-round TDD evidence:
+
+- RED: `vitest run apps/api/test/task14-fix3.test.ts` failed **2/2** because the
+  pre-fix direct factory proceeded instead of rejecting both mismatches; the
+  diagnostic run confirmed the returned value was `undefined` and no mismatch
+  error was raised.
+- GREEN: `vitest run apps/api/test/task14-fix3.test.ts` passed **2/2** after the
+  shared invariant was added.
+
+Fresh fix-round verification:
+
+- Focused fix-3, bootstrap, readiness, and prior Task 14 security suites —
+  **4 files, 19 tests passed**.
+- API TypeScript check — **exit 0**.
+- Affected ESLint — **exit 0**.
+- Affected Prettier check — **exit 0**.
+- `git diff --check` — **exit 0**.
+
+This fix round does not claim real production launch readiness. External signed
+provider, legal/privacy, hosting, restore, independent security, and operational
+release gates remain blockers.

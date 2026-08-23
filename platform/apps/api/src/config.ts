@@ -29,6 +29,18 @@ export interface AppConfig {
   mainHeadOfficeLocation?: string;
 }
 
+export function assertEnvironmentAgreement(
+  configEnvironment: AppEnvironment,
+  runtimeEnvironment: string | undefined,
+): void {
+  if (
+    runtimeEnvironment !== undefined &&
+    runtimeEnvironment !== configEnvironment
+  ) {
+    throw new Error("BOOTSTRAP_ENVIRONMENT_MISMATCH");
+  }
+}
+
 export function loadConfig(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): AppConfig {

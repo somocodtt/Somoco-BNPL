@@ -1,7 +1,12 @@
 import { createDatabase, probeDatabase, type Database } from "@somo/db";
 import type { Writable } from "node:stream";
 import fastify, { type FastifyInstance, LogController } from "fastify";
-import { type AppConfig, loadConfig, validateConfig } from "./config.js";
+import {
+  assertEnvironmentAgreement,
+  type AppConfig,
+  loadConfig,
+  validateConfig,
+} from "./config.js";
 import { registerAccessRoutes } from "./modules/access/routes.js";
 import {
   createAccessService,
@@ -151,6 +156,7 @@ export async function buildApp(
     options.config === undefined
       ? loadConfig()
       : validateConfig(options.config);
+  assertEnvironmentAgreement(config.environment, process.env.NODE_ENV);
   const productionRuntime =
     config.environment === "production" ||
     process.env.NODE_ENV === "production";
