@@ -573,19 +573,11 @@ describe("reporting and quarantined legacy import", () => {
             endDate: "2026-01-01",
           },
           vehicle: { vin: "REQUIRED-FIELDS-VIN" },
-          repaymentFrequency: "WEEKLY",
+          repaymentFrequency: "MONTHLY",
           tenureMonths: 12,
           arrearsMinorUnits: "0",
           repaymentHistory: [],
-          installmentSchedule: [
-            {
-              number: 1,
-              dueDate: "2025-02-01",
-              amountMinorUnits: "100",
-              status: "DUE",
-              currency: "GHS",
-            },
-          ],
+          installmentSchedule: monthlySchedule(),
           currentBalanceMinorUnits: "100",
         },
       ],
@@ -851,6 +843,101 @@ describe("reporting and quarantined legacy import", () => {
         code: "TENURE_DATE_RANGE_INVALID",
         overrides: { tenureMonths: 6 },
       },
+      {
+        suffix: "paid-over-total",
+        code: "REPAYMENT_EXCEEDS_CONTRACT_TOTAL",
+        overrides: {
+          totalPaidMinorUnits: "120",
+          currentBalanceMinorUnits: "0",
+          repaymentHistory: [
+            {
+              date: "2025-01-10",
+              amountMinorUnits: "120",
+              type: "PAYMENT",
+              reference: "PAY-OVER",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "weekly-cadence",
+        code: "INSTALLMENT_SCHEDULE_CADENCE_INVALID",
+        overrides: {
+          repaymentFrequency: "WEEKLY",
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-01-08",
+              amountMinorUnits: "50",
+              status: "UNPAID",
+              currency: "GHS",
+            },
+            {
+              number: 2,
+              dueDate: "2025-01-16",
+              amountMinorUnits: "50",
+              status: "UNPAID",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "maturity-coverage",
+        code: "INSTALLMENT_SCHEDULE_COVERAGE_INVALID",
+        overrides: {
+          repaymentFrequency: "MONTHLY",
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "100",
+              status: "UNPAID",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "paid-status",
+        code: "INSTALLMENT_PAID_AMOUNT_MISMATCH",
+        overrides: {
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "100",
+              paidAmountMinorUnits: "50",
+              status: "PAID",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
+      {
+        suffix: "schedule-paid-net",
+        code: "INSTALLMENT_PAID_TOTAL_MISMATCH",
+        overrides: {
+          installmentSchedule: [
+            {
+              number: 1,
+              dueDate: "2025-02-01",
+              amountMinorUnits: "50",
+              paidAmountMinorUnits: "10",
+              status: "PARTIAL",
+              currency: "GHS",
+            },
+            {
+              number: 2,
+              dueDate: "2025-03-01",
+              amountMinorUnits: "50",
+              status: "UNPAID",
+              currency: "GHS",
+            },
+          ],
+        },
+      },
     ];
     for (const [index, item] of cases.entries()) {
       const row = financialRow(item.suffix, item.overrides);
@@ -859,7 +946,9 @@ describe("reporting and quarantined legacy import", () => {
         requestId: randomUUID(),
         source: "LEGACY_EXCEL",
         sourceBatchId: `financial-${item.suffix}`,
-        sourceFileHash: ["6", "7", "8", "9", "a"][index]!.repeat(64),
+        sourceFileHash: ["6", "7", "8", "9", "a", "b", "c", "d", "e", "f"][
+          index
+        ]!.repeat(64),
         templateVersion: "legacy-v1",
         expectedRecords: 1,
         controlTotalMinorUnits: row.currentBalanceMinorUnits,
@@ -938,21 +1027,13 @@ describe("reporting and quarantined legacy import", () => {
             vin: "LEGACY-VIN-1",
             model: "Somoco Model One",
           },
-          repaymentFrequency: "WEEKLY",
+          repaymentFrequency: "MONTHLY",
           tenureMonths: 12,
           arrearsMinorUnits: "0",
           arrearsAsOfDate: "2025-01-15",
           totalPaidMinorUnits: "0",
           repaymentHistory: [],
-          installmentSchedule: [
-            {
-              number: 1,
-              dueDate: "2025-02-01",
-              amountMinorUnits: "100",
-              status: "DUE",
-              currency: "GHS",
-            },
-          ],
+          installmentSchedule: monthlySchedule(),
           currentBalanceMinorUnits: "100",
           attachmentDocumentId: documentId,
         },
@@ -1022,6 +1103,30 @@ function principal(role: string): StaffPrincipal {
   };
 }
 
+function monthlySchedule(): readonly Record<string, unknown>[] {
+  const dates = [
+    "2025-02-01",
+    "2025-03-01",
+    "2025-04-01",
+    "2025-05-01",
+    "2025-06-01",
+    "2025-07-01",
+    "2025-08-01",
+    "2025-09-01",
+    "2025-10-01",
+    "2025-11-01",
+    "2025-12-01",
+    "2026-01-01",
+  ];
+  return dates.map((dueDate, index) => ({
+    number: index + 1,
+    dueDate,
+    amountMinorUnits: index === dates.length - 1 ? "12" : "8",
+    status: "UNPAID",
+    currency: "GHS",
+  }));
+}
+
 function financialRow(
   suffix: string,
   overrides: Record<string, unknown> = {},
@@ -1047,7 +1152,7 @@ function financialRow(
       legacyId: `FIN-CON-${suffix}`,
       reference: `FIN-REF-${suffix}`,
       startDate: "2025-01-01",
-      endDate: "2025-12-31",
+      endDate: "2026-01-01",
       totalMinorUnits: "100",
       principalMinorUnits: "100",
       openingBalanceMinorUnits: "100",
@@ -1057,21 +1162,13 @@ function financialRow(
       vin: `FIN-VIN-${suffix}`,
       model: "Somoco Model One",
     },
-    repaymentFrequency: "WEEKLY",
+    repaymentFrequency: "MONTHLY",
     tenureMonths: 12,
     arrearsMinorUnits: "0",
     arrearsAsOfDate: "2025-01-15",
     totalPaidMinorUnits: "0",
     repaymentHistory: [],
-    installmentSchedule: [
-      {
-        number: 1,
-        dueDate: "2025-02-01",
-        amountMinorUnits: "100",
-        status: "DUE",
-        currency: "GHS",
-      },
-    ],
+    installmentSchedule: monthlySchedule(),
     currentBalanceMinorUnits: "100",
   };
   const overrideContract = overrides.contract;
@@ -1172,21 +1269,13 @@ async function createApprovedBoundBatch(
           vin: `VIN-${suffix}`,
           model: "Somoco Model One",
         },
-        repaymentFrequency: "WEEKLY",
+        repaymentFrequency: "MONTHLY",
         tenureMonths: 12,
         arrearsMinorUnits: "0",
         arrearsAsOfDate: "2025-01-15",
         totalPaidMinorUnits: "0",
         repaymentHistory: [],
-        installmentSchedule: [
-          {
-            number: 1,
-            dueDate: "2025-02-01",
-            amountMinorUnits: "100",
-            status: "DUE",
-            currency: "GHS",
-          },
-        ],
+        installmentSchedule: monthlySchedule(),
         currentBalanceMinorUnits: "100",
         attachmentDocumentId: documentId,
       },

@@ -217,6 +217,46 @@ export const migrationSampleEvidence = pgTable(
   ],
 );
 
+export const migrationSampleEvidenceQuarantine = pgTable(
+  "migration_sample_evidence_quarantine",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    originalEvidenceId: uuid("original_evidence_id").notNull(),
+    migrationBatchId: uuid("migration_batch_id").notNull(),
+    migrationRecordId: uuid("migration_record_id").notNull(),
+    verifierStaffUserId: uuid("verifier_staff_user_id").notNull(),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+    result: text("result").notNull(),
+    verificationCommandId: uuid("verification_command_id"),
+    evidenceHash: text("evidence_hash"),
+    reasonCode: text("reason_code").notNull(),
+    reasonData: jsonb("reason_data")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    quarantinedAt: timestamp("quarantined_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("migration_sample_evidence_quarantine_original_unique").on(
+      table.originalEvidenceId,
+    ),
+    check(
+      "migration_sample_evidence_quarantine_result_allowed",
+      sql`${table.result} in ('PASS', 'FAIL')`,
+    ),
+    check(
+      "migration_sample_evidence_quarantine_hash_sha256",
+      sql`${table.evidenceHash} is null or ${table.evidenceHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "migration_sample_evidence_quarantine_reason_code_safe",
+      sql`${table.reasonCode} ~ '^[A-Z][A-Z0-9_]{0,63}$'`,
+    ),
+  ],
+);
+
 export const migrationRecord = pgTable(
   "migration_record",
   {

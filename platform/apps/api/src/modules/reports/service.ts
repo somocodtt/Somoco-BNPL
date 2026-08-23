@@ -953,33 +953,57 @@ async function countReportRows(
 ): Promise<number> {
   const status = typeof filters.status === "string" ? filters.status : null;
   const asOfDate = asOfDateFilter(filters);
+  const cursor = decodeCursor(
+    typeof filters.cursor === "string" ? filters.cursor : null,
+  );
   const statusClause =
     status === null || report === "audit"
       ? sql`true`
       : report === "operations"
-        ? sql`status::text = ${status}`
-        : sql`status::text = ${status}`;
+        ? sql`a.status::text = ${status}`
+        : sql`c.status::text = ${status}`;
   const asOfClause =
     asOfDate === null
       ? sql`true`
       : report === "audit"
-        ? sql`occurred_at < (${asOfDate}::date + interval '1 day')`
-        : sql`created_at < (${asOfDate}::date + interval '1 day')`;
+        ? sql`e.occurred_at < (${asOfDate}::date + interval '1 day')`
+        : report === "operations"
+          ? sql`a.created_at < (${asOfDate}::date + interval '1 day')`
+          : report === "portfolio"
+            ? sql`c.created_at < (${asOfDate}::date + interval '1 day')`
+            : sql`b.created_at < (${asOfDate}::date + interval '1 day')`;
+  const vehicleAsOfClause =
+    asOfDate === null
+      ? sql`true`
+      : sql`vu.created_at < (${asOfDate}::date + interval '1 day')`;
+  const cursorClause =
+    cursor === null
+      ? sql`true`
+      : report === "operations"
+        ? sql`(a.created_at > ${cursor.createdAt}::timestamptz or (a.created_at = ${cursor.createdAt}::timestamptz and a.id > ${cursor.id}::uuid))`
+        : report === "portfolio"
+          ? sql`(c.created_at > ${cursor.createdAt}::timestamptz or (c.created_at = ${cursor.createdAt}::timestamptz and c.id > ${cursor.id}::uuid))`
+          : report === "audit"
+            ? sql`(e.occurred_at < ${cursor.createdAt}::timestamptz or (e.occurred_at = ${cursor.createdAt}::timestamptz and e.id < ${cursor.id}::uuid))`
+            : sql`(b.created_at < ${cursor.createdAt}::timestamptz or (b.created_at = ${cursor.createdAt}::timestamptz and b.id < ${cursor.id}::uuid))`;
   const result =
     report === "operations"
       ? await db.execute<{ count: number }>(
-          sql`select count(*)::int as count from application where ${statusClause} and ${asOfClause}`,
+          sql`select count(*)::int as count from application a where ${statusClause} and ${asOfClause} and ${cursorClause}`,
         )
       : report === "portfolio"
         ? await db.execute<{ count: number }>(
-            sql`select count(*)::int as count from contract where ${statusClause} and ${asOfClause}`,
+            sql`select count(*)::int as count
+                  from contract c
+                  join vehicle_unit vu on vu.id = c.vehicle_unit_id and ${vehicleAsOfClause}
+                 where ${statusClause} and ${asOfClause} and ${cursorClause}`,
           )
         : report === "audit"
           ? await db.execute<{ count: number }>(
-              sql`select count(*)::int as count from audit_event where ${asOfClause}`,
+              sql`select count(*)::int as count from audit_event e where ${asOfClause} and ${cursorClause}`,
             )
           : await db.execute<{ count: number }>(
-              sql`select count(*)::int as count from migration_batch where ${asOfClause}`,
+              sql`select count(*)::int as count from migration_batch b where ${asOfClause} and ${cursorClause}`,
             );
   return Number(result.rows[0]?.count ?? 0);
 }

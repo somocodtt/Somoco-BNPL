@@ -1491,6 +1491,7 @@ describe("populated legacy schema migration", () => {
     );
     const otherBatchId = randomUUID();
     const otherRecordId = randomUUID();
+    const nullRecordId = randomUUID();
     const verifierId = randomUUID();
     await pool.query(
       `insert into staff_user (id, email, password_hash, status)
@@ -1506,6 +1507,38 @@ describe("populated legacy schema migration", () => {
       `insert into migration_record (id, migration_batch_id, source_record_id, payload)
        values ($1, $2, $3, '{}'::jsonb)`,
       [otherRecordId, otherBatchId, `other-row-${randomUUID()}`],
+    );
+    await pool.query(
+      `insert into migration_record (id, migration_batch_id, source_record_id, payload)
+       values ($1, $2, $3, '{}'::jsonb)`,
+      [nullRecordId, batchId, `null-command-row-${randomUUID()}`],
+    );
+    await pool.query(
+      `alter table migration_sample_evidence
+         add column verification_command_id uuid`,
+    );
+    const validCommandId = randomUUID();
+    const crossBatchEvidenceId = randomUUID();
+    const nullCommandEvidenceId = randomUUID();
+    await pool.query(
+      `insert into migration_sample_evidence
+        (id, migration_batch_id, migration_record_id, verifier_staff_user_id,
+         result, verification_command_id)
+       values ($1, $2, $3, $4, 'PASS', $5),
+              ($6, $2, $7, $4, 'PASS', $8),
+              ($9, $2, $10, $4, 'PASS', null)`,
+      [
+        validCommandId,
+        batchId,
+        recordId,
+        verifierId,
+        validCommandId,
+        crossBatchEvidenceId,
+        otherRecordId,
+        randomUUID(),
+        nullCommandEvidenceId,
+        nullRecordId,
+      ],
     );
     await applyMigrationFile(
       pool,
@@ -1540,6 +1573,72 @@ describe("populated legacy schema migration", () => {
     expect(baseline.rows).toEqual([
       { event_type: "CORRECTED", status: "QUARANTINED" },
     ]);
+
+    const activeEvidence = await pool.query<{
+      id: string;
+      migration_record_id: string;
+      verification_command_id: string | null;
+    }>(
+      `select id, migration_record_id, verification_command_id
+         from migration_sample_evidence
+        where migration_batch_id = $1
+        order by id`,
+      [batchId],
+    );
+    expect(activeEvidence.rows).toEqual([
+      {
+        id: validCommandId,
+        migration_record_id: recordId,
+        verification_command_id: validCommandId,
+      },
+    ]);
+    const quarantinedEvidence = await pool.query<{
+      original_evidence_id: string;
+      migration_record_id: string;
+      result: string;
+      verification_command_id: string | null;
+      reason_code: string;
+    }>(
+      `select original_evidence_id, migration_record_id, result,
+              verification_command_id, reason_code
+         from migration_sample_evidence_quarantine
+        where migration_batch_id = $1
+        order by original_evidence_id`,
+      [batchId],
+    );
+    expect(quarantinedEvidence.rows).toEqual(
+      expect.arrayContaining([
+        {
+          original_evidence_id: crossBatchEvidenceId,
+          migration_record_id: otherRecordId,
+          result: "PASS",
+          verification_command_id: expect.any(String),
+          reason_code: "CROSS_BATCH_RECORD",
+        },
+        {
+          original_evidence_id: nullCommandEvidenceId,
+          migration_record_id: nullRecordId,
+          result: "PASS",
+          verification_command_id: null,
+          reason_code: "MISSING_VERIFICATION_COMMAND",
+        },
+      ]),
+    );
+    await expect(
+      pool.query(
+        `update migration_sample_evidence_quarantine
+            set reason_code = 'TAMPERED'
+          where original_evidence_id = $1`,
+        [nullCommandEvidenceId],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
+    await expect(
+      pool.query(
+        `delete from migration_sample_evidence_quarantine
+          where original_evidence_id = $1`,
+        [nullCommandEvidenceId],
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
 
     await expect(
       pool.query(

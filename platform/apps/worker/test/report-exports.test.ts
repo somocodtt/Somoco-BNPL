@@ -18,6 +18,7 @@ function job(): ReportExportJob {
     dataClassification: "REDACTED",
     filters: {},
     filtersFingerprint: fingerprint,
+    expectedRowCount: 2,
     watermark: "SOMOCO CONFIDENTIAL | requester=staff-1",
     status: "QUEUED",
   };
@@ -65,6 +66,7 @@ function message(overrides: Record<string, unknown> = {}) {
       dataClassification: "REDACTED",
       filters: {},
       filtersFingerprint: fingerprint,
+      expectedRowCount: 2,
       version: 1,
       ...overrides,
     },
@@ -125,6 +127,32 @@ describe("report export worker", () => {
     ).rejects.toThrow("PERMANENT_WORKER_FAILURE");
     expect(failures).toMatchObject([
       { reasonCode: "REPORT_EXPORT_FILTER_INVALID" },
+    ]);
+  });
+
+  it("loads the persisted export before durably failing a malformed payload", async () => {
+    const { port, failures } = portFor();
+    const handler = createReportExportHandler(port);
+    await expect(handler(message({ format: undefined }))).rejects.toThrow(
+      "PERMANENT_WORKER_FAILURE",
+    );
+    expect(failures).toMatchObject([
+      { reasonCode: "REPORT_EXPORT_PAYLOAD_INVALID" },
+    ]);
+  });
+
+  it("fails durably before READY when generated rows differ from the persisted count", async () => {
+    const { port, failures, completed } = portFor({
+      ...job(),
+      expectedRowCount: 3,
+    });
+    const handler = createReportExportHandler(port);
+    await expect(handler(message({ expectedRowCount: 3 }))).rejects.toThrow(
+      "PERMANENT_WORKER_FAILURE",
+    );
+    expect(completed).toHaveLength(0);
+    expect(failures).toMatchObject([
+      { reasonCode: "REPORT_EXPORT_ROW_COUNT_MISMATCH" },
     ]);
   });
 });

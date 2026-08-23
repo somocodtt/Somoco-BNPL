@@ -1131,11 +1131,11 @@ async function validateRows(
       isIsoCalendarDate(contract.startDate) &&
       isIsoCalendarDate(contract.endDate) &&
       [6, 8, 12, 24, 36, 48].includes(tenure) &&
-      contract.endDate! > addMonths(contract.startDate!, tenure)
+      contract.endDate! !== addMonths(contract.startDate!, tenure)
     )
       errors.push({
         code: "TENURE_DATE_RANGE_INVALID",
-        message: "The contract dates exceed the supplied tenure.",
+        message: "The contract dates must match the supplied tenure.",
       });
     let arrears = 0n;
     if (typeof arrearsValue !== "string")
@@ -1236,13 +1236,76 @@ async function validateRows(
         installmentSchedule.some(
           (entry) =>
             String(entry.dueDate) < contract.startDate! ||
-            String(entry.dueDate) > contract.endDate!,
+            String(entry.dueDate) >
+              (repaymentFrequency === "WEEKLY"
+                ? addDays(contract.endDate!, 6)
+                : contract.endDate!),
         )
       )
         errors.push({
           code: "INSTALLMENT_DATE_OUT_OF_RANGE",
-          message: "Installment due dates must fall within the contract dates.",
+          message:
+            "Installment due dates must fall within the contract maturity window.",
         });
+      for (const entry of installmentSchedule) {
+        const amountDue = BigInt(String(entry.amountMinorUnits));
+        const paid = BigInt(String(entry.paidAmountMinorUnits ?? "0"));
+        if (entry.status === "PAID" && paid !== amountDue)
+          errors.push({
+            code: "INSTALLMENT_PAID_AMOUNT_MISMATCH",
+            message: "A PAID installment must be fully paid.",
+          });
+        if (entry.status === "PARTIAL" && (paid <= 0n || paid >= amountDue))
+          errors.push({
+            code: "INSTALLMENT_PARTIAL_AMOUNT_INVALID",
+            message: "A PARTIAL installment must be partly paid.",
+          });
+        if (
+          ["DUE", "MISSED", "PENDING", "UNPAID", "WAIVED"].includes(
+            String(entry.status),
+          ) &&
+          paid !== 0n
+        )
+          errors.push({
+            code: "INSTALLMENT_UNPAID_AMOUNT_MISMATCH",
+            message: "An unpaid or waived installment must have no payment.",
+          });
+      }
+      if (
+        isIsoCalendarDate(contract.startDate) &&
+        isIsoCalendarDate(contract.endDate) &&
+        [6, 8, 12, 24, 36, 48].includes(tenure) &&
+        installmentSchedule.length > 0
+      ) {
+        const maturity = addMonths(contract.startDate!, tenure);
+        const firstDueDate = String(installmentSchedule[0]!.dueDate);
+        const lastDueDate = String(installmentSchedule.at(-1)!.dueDate);
+        let cadenceValid = firstDueDate > contract.startDate!;
+        for (let index = 1; index < installmentSchedule.length; index += 1) {
+          const previous = String(installmentSchedule[index - 1]!.dueDate);
+          const current = String(installmentSchedule[index]!.dueDate);
+          const expected =
+            repaymentFrequency === "WEEKLY"
+              ? addDays(previous, 7)
+              : addMonths(previous, 1);
+          if (current !== expected) cadenceValid = false;
+        }
+        if (!cadenceValid)
+          errors.push({
+            code: "INSTALLMENT_SCHEDULE_CADENCE_INVALID",
+            message:
+              "Installment due dates must follow the declared repayment cadence.",
+          });
+        if (
+          lastDueDate < maturity ||
+          (repaymentFrequency === "MONTHLY" && lastDueDate !== maturity)
+        )
+          errors.push({
+            code: "INSTALLMENT_SCHEDULE_COVERAGE_INVALID",
+            message:
+              "The installment schedule must cover the declared contract maturity.",
+          });
+      }
     }
     if (
       Array.isArray(repaymentHistory) &&
@@ -1293,11 +1356,27 @@ async function validateRows(
             message:
               "Repayment history net does not equal the explicit paid total.",
           });
-        if (contractTotal >= netPaid && amount !== contractTotal - netPaid)
+        if (contractTotal > 0n && netPaid > contractTotal)
+          errors.push({
+            code: "REPAYMENT_EXCEEDS_CONTRACT_TOTAL",
+            message: "Net paid cannot exceed the contract total.",
+          });
+        if (contractTotal > 0n && amount !== contractTotal - netPaid)
           errors.push({
             code: "CURRENT_BALANCE_RECONCILIATION_MISMATCH",
             message:
               "Current balance does not reconcile to contract total and net paid.",
+          });
+        const schedulePaid = installmentSchedule.reduce(
+          (total, entry) =>
+            total + BigInt(String(entry.paidAmountMinorUnits ?? "0")),
+          0n,
+        );
+        if (schedulePaid !== netPaid)
+          errors.push({
+            code: "INSTALLMENT_PAID_TOTAL_MISMATCH",
+            message:
+              "Installment paid amounts must equal repayment-history net paid.",
           });
       }
       if (!isIsoCalendarDate(arrearsAsOfDate))
@@ -1310,7 +1389,7 @@ async function validateRows(
           const status = String(entry.status);
           if (
             String(entry.dueDate) > arrearsAsOfDate! ||
-            !["DUE", "MISSED", "PENDING"].includes(status)
+            ["PAID", "WAIVED"].includes(status)
           )
             return total;
           const amountDue = BigInt(String(entry.amountMinorUnits));
@@ -1692,6 +1771,16 @@ function addMonths(value: string, months: number): string {
   ].join("-");
 }
 
+function addDays(value: string, days: number): string {
+  const [year, month, day] = value.split("-").map(Number);
+  const result = new Date(Date.UTC(year!, month! - 1, day! + days));
+  return [
+    result.getUTCFullYear().toString().padStart(4, "0"),
+    (result.getUTCMonth() + 1).toString().padStart(2, "0"),
+    result.getUTCDate().toString().padStart(2, "0"),
+  ].join("-");
+}
+
 function parseRepaymentHistory(
   value: unknown,
 ): readonly Record<string, unknown>[] | undefined {
@@ -1770,12 +1859,17 @@ function parseInstallmentSchedule(
       typeof amount !== "string" ||
       !/^(0|[1-9][0-9]*)$/.test(amount) ||
       typeof status !== "string" ||
-      !["DUE", "PAID", "MISSED", "WAIVED", "PENDING"].includes(status) ||
+      ![
+        "DUE",
+        "PAID",
+        "PARTIAL",
+        "UNPAID",
+        "MISSED",
+        "WAIVED",
+        "PENDING",
+      ].includes(status) ||
       typeof paidAmount !== "string" ||
       !/^(0|[1-9][0-9]*)$/.test(paidAmount) ||
-      (status === "PAID" &&
-        row.paidAmountMinorUnits === undefined &&
-        row.paidAmount === undefined) ||
       BigInt(paidAmount) > BigInt(amount) ||
       row.currency !== "GHS"
     )

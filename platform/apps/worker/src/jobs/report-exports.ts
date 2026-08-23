@@ -30,6 +30,7 @@ export interface ReportExportJob {
   dataClassification: ReportClassification;
   filters: Record<string, unknown>;
   filtersFingerprint: string;
+  expectedRowCount: number;
   watermark: string;
   status: "QUEUED" | "READY" | "FAILED";
 }
@@ -69,12 +70,14 @@ export function createDatabaseReportExportCompletionPort(
         report_type: string;
         format: ReportFormat;
         data_classification: ReportClassification;
+        row_count: number;
         filters: Record<string, unknown>;
         artifact: Record<string, unknown>;
         status: "QUEUED" | "READY" | "FAILED";
       }>(sql`
         select e.id, e.requester_staff_user_id, e.request_id, e.report_type,
-               e.format, e.data_classification, e.filters, e.artifact, e.status
+               e.format, e.data_classification, e.row_count, e.filters,
+               e.artifact, e.status
           from report_export e
          where e.id = ${exportId}
          limit 1
@@ -105,6 +108,7 @@ export function createDatabaseReportExportCompletionPort(
         dataClassification: row.data_classification,
         filters: row.filters,
         filtersFingerprint,
+        expectedRowCount: row.row_count,
         watermark: String(artifact.watermark ?? ""),
         status: event.rows[0]?.event_type ?? row.status,
       };
@@ -119,22 +123,20 @@ export function createReportExportHandler(
   port: ReportExportCompletionPort,
 ): OutboxHandler {
   return createOutboxHandler([], async (message: OutboxMessage) => {
-    const payload = reportExportPayload(message.payload);
-    if (
-      message.aggregateType !== "report_export" ||
-      message.aggregateId !== payload.exportId
-    )
-      return failPermanently(
-        port,
-        payload.exportId,
-        "REPORT_EXPORT_AGGREGATE_MISMATCH",
-        message,
-      );
-    const job = await port.load(payload.exportId);
+    if (typeof message.aggregateId !== "string" || message.aggregateId === "")
+      throw new PermanentWorkerError("REPORT_EXPORT_AGGREGATE_MISMATCH");
+    const job = await port.load(message.aggregateId);
     if (job === null) throw new PermanentWorkerError("REPORT_EXPORT_NOT_FOUND");
     if (job.status !== "QUEUED")
-      return { exportId: payload.exportId, status: job.status };
+      return { exportId: job.exportId, status: job.status };
     try {
+      const payload = reportExportPayload(message.payload);
+      if (
+        message.aggregateType !== "report_export" ||
+        message.aggregateId !== payload.exportId ||
+        job.exportId !== message.aggregateId
+      )
+        throw new PermanentWorkerError("REPORT_EXPORT_AGGREGATE_MISMATCH");
       if (
         job.requesterStaffUserId !== payload.requesterStaffUserId ||
         job.requestId !== payload.requestId ||
@@ -142,6 +144,7 @@ export function createReportExportHandler(
         job.format !== payload.format ||
         job.dataClassification !== payload.dataClassification ||
         job.filtersFingerprint !== payload.filtersFingerprint ||
+        job.expectedRowCount !== payload.expectedRowCount ||
         canonicalJson(job.filters) !== canonicalJson(payload.filters) ||
         payload.version !== 1
       )
@@ -168,6 +171,8 @@ export function createReportExportHandler(
           rows.push(row as Record<string, unknown>);
         }
       }
+      if (rows.length !== job.expectedRowCount)
+        throw new PermanentWorkerError("REPORT_EXPORT_ROW_COUNT_MISMATCH");
       const content = renderExport(job, rows);
       const contentHash = sha256(content);
       await port.complete({
@@ -189,46 +194,24 @@ export function createReportExportHandler(
       });
       return { exportId: job.exportId, status: "READY", rowCount: rows.length };
     } catch (error) {
-      if (error instanceof PermanentWorkerError) {
+      const permanent = toPermanentReportError(error);
+      if (permanent !== null) {
         await port.fail({
           exportId: job.exportId,
-          eventKey: `report-export:${job.exportId}:FAILED:${error.code}`,
-          reasonCode: error.code,
+          eventKey: `report-export:${job.exportId}:FAILED:${permanent.code}`,
+          reasonCode: permanent.code,
           artifact: {
             requesterStaffUserId: job.requesterStaffUserId,
             watermark: job.watermark,
             format: job.format,
-            failureReasonCode: error.code,
+            failureReasonCode: permanent.code,
             noRawDocumentUrls: true,
           },
         });
       }
-      throw error;
+      throw permanent ?? error;
     }
   });
-}
-
-async function failPermanently(
-  port: ReportExportCompletionPort,
-  exportId: string,
-  reasonCode: string,
-  message: OutboxMessage,
-) {
-  const job = await port.load(exportId);
-  if (job !== null && job.status === "QUEUED")
-    await port.fail({
-      exportId,
-      eventKey: `report-export:${exportId}:FAILED:${reasonCode}`,
-      reasonCode,
-      artifact: {
-        requesterStaffUserId: job.requesterStaffUserId,
-        watermark: job.watermark,
-        failureReasonCode: reasonCode,
-        noRawDocumentUrls: true,
-        workerOutboxMessageId: message.id,
-      },
-    });
-  throw new PermanentWorkerError(reasonCode);
 }
 
 function reportExportPayload(payload: unknown): {
@@ -240,6 +223,7 @@ function reportExportPayload(payload: unknown): {
   dataClassification: ReportClassification;
   filters: Record<string, unknown>;
   filtersFingerprint: string;
+  expectedRowCount: number;
   version: 1;
 } {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload))
@@ -255,6 +239,10 @@ function reportExportPayload(payload: unknown): {
       value.dataClassification !== "PERSONAL_DATA") ||
     typeof value.filtersFingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(value.filtersFingerprint) ||
+    typeof value.expectedRowCount !== "number" ||
+    !Number.isSafeInteger(value.expectedRowCount) ||
+    value.expectedRowCount < 0 ||
+    value.expectedRowCount > 10_000_000 ||
     typeof value.filters !== "object" ||
     value.filters === null ||
     Array.isArray(value.filters) ||
@@ -272,8 +260,27 @@ function reportExportPayload(payload: unknown): {
     dataClassification: value.dataClassification,
     filters: value.filters as Record<string, unknown>,
     filtersFingerprint: value.filtersFingerprint,
+    expectedRowCount: value.expectedRowCount,
     version: 1,
   };
+}
+
+function toPermanentReportError(error: unknown): PermanentWorkerError | null {
+  if (error instanceof PermanentWorkerError) return error;
+  const code =
+    error !== null && typeof error === "object" && "code" in error
+      ? String((error as { code: unknown }).code)
+      : "";
+  if (code === "REPORT_CURSOR_INVALID")
+    return new PermanentWorkerError("REPORT_EXPORT_CURSOR_INVALID");
+  if (
+    code === "REPORT_AS_OF_DATE_INVALID" ||
+    code === "REPORT_FILTER_INVALID" ||
+    code === "REPORT_FILTER_NOT_ALLOWED" ||
+    code === "REPORT_FILTER_TOO_LARGE"
+  )
+    return new PermanentWorkerError("REPORT_EXPORT_FILTER_INVALID");
+  return null;
 }
 
 async function* databaseReportPages(
@@ -282,15 +289,20 @@ async function* databaseReportPages(
 ): AsyncIterable<ReportExportPage> {
   let cursor: string | undefined;
   for (;;) {
-    const page = await readCanonicalReportPage({
-      database,
-      report: job.report,
-      filters: {
-        ...job.filters,
-        ...(cursor === undefined ? {} : { cursor }),
-      },
-      dataClassification: job.dataClassification,
-    });
+    let page;
+    try {
+      page = await readCanonicalReportPage({
+        database,
+        report: job.report,
+        filters: {
+          ...job.filters,
+          ...(cursor === undefined ? {} : { cursor }),
+        },
+        dataClassification: job.dataClassification,
+      });
+    } catch (error) {
+      throw toPermanentReportError(error) ?? error;
+    }
     if (page.rows.length === 0) return;
     yield {
       rows: page.rows,

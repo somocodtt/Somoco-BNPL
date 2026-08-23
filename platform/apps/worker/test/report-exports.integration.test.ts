@@ -41,7 +41,7 @@ describe("PostgreSQL report export worker", () => {
          data_classification, filters, row_count, content_hash, artifact, status)
       values
         (${exportId}, ${staffId}, ${requestId}, 'OPERATIONS', 'JSON',
-         'REDACTED', '{}'::jsonb, 501, ${"a".repeat(64)},
+         'REDACTED', '{}'::jsonb, 0, ${"a".repeat(64)},
          '{"watermark":"SOMOCO"}'::jsonb, 'QUEUED')
     `);
     await getInternalDatabase(database).execute(sql`
@@ -72,6 +72,7 @@ describe("PostgreSQL report export worker", () => {
         filtersFingerprint: createHash("sha256")
           .update("{}", "utf8")
           .digest("hex"),
+        expectedRowCount: 0,
         version: 1,
       },
     };
@@ -134,6 +135,7 @@ describe("PostgreSQL report export worker", () => {
           dataClassification: "REDACTED",
           filters: {},
           filtersFingerprint: createHash("sha256").update("{}").digest("hex"),
+          expectedRowCount: 501,
           version: 1,
         },
       }),
@@ -211,6 +213,7 @@ describe("PostgreSQL report export worker", () => {
         dataClassification: "REDACTED",
         filters: {},
         filtersFingerprint: createHash("sha256").update("{}").digest("hex"),
+        expectedRowCount: 1001,
         version: 1,
       },
     });
@@ -291,5 +294,77 @@ describe("PostgreSQL report export worker", () => {
     `);
     const workerRows = JSON.parse(ready.rows[0]!.artifact.content!).rows;
     expect(workerRows).toEqual(apiReport.rows);
+  });
+
+  it("counts and completes a cursor-scoped export using the same predicate", async () => {
+    const staffId = randomUUID();
+    await getInternalDatabase(database).execute(sql`
+      insert into staff_user (id, email, password_hash, status)
+      values (${staffId}, ${staffId + "@example.test"}, 'hash', 'ACTIVE')
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into privacy.person (id, phone_e164)
+      select gen_random_uuid(), '+233240' || lpad(series::text, 7, '0')
+        from generate_series(1, 2501) as series
+    `);
+    await getInternalDatabase(database).execute(sql`
+      insert into application (applicant_person_id, status)
+      select id, 'ACTIVE'::application_status
+        from privacy.person where phone_e164 like '+233240%'
+    `);
+    const actor = {
+      kind: "staff" as const,
+      staffUserId: staffId,
+      roles: ["CUSTOMER_SUPPORT" as const],
+      sessionId: randomUUID(),
+    };
+    const reportService = createReportService({ database });
+    const firstPage = await reportService.operations({ actor });
+    expect(firstPage.pagination.nextCursor).toEqual(expect.any(String));
+    const exported = await reportService.export({
+      actor,
+      requestId: randomUUID(),
+      report: "operations",
+      filters: { cursor: firstPage.pagination.nextCursor! },
+      format: "JSON",
+    });
+    expect(exported.status).toBe("QUEUED");
+    expect(exported.rowCount).toBe(1501);
+    const outbox = await getInternalDatabase(database).execute<{
+      id: string;
+      payload: Record<string, unknown>;
+    }>(sql`
+      select id, payload
+        from outbox_message
+       where aggregate_id = ${exported.id}
+         and topic = 'report.export.requested'
+       limit 1
+    `);
+    expect(outbox.rows[0]?.payload.expectedRowCount).toBe(1501);
+    const handler = createReportExportHandler(
+      createDatabaseReportExportCompletionPort(database),
+    );
+    await handler({
+      id: outbox.rows[0]!.id,
+      topic: "report.export.requested",
+      aggregateType: "report_export",
+      aggregateId: exported.id,
+      occurredAt: new Date(),
+      attempts: 1,
+      payload: outbox.rows[0]!.payload,
+    });
+    const ready = await getInternalDatabase(database).execute<{
+      event_type: string;
+      artifact: { rowCount?: number };
+    }>(sql`
+      select event_type, artifact
+        from report_export_event
+       where report_export_id = ${exported.id}
+         and event_type in ('READY', 'FAILED')
+    `);
+    expect(ready.rows).toEqual([
+      expect.objectContaining({ event_type: "READY" }),
+    ]);
+    expect(ready.rows[0]?.artifact.rowCount).toBe(1501);
   });
 });

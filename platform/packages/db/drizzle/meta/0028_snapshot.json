@@ -1,6 +1,6 @@
 {
-  "id": "3abe412b-a029-480e-86fc-c7506cfdbe1a",
-  "prevId": "cf4a9842-de41-44cb-93a2-1f21d8210241",
+  "id": "43ae33c3-c5c0-4c1d-9903-eea7043bde82",
+  "prevId": "3abe412b-a029-480e-86fc-c7506cfdbe1a",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -7888,6 +7888,123 @@
         "migration_sample_evidence_hash_sha256": {
           "name": "migration_sample_evidence_hash_sha256",
           "value": "\"migration_sample_evidence\".\"evidence_hash\" is null or \"migration_sample_evidence\".\"evidence_hash\" ~ '^[0-9a-f]{64}$'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.migration_sample_evidence_quarantine": {
+      "name": "migration_sample_evidence_quarantine",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "original_evidence_id": {
+          "name": "original_evidence_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "migration_batch_id": {
+          "name": "migration_batch_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "migration_record_id": {
+          "name": "migration_record_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "verifier_staff_user_id": {
+          "name": "verifier_staff_user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "verified_at": {
+          "name": "verified_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "result": {
+          "name": "result",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "verification_command_id": {
+          "name": "verification_command_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "evidence_hash": {
+          "name": "evidence_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reason_code": {
+          "name": "reason_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason_data": {
+          "name": "reason_data",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "quarantined_at": {
+          "name": "quarantined_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "migration_sample_evidence_quarantine_original_unique": {
+          "name": "migration_sample_evidence_quarantine_original_unique",
+          "columns": [
+            {
+              "expression": "original_evidence_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "migration_sample_evidence_quarantine_result_allowed": {
+          "name": "migration_sample_evidence_quarantine_result_allowed",
+          "value": "\"migration_sample_evidence_quarantine\".\"result\" in ('PASS', 'FAIL')"
+        },
+        "migration_sample_evidence_quarantine_hash_sha256": {
+          "name": "migration_sample_evidence_quarantine_hash_sha256",
+          "value": "\"migration_sample_evidence_quarantine\".\"evidence_hash\" is null or \"migration_sample_evidence_quarantine\".\"evidence_hash\" ~ '^[0-9a-f]{64}$'"
+        },
+        "migration_sample_evidence_quarantine_reason_code_safe": {
+          "name": "migration_sample_evidence_quarantine_reason_code_safe",
+          "value": "\"migration_sample_evidence_quarantine\".\"reason_code\" ~ '^[A-Z][A-Z0-9_]{0,63}$'"
         }
       },
       "isRLSEnabled": false
