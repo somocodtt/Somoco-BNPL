@@ -8,7 +8,7 @@ export interface CompleteOwnershipTransferCommand {
   id: string;
   expectedVersion: number;
   evidence: Record<string, unknown>;
-  approvedBy?: string;
+  approvedBy: string;
   transferredAt: Date;
   effects: WriteEffects;
 }
@@ -23,6 +23,7 @@ export async function completeOwnershipTransfer(
       version: number;
       transfer_status: string;
       transfer_evidence: Record<string, unknown> | null;
+      transfer_approved_by: string | null;
       transfer_id: string;
       contract_status: string;
       outstanding_balance_minor_units: string;
@@ -39,6 +40,7 @@ export async function completeOwnershipTransfer(
              transfer.version,
              transfer.status as transfer_status,
              transfer.evidence as transfer_evidence,
+             transfer.approved_by as transfer_approved_by,
              agreement.status as contract_status,
              agreement.outstanding_balance_minor_units,
              agreement.ownership_holder,
@@ -131,6 +133,7 @@ export async function completeOwnershipTransfer(
         document.accepted_object_etag.length > 0;
       const coherent =
         acceptedEvidence &&
+        record.transfer_approved_by !== null &&
         transferEvidenceDocumentId === registrationEvidenceDocumentId &&
         record.contract_status === "TRANSFERRED" &&
         record.ownership_holder === "CUSTOMER" &&
@@ -145,6 +148,7 @@ export async function completeOwnershipTransfer(
 
       const derivable =
         acceptedEvidence &&
+        record.transfer_approved_by !== null &&
         transferEvidenceDocumentId === registrationEvidenceDocumentId &&
         record.contract_status === "SETTLED" &&
         record.ownership_holder === "SOMOCO" &&

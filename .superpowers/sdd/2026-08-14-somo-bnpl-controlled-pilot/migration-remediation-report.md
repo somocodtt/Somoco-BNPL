@@ -192,4 +192,165 @@ git diff --cached --name-status
 Result: exactly these seven paths: the remediation report, collections
 hardening test, migration 0034, migration journal, DB integration tests,
 collections repository, and contracts repository.
+
+## Fix round 1 — independent review remediation
+
+Review base for this round: `fce9a35dadac86f89b71159932d20f5e20f524b1`.
+The approved review findings were addressed without changing migration 0033.
+Every PostgreSQL command below used only
+`postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`; database suites were
+serial.
+
+### Strict TDD RED evidence
+
+Applicant binding and migration approval were tested before the production
+changes:
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'belongs to another person|populated completed ownership transfer is unapproved'
+Result: 2 failed; both promises resolved undefined instead of rejecting with
+LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'otherwise coherent unapproved ownership transfer replay'
+Result: 1 failed; the promise resolved the COMPLETED row with
+approvedBy:null instead of rejecting.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/collections.hardening.test.ts -t 'otherwise coherent completed ownership row is unapproved'
+Result with the two approval predicates temporarily removed from the
+repository: 1 failed; the promise resolved the COMPLETED row with
+approvedBy:null instead of rejecting. The predicates were restored before
+the GREEN run.
+```
+
+### Strict TDD GREEN evidence
+
+Migration 0034 now binds the application and applicant person in its
+classification CTE and all three ownership backfill CTEs. Its coherent
+classification also requires `approved_by IS NOT NULL`. The exported locked
+repository selects and requires the existing transfer approval in both
+coherent and derivable branches; the collections repository retains the same
+non-null approval predicates.
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'belongs to another person|populated completed ownership transfer is unapproved|otherwise coherent unapproved ownership transfer replay'
+Result: Test Files 1 passed; Tests 3 passed, 46 skipped.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/collections.hardening.test.ts -t 'otherwise coherent completed ownership row is unapproved'
+Result: Test Files 1 passed; Tests 1 passed, 16 skipped.
+```
+
+The real Drizzle migration boundary and runtime role proofs pass independently:
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'rolls back a failed 0034'
+Result: Test Files 1 passed; Tests 1 passed, 48 skipped.
+```
+
+The rollback test runs the actual Drizzle migrator through 0033, then runs
+0034 through the journal boundary against a populated applicant-mismatched
+transfer. It asserts the stable `P0001` error, unchanged contract/vehicle/
+registration/transfer/financial snapshots, the original journal rows, 33
+applied migrations, and no 0034 hash in `drizzle.__drizzle_migrations`.
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'repairs ownership transfer under the runtime role'
+Result: Test Files 1 passed; Tests 1 passed, 48 skipped.
+```
+
+The runtime proof executes the derivable ownership repair after
+`SET LOCAL ROLE somo_runtime` and then proves the same role cannot update an
+unrelated audit row (`42501`). No migration grant or broad privilege was
+needed; existing bounded runtime table grants were sufficient.
+
+### Final verification for this round
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts
+Result: Test Files 1 passed; Tests 49 passed; Duration 70.55s.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/collections.hardening.test.ts
+Result: Test Files 1 passed; Tests 17 passed; Duration 46.48s.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/assets-contracts.e2e.test.ts apps/api/test/assets-contracts.http.test.ts
+Result: Test Files 2 passed; Tests 15 passed; Duration 33.33s.
+```
+
+```text
+$env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts
+Result: Test Files 1 passed; Tests 9 passed; Duration 30.15s.
+```
+
+Affected static and delivery gates:
+
+```text
+node node_modules/typescript/bin/tsc -p packages/db/tsconfig.public-api.json
+Result: exit 0.
+
+node node_modules/typescript/bin/tsc -p packages/db/tsconfig.json --noEmit
+Result: exit 0.
+
+node node_modules/typescript/bin/tsc -p apps/api/tsconfig.json --noEmit
+Result: exit 0.
+
+node node_modules/eslint/bin/eslint.js packages/db/src/db.integration.test.ts packages/db/src/repositories/contracts.ts packages/db/src/repositories/collections.ts apps/api/test/collections.hardening.test.ts
+Result: exit 0.
+
+node node_modules/prettier/bin/prettier.cjs --check packages/db/src/db.integration.test.ts packages/db/src/repositories/contracts.ts packages/db/src/repositories/collections.ts apps/api/test/collections.hardening.test.ts
+Result: All matched files use Prettier code style.
+
+node node_modules/typescript/bin/tsc -p packages/db/tsconfig.json
+Result: exit 0.
+
+node scripts/build-api.mjs
+Result: exit 0.
+
+node scripts/verify-workspace.mjs
+Result: Workspace configuration verified.
+
+node scripts/verify-pilot-gates.mjs --environment test
+Result: pilot gates verified: test (10 signed gates).
+```
+
+### Self-review
+
+- The applicant join and `document.person_id = applicant.applicant_person_id`
+  predicate are present in classification and each contract, vehicle, and
+  registration backfill source. The adversarial accepted/clean other-person
+  fixture fails closed before any ownership DML.
+- `approved_by IS NOT NULL` is required by migration coherent classification,
+  migration backfill, exported repository coherent/derivable validation, and
+  collections coherent/derivable validation. The pending exported command now
+  requires a non-null approval at the type boundary.
+- The real Drizzle journal test proves a failed 0034 transaction does not add
+  its journal row or mutate populated state. The runtime-role test proves the
+  bounded repair succeeds and unrelated audit mutation remains prohibited.
+- No production access, provider access, remote contact, dependency change,
+  or broad grant was introduced. The remaining concern is unchanged from the
+  prior round: production pilot evidence and external signed UAT gates remain
+  pending, so production gate verification must stay fail-closed.
+
+### Post-commit exact-base review
+
+```text
+git diff --check fce9a35dadac86f89b71159932d20f5e20f524b1..HEAD
+Result: no output; exit 0.
+
+git diff --name-status fce9a35dadac86f89b71159932d20f5e20f524b1..HEAD
+Result: exactly the five intended paths in this round: this report, the
+collections hardening test, migration 0034, DB integration tests, and the
+exported contracts repository.
+
+git status --short
+Result: empty after commit.
+```
 ```

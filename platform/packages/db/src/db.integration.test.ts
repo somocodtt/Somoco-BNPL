@@ -1,7 +1,17 @@
-import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -25,6 +35,7 @@ import {
 } from "./outbox.js";
 import { applicationRepo } from "./repositories/applications.js";
 import { appendAuditEvent } from "./repositories/audit.js";
+import { collectionsRepo } from "./repositories/collections.js";
 import { completeOwnershipTransfer } from "./repositories/contracts.js";
 import { ledgerRepo } from "./repositories/ledger.js";
 import { paymentRepo } from "./repositories/payments.js";
@@ -52,7 +63,7 @@ import {
   product,
   vehicleModel,
 } from "./schema/products.js";
-import { withTransaction } from "./transaction.js";
+import { getInternalTransaction, withTransaction } from "./transaction.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -394,6 +405,79 @@ describe("PostgreSQL persistence", () => {
     ).rejects.toMatchObject({ code: "55000" });
   });
 
+  it("repairs ownership transfer under the runtime role without unrelated mutation", async () => {
+    const graph = await insertFinancialGraph(db, {
+      contractStatus: "SETTLED",
+      outstandingBalanceMinorUnits: 0n,
+    });
+    const approverId = randomUUID();
+    const transferId = randomUUID();
+    const documentId = randomUUID();
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash)
+      values (${approverId}, ${`${approverId}@example.test`}, 'hash')
+    `);
+    await db.insert(registrationRecord).values({
+      vehicleUnitId: graph.vehicleUnitId,
+      registrationNumber: "REG-RUNTIME-1001",
+      registeredOwner: "SOMOCO",
+      validFrom: "2026-08-14",
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    await db.execute(sql`
+      insert into privacy.document
+        (id, person_id, document_type, object_key, declared_mime_type,
+         declared_size_bytes, upload_ticket_hash, upload_expires_at,
+         accepted_object_key, accepted_object_version_id,
+         accepted_object_etag, sha256, status, malware_scanned)
+      select ${documentId}::uuid,
+             application.applicant_person_id,
+             'TRANSFER_EVIDENCE', ${`pending/${documentId}`},
+             'application/pdf', 128, repeat('a', 64), now() + interval '5 minutes',
+             ${`accepted/${documentId}`}, 'v1', 'etag', repeat('b', 64),
+             'ACCEPTED', true
+        from application
+       where application.id = (
+         select application_id from contract where id = ${graph.contractId}
+       )
+    `);
+    await db.insert(ownershipTransfer).values({
+      id: transferId,
+      contractId: graph.contractId,
+      status: "PENDING",
+    });
+    const audit = await appendAuditEvent(
+      database,
+      auditBuilder({ aggregateId: graph.contractId }),
+    );
+
+    const repaired = await withTransaction(database, async (tx) => {
+      const executor = getInternalTransaction(tx);
+      await executor.execute(sql`set local role somo_runtime`);
+      return collectionsRepo(tx).completeOwnershipTransfer({
+        contractId: graph.contractId,
+        approvedBy: approverId,
+        evidence: { registrationEvidenceDocumentId: documentId },
+        transferredAt: new Date("2026-08-14T12:00:00.000Z"),
+      });
+    });
+    expect(repaired).toMatchObject({
+      id: transferId,
+      status: "COMPLETED",
+      approvedBy: approverId,
+    });
+
+    await expect(
+      withTransaction(database, async (tx) => {
+        const executor = getInternalTransaction(tx);
+        await executor.execute(sql`set local role somo_runtime`);
+        await executor.execute(
+          sql`update audit_event set action = 'TAMPERED' where id = ${audit.id}`,
+        );
+      }),
+    ).rejects.toMatchObject({ cause: { code: "42501" } });
+  });
+
   it("keeps settlement evidence append-only and limits runtime privileges", async () => {
     const graph = await insertFinancialGraph(db);
     const staffId = randomUUID();
@@ -628,10 +712,17 @@ describe("PostgreSQL persistence", () => {
        where contract.id = ${graph.contractId}
     `);
 
+    const approverId = randomUUID();
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash)
+      values (${approverId}, ${`${approverId}@example.test`}, 'hash')
+    `);
+
     const completed = await completeOwnershipTransfer(database, {
       id: transferId,
       expectedVersion: 1,
       evidence: { registrationEvidenceDocumentId },
+      approvedBy: approverId,
       transferredAt: new Date("2026-08-14T12:00:00.000Z"),
       effects: writeEffects(transferId, "OWNERSHIP_TRANSFER_COMPLETED"),
     });
@@ -672,6 +763,7 @@ describe("PostgreSQL persistence", () => {
         id: transferId,
         expectedVersion: 2,
         evidence: { registrationEvidenceDocumentId },
+        approvedBy: approverId,
         transferredAt: new Date("2026-08-14T12:01:00.000Z"),
         effects: writeEffects(
           transferId,
@@ -683,6 +775,86 @@ describe("PostgreSQL persistence", () => {
       status: "COMPLETED",
       version: 2,
     });
+  });
+
+  it("rejects an otherwise coherent unapproved ownership transfer replay", async () => {
+    const graph = await insertFinancialGraph(db, {
+      contractStatus: "SETTLED",
+      outstandingBalanceMinorUnits: 0n,
+    });
+    const transferId = randomUUID();
+    const approverId = randomUUID();
+    const documentId = randomUUID();
+    await db.execute(sql`
+      insert into staff_user (id, email, password_hash)
+      values (${approverId}, ${`${approverId}@example.test`}, 'hash')
+    `);
+    await db.execute(sql`
+      insert into registration_record
+        (vehicle_unit_id, registration_number, registered_owner, valid_from)
+      values (${graph.vehicleUnitId}, 'REG-UNAPPROVED-1001', 'SOMOCO', '2026-08-14')
+    `);
+    await db.execute(sql`
+      insert into privacy.document
+        (id, person_id, document_type, object_key, declared_mime_type,
+         declared_size_bytes, upload_ticket_hash, upload_expires_at,
+         accepted_object_key, accepted_object_version_id, accepted_object_etag,
+         sha256, status, malware_scanned)
+      select ${documentId}::uuid,
+             application.applicant_person_id,
+             'TRANSFER_EVIDENCE',
+             ${`pending/${documentId}`},
+             'application/pdf', 128, repeat('a', 64), now() + interval '5 minutes',
+             ${`accepted/${documentId}`}, 'v1', 'etag', repeat('b', 64),
+             'ACCEPTED', true
+        from application
+       where application.id = (
+         select application_id from contract where id = ${graph.contractId}
+       )
+    `);
+    await withTransaction(database, async (tx) => {
+      const executor = getInternalTransaction(tx);
+      await executor.execute(sql`
+        update contract
+           set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER'
+         where id = ${graph.contractId}
+      `);
+      await executor.execute(sql`
+        update vehicle_unit
+           set status = 'TRANSFERRED'
+         where id = ${graph.vehicleUnitId}
+      `);
+      await executor.execute(sql`
+        insert into registration_record
+          (vehicle_unit_id, registration_number, registered_owner,
+           valid_from, evidence_document_id)
+        values (${graph.vehicleUnitId}, 'REG-UNAPPROVED-1001', 'CUSTOMER',
+                '2026-08-14', ${documentId})
+      `);
+      await executor.execute(sql`
+        insert into ownership_transfer
+          (id, contract_id, status, evidence, approved_by, transferred_at)
+        values (${transferId}, ${graph.contractId}, 'COMPLETED',
+                ${JSON.stringify({ registrationEvidenceDocumentId: documentId })}::jsonb,
+                null, '2026-08-14T12:00:00.000Z')
+      `);
+    });
+
+    await expect(
+      completeOwnershipTransfer(database, {
+        id: transferId,
+        expectedVersion: 1,
+        approvedBy: approverId,
+        evidence: { registrationEvidenceDocumentId: documentId },
+        transferredAt: new Date("2026-08-14T12:01:00.000Z"),
+        effects: writeEffects(
+          transferId,
+          "UNAPPROVED_OWNERSHIP_TRANSFER_REPLAY",
+        ),
+      }),
+    ).rejects.toThrow(
+      "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+    );
   });
 
   it("rejects customer registration before ownership transfer completes", async () => {
@@ -2465,6 +2637,341 @@ describe("populated legacy schema migration", () => {
     ).resolves.toEqual(before);
   });
 
+  it("fails closed when accepted legacy transfer evidence belongs to another person", async () => {
+    const legacy = await seedPopulatedOwnershipTransfer(pool, {
+      documentOwner: "OTHER",
+      finalState: "SETTLED",
+      approved: true,
+    });
+    const before = await pool.query(
+      `select c.status::text as contract_status, c.ownership_holder,
+              c.outstanding_balance_minor_units::text as balance,
+              v.status::text as vehicle_status,
+              (select count(*)::int from registration_record
+                where vehicle_unit_id = v.id) as registration_count
+         from contract c
+         join vehicle_unit v on v.id = c.vehicle_unit_id
+        where c.id = $1`,
+      [legacy.contractId],
+    );
+
+    await expect(
+      applyMigrationFile(
+        pool,
+        "0034_populated_financial_ownership_remediation.sql",
+      ),
+    ).rejects.toMatchObject({
+      code: "P0001",
+      message: expect.stringContaining(
+        "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+      ),
+      detail: expect.stringContaining(legacy.contractId),
+    });
+    await expect(
+      pool.query(
+        `select c.status::text as contract_status, c.ownership_holder,
+                c.outstanding_balance_minor_units::text as balance,
+                v.status::text as vehicle_status,
+                (select count(*)::int from registration_record
+                  where vehicle_unit_id = v.id) as registration_count
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+          where c.id = $1`,
+        [legacy.contractId],
+      ),
+    ).resolves.toEqual(before);
+  });
+
+  it("fails closed when a populated completed ownership transfer is unapproved", async () => {
+    const legacy = await seedPopulatedOwnershipTransfer(pool, {
+      documentOwner: "APPLICANT",
+      finalState: "TRANSFERRED",
+      approved: false,
+    });
+    const before = await pool.query(
+      `select c.status::text as contract_status, c.ownership_holder,
+              v.status::text as vehicle_status,
+              registration.registered_owner::text,
+              registration.evidence_document_id::text as evidence_document_id
+         from contract c
+         join vehicle_unit v on v.id = c.vehicle_unit_id
+         join lateral (
+           select * from registration_record
+            where vehicle_unit_id = v.id
+            order by created_at desc, id desc limit 1
+         ) registration on true
+        where c.id = $1`,
+      [legacy.contractId],
+    );
+
+    await expect(
+      applyMigrationFile(
+        pool,
+        "0034_populated_financial_ownership_remediation.sql",
+      ),
+    ).rejects.toMatchObject({
+      code: "P0001",
+      message: expect.stringContaining(
+        "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+      ),
+      detail: expect.stringContaining(legacy.contractId),
+    });
+    await expect(
+      pool.query(
+        `select c.status::text as contract_status, c.ownership_holder,
+                v.status::text as vehicle_status,
+                registration.registered_owner::text,
+                registration.evidence_document_id::text as evidence_document_id
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+           join lateral (
+             select * from registration_record
+              where vehicle_unit_id = v.id
+              order by created_at desc, id desc limit 1
+           ) registration on true
+          where c.id = $1`,
+        [legacy.contractId],
+      ),
+    ).resolves.toEqual(before);
+  });
+
+  it("rolls back a failed 0034 through the Drizzle journal boundary", async () => {
+    await resetTestDatabase(databaseUrl);
+    const sourceJournal = JSON.parse(
+      await readFile(join(migrationsFolder, "meta", "_journal.json"), "utf8"),
+    ) as {
+      version: string;
+      dialect: string;
+      entries: ReadonlyArray<{
+        idx: number;
+        version: string;
+        when: number;
+        tag: string;
+        breakpoints: boolean;
+      }>;
+    };
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "somo-drizzle-"));
+    const preEntries = sourceJournal.entries.filter(
+      ({ tag }) => tag !== "0034_populated_financial_ownership_remediation",
+    );
+    const preFolder = await writeMigrationSubset(
+      temporaryRoot,
+      "pre",
+      sourceJournal,
+      preEntries,
+    );
+    const fullFolder = await writeMigrationSubset(
+      temporaryRoot,
+      "full",
+      sourceJournal,
+      sourceJournal.entries,
+    );
+    const migrationConnection = createDatabase(databaseUrl);
+    const migrationDatabase = migrationConnection.db;
+    try {
+      await migrate(getInternalDatabase(migrationDatabase), {
+        migrationsFolder: preFolder,
+      });
+
+      const legacy = await insertLegacyFinancialGraph(pool, {
+        provider: "SOMOCO_PAYMENTS",
+        channel: "MOBILE_MONEY",
+        registeredOwner: "SOMOCO",
+        calculationMethod: "REDUCING_BALANCE",
+      });
+      const applicant = await pool.query<{ applicant_person_id: string }>(
+        `select applicant_person_id from application
+           where id = (select application_id from contract where id = $1)`,
+        [legacy.contractId],
+      );
+      const otherPersonId = randomUUID();
+      const staffId = randomUUID();
+      const documentId = randomUUID();
+      const transferId = randomUUID();
+      await pool.query(
+        `insert into privacy.person (id, phone_e164) values ($1, $2)`,
+        [
+          otherPersonId,
+          `+23320${randomUUID().replaceAll("-", "").slice(0, 7)}`,
+        ],
+      );
+      await pool.query(
+        `update contract
+            set status = 'SETTLED', outstanding_balance_minor_units = 0,
+                settled_at = '2026-08-14T12:00:00.000Z'
+          where id = $1`,
+        [legacy.contractId],
+      );
+      await pool.query(
+        `insert into staff_user (id, email, password_hash)
+         values ($1, $2, 'hash')`,
+        [staffId, `${staffId}@example.test`],
+      );
+      await pool.query(
+        `insert into privacy.document
+           (id, person_id, document_type, object_key, declared_mime_type,
+            declared_size_bytes, upload_ticket_hash, upload_expires_at,
+            accepted_object_key, accepted_object_version_id,
+            accepted_object_etag, sha256, status, malware_scanned)
+         values ($1, $2, 'TRANSFER_EVIDENCE', $3, 'application/pdf', 128,
+                 repeat('a', 64), now() + interval '5 minutes', $4, 'v1',
+                 'etag', repeat('b', 64), 'ACCEPTED', true)`,
+        [
+          documentId,
+          otherPersonId,
+          `pending/${documentId}`,
+          `accepted/${documentId}`,
+        ],
+      );
+      await pool.query(
+        `insert into settlement_evidence
+           (id, contract_id, evidence_document_id,
+            evidence_document_reference, evidence_hash, evidence_object_key,
+            evidence_object_version_id, evidence_object_etag,
+            verification_status, accepted_by, accepted_at)
+         values ($1, $2, $3, $4, repeat('b', 64), $4, 'v1', 'etag',
+                 'CLEAN', $5, now())`,
+        [
+          randomUUID(),
+          legacy.contractId,
+          documentId,
+          `accepted/${documentId}`,
+          staffId,
+        ],
+      );
+      const setupClient = await pool.connect();
+      try {
+        await setupClient.query("begin");
+        await setupClient.query(
+          `insert into ownership_transfer
+             (id, contract_id, status, evidence)
+           values ($1, $2, 'PENDING', '{}'::jsonb)`,
+          [transferId, legacy.contractId],
+        );
+        await setupClient.query(
+          `update contract
+              set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+                  outstanding_balance_minor_units = 0
+            where id = $1`,
+          [legacy.contractId],
+        );
+        await setupClient.query(
+          `update vehicle_unit set status = 'TRANSFERRED'
+            where id = (select vehicle_unit_id from contract where id = $1)`,
+          [legacy.contractId],
+        );
+        await setupClient.query(
+          `insert into registration_record
+             (vehicle_unit_id, registration_number, registered_owner,
+              valid_from, valid_to, evidence_document_id)
+           select vehicle_unit_id, registration_number, 'CUSTOMER',
+                  valid_from, valid_to, $2::uuid
+             from registration_record
+            where vehicle_unit_id = (select vehicle_unit_id from contract where id = $1)
+              and registered_owner = 'SOMOCO'
+            order by created_at desc, id desc
+            limit 1`,
+          [legacy.contractId, documentId],
+        );
+        await setupClient.query(
+          `update ownership_transfer
+              set status = 'COMPLETED', approved_by = $2,
+                  evidence = $3::jsonb,
+                  transferred_at = '2026-08-14T12:00:00.000Z'
+            where id = $1`,
+          [
+            transferId,
+            staffId,
+            JSON.stringify({ registrationEvidenceDocumentId: documentId }),
+          ],
+        );
+        await setupClient.query("commit");
+      } catch (error) {
+        await setupClient.query("rollback");
+        throw error;
+      } finally {
+        setupClient.release();
+      }
+
+      const snapshot = async () => ({
+        contract: await pool.query(
+          `select c.status::text as contract_status,
+                  c.ownership_holder, c.outstanding_balance_minor_units::text as balance,
+                  c.version, v.status::text as vehicle_status, v.version as vehicle_version,
+                  (select count(*)::int from registration_record
+                    where vehicle_unit_id = v.id) as registration_count
+             from contract c
+             join vehicle_unit v on v.id = c.vehicle_unit_id
+            where c.id = $1`,
+          [legacy.contractId],
+        ),
+        transfer: await pool.query(
+          `select status, approved_by::text as approved_by, evidence::text as evidence,
+                  version from ownership_transfer where id = $1`,
+          [transferId],
+        ),
+        registrations: await pool.query(
+          `select registration_number, registered_owner::text as registered_owner,
+                  evidence_document_id::text as evidence_document_id
+             from registration_record
+            where vehicle_unit_id = (select vehicle_unit_id from contract where id = $1)
+            order by created_at, id`,
+          [legacy.contractId],
+        ),
+        counts: await pool.query(
+          `select (select count(*)::int from payment_transaction) as payment_count,
+                  (select count(*)::int from ledger_entry) as ledger_count,
+                  (select count(*)::int from audit_event) as audit_count`,
+        ),
+      });
+      const before = await snapshot();
+      const journalBefore = await pool.query(
+        `select hash, created_at from drizzle.__drizzle_migrations order by id`,
+      );
+
+      let migrationError: unknown;
+      try {
+        await migrate(getInternalDatabase(migrationDatabase), {
+          migrationsFolder: fullFolder,
+        });
+      } catch (error) {
+        migrationError = error;
+      }
+      expect(migrationError).toBeDefined();
+      const errorCause = (
+        migrationError as { cause?: { code?: string; message?: string } }
+      ).cause;
+      expect(errorCause?.code).toBe("P0001");
+      expect(errorCause?.message).toContain(
+        "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+      );
+
+      await expect(snapshot()).resolves.toEqual(before);
+      const journalAfter = await pool.query(
+        `select hash, created_at from drizzle.__drizzle_migrations order by id`,
+      );
+      expect(journalAfter.rows).toEqual(journalBefore.rows);
+      expect(journalAfter.rows).toHaveLength(33);
+      const migration034Hash = createHash("sha256")
+        .update(
+          await readFile(
+            join(
+              migrationsFolder,
+              "0034_populated_financial_ownership_remediation.sql",
+            ),
+          ),
+        )
+        .digest("hex");
+      expect(
+        journalAfter.rows.some(({ hash }) => hash === migration034Hash),
+      ).toBe(false);
+      expect(applicant.rows[0]?.applicant_person_id).not.toBe(otherPersonId);
+    } finally {
+      await migrationConnection.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
     for (const migration of [
       "0001_fresh_talon.sql",
@@ -2694,6 +3201,46 @@ async function runAsRuntimeRole<T>(
 
 const migrationsFolder = fileURLToPath(new URL("../drizzle/", import.meta.url));
 
+async function writeMigrationSubset(
+  root: string,
+  name: string,
+  sourceJournal: {
+    version: string;
+    dialect: string;
+    entries: ReadonlyArray<{
+      idx: number;
+      version: string;
+      when: number;
+      tag: string;
+      breakpoints: boolean;
+    }>;
+  },
+  entries: ReadonlyArray<{
+    idx: number;
+    version: string;
+    when: number;
+    tag: string;
+    breakpoints: boolean;
+  }>,
+): Promise<string> {
+  const folder = join(root, name);
+  await mkdir(join(folder, "meta"), { recursive: true });
+  await writeFile(
+    join(folder, "meta", "_journal.json"),
+    JSON.stringify({ ...sourceJournal, entries }, null, 2),
+    "utf8",
+  );
+  await Promise.all(
+    entries.map(({ tag }) =>
+      copyFile(
+        join(migrationsFolder, `${tag}.sql`),
+        join(folder, `${tag}.sql`),
+      ),
+    ),
+  );
+  return folder;
+}
+
 async function applyMigrationFile(pool: Pool, filename: string): Promise<void> {
   const migration = await readFile(`${migrationsFolder}${filename}`, "utf8");
   const statements = migration
@@ -2734,6 +3281,148 @@ interface LegacyGraphOptions {
   channel?: "USSD" | "MOBILE_MONEY";
   registeredOwner: string;
   calculationMethod?: "DECLINING_BALANCE" | "REDUCING_BALANCE";
+}
+
+interface PopulatedOwnershipTransferOptions {
+  documentOwner: "APPLICANT" | "OTHER";
+  finalState: "SETTLED" | "TRANSFERRED";
+  approved: boolean;
+}
+
+async function seedPopulatedOwnershipTransfer(
+  pool: Pool,
+  options: PopulatedOwnershipTransferOptions,
+) {
+  await applyMigrationsBefore0033(pool);
+  const legacy = await insertLegacyFinancialGraph(pool, {
+    provider: "SOMOCO_PAYMENTS",
+    channel: "MOBILE_MONEY",
+    registeredOwner: "SOMOCO",
+    calculationMethod: "REDUCING_BALANCE",
+  });
+  const staffId = randomUUID();
+  const documentId = randomUUID();
+  const transferId = randomUUID();
+  const applicant = await pool.query<{ applicant_person_id: string }>(
+    `select applicant_person_id from application
+       where id = (select application_id from contract where id = $1)`,
+    [legacy.contractId],
+  );
+  const evidencePersonId =
+    options.documentOwner === "APPLICANT"
+      ? applicant.rows[0]!.applicant_person_id
+      : randomUUID();
+  if (options.documentOwner === "OTHER") {
+    await pool.query(
+      `insert into privacy.person (id, phone_e164) values ($1, $2)`,
+      [
+        evidencePersonId,
+        `+23320${randomUUID().replaceAll("-", "").slice(0, 7)}`,
+      ],
+    );
+  }
+  await pool.query(
+    `update contract
+        set status = 'SETTLED', outstanding_balance_minor_units = 0,
+            settled_at = '2026-08-14T12:00:00.000Z'
+      where id = $1`,
+    [legacy.contractId],
+  );
+  await pool.query(
+    `update vehicle_unit set status = 'HANDED_OVER'
+      where id = (select vehicle_unit_id from contract where id = $1)`,
+    [legacy.contractId],
+  );
+  await pool.query(
+    `insert into staff_user (id, email, password_hash) values ($1, $2, 'hash')`,
+    [staffId, `${staffId}@example.test`],
+  );
+  await pool.query(
+    `insert into privacy.document
+       (id, person_id, document_type, object_key, declared_mime_type,
+        declared_size_bytes, upload_ticket_hash, upload_expires_at,
+        accepted_object_key, accepted_object_version_id, accepted_object_etag,
+        sha256, status, malware_scanned)
+     values ($1, $2, 'TRANSFER_EVIDENCE', $3, 'application/pdf', 128,
+             repeat('a', 64), now() + interval '5 minutes', $4, 'v1', 'etag',
+             repeat('b', 64), 'ACCEPTED', true)`,
+    [
+      documentId,
+      evidencePersonId,
+      `pending/${documentId}`,
+      `accepted/${documentId}`,
+    ],
+  );
+  await pool.query(
+    `insert into settlement_evidence
+       (id, contract_id, evidence_document_id, evidence_document_reference,
+        evidence_hash, evidence_object_key, evidence_object_version_id,
+        evidence_object_etag, verification_status, accepted_by, accepted_at)
+     values ($1, $2, $3, $4, repeat('b', 64), $4, 'v1', 'etag', 'CLEAN', $5, now())`,
+    [
+      randomUUID(),
+      legacy.contractId,
+      documentId,
+      `accepted/${documentId}`,
+      staffId,
+    ],
+  );
+  await pool.query(
+    `insert into ownership_transfer
+       (id, contract_id, status, evidence, approved_by, transferred_at)
+     values ($1, $2, 'COMPLETED', $3::jsonb, $4, '2026-08-14T12:00:00.000Z')`,
+    [
+      transferId,
+      legacy.contractId,
+      JSON.stringify({ registrationEvidenceDocumentId: documentId }),
+      options.approved ? staffId : null,
+    ],
+  );
+
+  await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+  if (options.finalState === "TRANSFERRED") {
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      await client.query(
+        `update contract
+            set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+                outstanding_balance_minor_units = 0
+          where id = $1`,
+        [legacy.contractId],
+      );
+      await client.query(
+        `update vehicle_unit set status = 'TRANSFERRED'
+          where id = (select vehicle_unit_id from contract where id = $1)`,
+        [legacy.contractId],
+      );
+      await client.query(
+        `insert into registration_record
+          (vehicle_unit_id, registration_number, registered_owner,
+           valid_from, valid_to, evidence_document_id)
+         select vehicle_unit_id, registration_number, 'CUSTOMER',
+                valid_from, valid_to, $2::uuid
+           from registration_record
+          where vehicle_unit_id = (select vehicle_unit_id from contract where id = $1)
+            and registered_owner = 'SOMOCO'
+          order by created_at desc, id desc
+          limit 1`,
+        [legacy.contractId, documentId],
+      );
+      await client.query("commit");
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  return {
+    ...legacy,
+    documentId,
+    staffId,
+    transferId,
+  };
 }
 
 async function insertLegacyFinancialGraph(

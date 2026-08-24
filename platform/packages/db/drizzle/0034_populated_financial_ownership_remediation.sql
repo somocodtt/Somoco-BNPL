@@ -68,6 +68,7 @@ BEGIN
            accepted_evidence.evidence_object_etag
       FROM ownership_transfer transfer
       JOIN contract agreement ON agreement.id = transfer.contract_id
+      JOIN application applicant ON applicant.id = agreement.application_id
       JOIN vehicle_unit asset ON asset.id = agreement.vehicle_unit_id
       LEFT JOIN LATERAL (
         SELECT record.registration_number,
@@ -82,6 +83,7 @@ BEGIN
       ) registration ON true
       LEFT JOIN privacy.document document
         ON document.id::text = transfer.evidence->>'registrationEvidenceDocumentId'
+       AND document.person_id = applicant.applicant_person_id
       LEFT JOIN settlement_evidence accepted_evidence
         ON accepted_evidence.contract_id = transfer.contract_id
        AND accepted_evidence.evidence_document_id = document.id
@@ -91,6 +93,7 @@ BEGIN
     SELECT completed_transfers.*,
            (
              transfer_status = 'COMPLETED'
+             AND approved_by IS NOT NULL
              AND contract_status = 'TRANSFERRED'
              AND ownership_holder = 'CUSTOMER'
              AND outstanding_balance_minor_units = 0
@@ -171,6 +174,7 @@ WITH derivable_transfers AS (
          GREATEST(now(), COALESCE(transfer.transferred_at, now())) AS transferred_at
     FROM ownership_transfer transfer
     JOIN contract agreement ON agreement.id = transfer.contract_id
+    JOIN application applicant ON applicant.id = agreement.application_id
     JOIN vehicle_unit asset ON asset.id = agreement.vehicle_unit_id
     JOIN LATERAL (
       SELECT record.registration_number,
@@ -185,6 +189,7 @@ WITH derivable_transfers AS (
     ) registration ON true
     JOIN privacy.document document
       ON document.id::text = transfer.evidence->>'registrationEvidenceDocumentId'
+     AND document.person_id = applicant.applicant_person_id
     JOIN settlement_evidence accepted_evidence
       ON accepted_evidence.contract_id = transfer.contract_id
      AND accepted_evidence.evidence_document_id = document.id
@@ -230,6 +235,7 @@ WITH derivable_transfers AS (
          GREATEST(now(), COALESCE(transfer.transferred_at, now())) AS transferred_at
     FROM ownership_transfer transfer
     JOIN contract agreement ON agreement.id = transfer.contract_id
+    JOIN application applicant ON applicant.id = agreement.application_id
     JOIN vehicle_unit asset ON asset.id = agreement.vehicle_unit_id
     JOIN LATERAL (
       SELECT record.registration_number,
@@ -244,6 +250,7 @@ WITH derivable_transfers AS (
     ) registration ON true
     JOIN privacy.document document
       ON document.id::text = transfer.evidence->>'registrationEvidenceDocumentId'
+     AND document.person_id = applicant.applicant_person_id
     JOIN settlement_evidence accepted_evidence
       ON accepted_evidence.contract_id = transfer.contract_id
      AND accepted_evidence.evidence_document_id = document.id
@@ -290,6 +297,7 @@ WITH derivable_transfers AS (
          GREATEST(now(), COALESCE(transfer.transferred_at, now())) AS transferred_at
     FROM ownership_transfer transfer
     JOIN contract agreement ON agreement.id = transfer.contract_id
+    JOIN application applicant ON applicant.id = agreement.application_id
     JOIN vehicle_unit asset ON asset.id = agreement.vehicle_unit_id
     JOIN LATERAL (
       SELECT record.registration_number,
@@ -304,6 +312,7 @@ WITH derivable_transfers AS (
     ) registration ON true
     JOIN privacy.document document
       ON document.id::text = transfer.evidence->>'registrationEvidenceDocumentId'
+     AND document.person_id = applicant.applicant_person_id
     JOIN settlement_evidence accepted_evidence
       ON accepted_evidence.contract_id = transfer.contract_id
      AND accepted_evidence.evidence_document_id = document.id

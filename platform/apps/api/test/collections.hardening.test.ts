@@ -817,6 +817,49 @@ describe("settlement transfer evidence", () => {
       registration_count: 1,
     });
   });
+
+  it("fails closed when an otherwise coherent completed ownership row is unapproved", async () => {
+    const fixture = await seedContract("SETTLED", 0);
+    const actorId = await seedStaff("MD");
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
+    const transferId = randomUUID();
+    const evidenceJson = JSON.stringify({
+      registrationEvidenceDocumentId: evidenceDocumentId,
+    }).replaceAll("'", "''");
+    await executeTestSql(
+      databaseUrl,
+      `do $$ begin
+         update contract
+            set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+                outstanding_balance_minor_units = 0
+          where id = '${fixture.contractId}'::uuid;
+         update vehicle_unit set status = 'TRANSFERRED'
+          where id = '${fixture.vehicleId}'::uuid;
+         insert into registration_record
+           (vehicle_unit_id, registration_number, registered_owner,
+            valid_from, valid_to, evidence_document_id)
+         values ('${fixture.vehicleId}'::uuid, 'GT-UNAPPROVED-26', 'CUSTOMER',
+                 '2026-08-01', '2027-08-01', '${evidenceDocumentId}'::uuid);
+         insert into ownership_transfer
+           (id, contract_id, status, evidence, approved_by, transferred_at)
+         values ('${transferId}'::uuid, '${fixture.contractId}'::uuid, 'COMPLETED',
+                 '${evidenceJson}'::jsonb, null, '2026-08-14T12:00:00.000Z');
+       end $$`,
+    );
+
+    await expect(
+      withTransaction(database, async (tx) =>
+        collectionsRepo(tx).completeOwnershipTransfer({
+          contractId: fixture.contractId,
+          approvedBy: actorId,
+          evidence: { registrationEvidenceDocumentId: evidenceDocumentId },
+          transferredAt: new Date("2026-08-14T12:00:00.000Z"),
+        }),
+      ),
+    ).rejects.toThrow(
+      "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+    );
+  });
 });
 
 describe("recovery action replay", () => {
