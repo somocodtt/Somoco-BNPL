@@ -882,31 +882,36 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         .from(ownershipTransfer)
         .where(eq(ownershipTransfer.contractId, input.contractId))
         .for("update");
-      if (existing[0]?.status === "COMPLETED") return existing[0];
       const transfer = existing[0];
       const authoritative = await executor.execute<{
         contract_status: string;
         ownership_holder: string;
         outstanding_balance_minor_units: bigint | string;
         vehicle_unit_id: string;
+        vehicle_status: string;
         registration_number: string | null;
         registered_owner: string | null;
         valid_from: string | null;
         valid_to: string | null;
+        registration_evidence_document_id: string | null;
       }>(sql`
         select agreement.status::text as contract_status,
                agreement.ownership_holder,
                agreement.outstanding_balance_minor_units,
                asset.id as vehicle_unit_id,
+               asset.status::text as vehicle_status,
                registration.registration_number,
                registration.registered_owner::text,
                registration.valid_from::text,
-               registration.valid_to::text
+               registration.valid_to::text,
+               registration.evidence_document_id::text
+                 as registration_evidence_document_id
           from contract agreement
           join vehicle_unit asset on asset.id = agreement.vehicle_unit_id
           left join lateral (
             select record.registration_number, record.registered_owner,
-                   record.valid_from, record.valid_to
+                   record.valid_from, record.valid_to,
+                   record.evidence_document_id
               from registration_record record
              where record.vehicle_unit_id = asset.id
              order by record.created_at desc, record.id desc
@@ -917,6 +922,124 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       `);
       const state = authoritative.rows[0];
       if (state === undefined) throw new Error("CONTRACT_NOT_FOUND");
+
+      if (transfer?.status === "COMPLETED") {
+        const requestedEvidenceDocumentId =
+          input.evidence.registrationEvidenceDocumentId;
+        const transferEvidenceDocumentId =
+          typeof transfer.evidence?.registrationEvidenceDocumentId === "string"
+            ? transfer.evidence.registrationEvidenceDocumentId
+            : null;
+        const evidenceDocument = isUuid(requestedEvidenceDocumentId)
+          ? await executor.execute<{
+              document_type: string;
+              status: string;
+              malware_scanned: boolean;
+              sha256: string | null;
+              accepted_object_key: string | null;
+              accepted_object_version_id: string | null;
+              accepted_object_etag: string | null;
+            }>(sql`
+              select document.document_type,
+                     document.status::text,
+                     document.malware_scanned,
+                     document.sha256,
+                     document.accepted_object_key,
+                     document.accepted_object_version_id,
+                     document.accepted_object_etag
+                from contract agreement
+                join application on application.id = agreement.application_id
+                join privacy.document document
+                  on document.id = ${requestedEvidenceDocumentId}::uuid
+                 and document.person_id = application.applicant_person_id
+               where agreement.id = ${input.contractId}
+            `)
+          : { rows: [] };
+        const document = evidenceDocument.rows[0];
+        const acceptedEvidence =
+          document !== undefined &&
+          document.document_type === "TRANSFER_EVIDENCE" &&
+          document.status === "ACCEPTED" &&
+          document.malware_scanned &&
+          typeof document.sha256 === "string" &&
+          /^[0-9a-f]{64}$/.test(document.sha256) &&
+          typeof document.accepted_object_key === "string" &&
+          document.accepted_object_key.length > 0 &&
+          typeof document.accepted_object_version_id === "string" &&
+          document.accepted_object_version_id.length > 0 &&
+          typeof document.accepted_object_etag === "string" &&
+          document.accepted_object_etag.length > 0;
+        const coherent =
+          acceptedEvidence &&
+          transfer?.approvedBy !== null &&
+          transfer?.approvedBy !== undefined &&
+          transferEvidenceDocumentId === requestedEvidenceDocumentId &&
+          state.contract_status === "TRANSFERRED" &&
+          state.ownership_holder === "CUSTOMER" &&
+          BigInt(state.outstanding_balance_minor_units) === 0n &&
+          state.vehicle_status === "TRANSFERRED" &&
+          state.registration_number !== null &&
+          state.registered_owner === "CUSTOMER" &&
+          state.valid_from !== null &&
+          state.registration_evidence_document_id ===
+            requestedEvidenceDocumentId;
+        if (coherent) return transfer;
+
+        const derivable =
+          acceptedEvidence &&
+          transfer?.approvedBy !== null &&
+          transfer?.approvedBy !== undefined &&
+          transferEvidenceDocumentId === requestedEvidenceDocumentId &&
+          state.contract_status === "SETTLED" &&
+          state.ownership_holder === "SOMOCO" &&
+          BigInt(state.outstanding_balance_minor_units) === 0n &&
+          state.registration_number !== null &&
+          state.registered_owner === "SOMOCO" &&
+          state.valid_from !== null &&
+          (state.registration_evidence_document_id === null ||
+            state.registration_evidence_document_id ===
+              requestedEvidenceDocumentId);
+        if (!derivable)
+          throw new Error(
+            "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+          );
+
+        const contractTransition = await executor.execute(sql`
+          update contract
+             set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+                 version = version + 1, updated_at = ${input.transferredAt}
+           where id = ${input.contractId}
+             and status = 'SETTLED' and ownership_holder = 'SOMOCO'
+             and outstanding_balance_minor_units = 0
+        `);
+        if ((contractTransition.rowCount ?? 0) !== 1)
+          throw new Error(
+            "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+          );
+        if (state.vehicle_status !== "TRANSFERRED") {
+          const vehicleTransition = await executor.execute(sql`
+            update vehicle_unit
+               set status = 'TRANSFERRED', version = version + 1,
+                   updated_at = ${input.transferredAt}
+             where id = ${state.vehicle_unit_id}
+               and status <> 'TRANSFERRED'
+          `);
+          if ((vehicleTransition.rowCount ?? 0) !== 1)
+            throw new Error(
+              "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+            );
+        }
+        await executor.execute(sql`
+          insert into registration_record
+            (vehicle_unit_id, registration_number, registered_owner,
+             valid_from, valid_to, evidence_document_id, created_at)
+          values (${state.vehicle_unit_id}, ${state.registration_number}, 'CUSTOMER',
+                  ${state.valid_from}::date, ${state.valid_to}::date,
+                  ${requestedEvidenceDocumentId}::uuid,
+                  greatest(now(), ${input.transferredAt}))
+        `);
+        return transfer;
+      }
       if (
         state.contract_status !== "SETTLED" ||
         state.ownership_holder !== "SOMOCO" ||
@@ -1004,4 +1127,13 @@ export function collectionsRepo(tx: DatabaseTransaction) {
       return row !== undefined;
     },
   };
+}
+
+function isUuid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
 }

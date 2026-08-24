@@ -5,6 +5,7 @@ import { deriveOtpCode, otpDerivationKeyId } from "@somo/integrations";
 import {
   createDatabase,
   createStaffUser,
+  collectionsRepo,
   migrateDatabase,
   paymentRepo,
   withTransaction,
@@ -625,6 +626,196 @@ describe("settlement transfer evidence", () => {
         [fixture.vehicleId],
       ),
     ).rejects.toThrow();
+  });
+
+  it("repairs a legacy completed ownership row only after validating authoritative state and evidence", async () => {
+    const fixture = await seedContract("SETTLED", 0);
+    const actorId = await seedStaff("MD");
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
+    const transferId = randomUUID();
+    const evidenceJson = JSON.stringify({
+      registrationEvidenceDocumentId: evidenceDocumentId,
+    }).replaceAll("'", "''");
+    for (const [table, trigger] of [
+      ["contract", "contract_ownership_coherence"],
+      ["vehicle_unit", "vehicle_ownership_coherence"],
+      ["registration_record", "registration_ownership_coherence"],
+      ["ownership_transfer", "transfer_ownership_coherence"],
+    ]) {
+      await executeTestSql(
+        databaseUrl,
+        `alter table ${table} disable trigger ${trigger}`,
+      );
+    }
+    await executeTestSql(
+      databaseUrl,
+      `do $$ begin
+         update contract
+            set status = 'SETTLED', ownership_holder = 'SOMOCO',
+                outstanding_balance_minor_units = 0
+          where id = '${fixture.contractId}'::uuid;
+         update vehicle_unit set status = 'HANDED_OVER'
+          where id = '${fixture.vehicleId}'::uuid;
+         insert into registration_record
+           (vehicle_unit_id, registration_number, registered_owner, valid_from, valid_to)
+         values ('${fixture.vehicleId}'::uuid, 'GT-LEGACY-26', 'SOMOCO', '2026-08-01', '2027-08-01');
+         insert into ownership_transfer
+           (id, contract_id, status, evidence, approved_by, transferred_at)
+         values ('${transferId}'::uuid, '${fixture.contractId}'::uuid, 'COMPLETED',
+                 '${evidenceJson}'::jsonb, '${actorId}'::uuid,
+                 '2026-08-14T12:00:00.000Z');
+       end $$`,
+    );
+    for (const [table, trigger] of [
+      ["contract", "contract_ownership_coherence"],
+      ["vehicle_unit", "vehicle_ownership_coherence"],
+      ["registration_record", "registration_ownership_coherence"],
+      ["ownership_transfer", "transfer_ownership_coherence"],
+    ]) {
+      await executeTestSql(
+        databaseUrl,
+        `alter table ${table} enable trigger ${trigger}`,
+      );
+    }
+
+    const repaired = await withTransaction(database, async (tx) =>
+      collectionsRepo(tx).completeOwnershipTransfer({
+        contractId: fixture.contractId,
+        approvedBy: actorId,
+        evidence: { registrationEvidenceDocumentId: evidenceDocumentId },
+        transferredAt: new Date("2026-08-14T12:00:00.000Z"),
+      }),
+    );
+    expect(repaired.id).toBe(transferId);
+    await expect(
+      queryTestSql<{
+        contract_status: string;
+        ownership_holder: string;
+        vehicle_status: string;
+        registered_owner: string;
+        evidence_document_id: string;
+        registration_count: number;
+      }>(
+        databaseUrl,
+        `select c.status::text as contract_status,
+                c.ownership_holder,
+                v.status::text as vehicle_status,
+                registration.registered_owner::text,
+                registration.evidence_document_id::text as evidence_document_id,
+                (select count(*)::int from registration_record
+                  where vehicle_unit_id = v.id) as registration_count
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+           join lateral (
+             select * from registration_record
+              where vehicle_unit_id = v.id
+              order by created_at desc, id desc limit 1
+           ) registration on true
+          where c.id = $1`,
+        [fixture.contractId],
+      ),
+    ).resolves.toEqual({
+      contract_status: "TRANSFERRED",
+      ownership_holder: "CUSTOMER",
+      vehicle_status: "TRANSFERRED",
+      registered_owner: "CUSTOMER",
+      evidence_document_id: evidenceDocumentId,
+      registration_count: 2,
+    });
+
+    await withTransaction(database, async (tx) =>
+      collectionsRepo(tx).completeOwnershipTransfer({
+        contractId: fixture.contractId,
+        approvedBy: actorId,
+        evidence: { registrationEvidenceDocumentId: evidenceDocumentId },
+        transferredAt: new Date("2026-08-14T12:01:00.000Z"),
+      }),
+    );
+    expect(
+      await queryTestSql<{ count: number }>(
+        databaseUrl,
+        `select count(*)::int as count from registration_record
+          where vehicle_unit_id = $1`,
+        [fixture.vehicleId],
+      ),
+    ).toEqual({ count: 2 });
+  });
+
+  it("fails closed when a legacy completed ownership row is not coherently derivable", async () => {
+    const fixture = await seedContract("SETTLED", 0);
+    const actorId = await seedStaff("MD");
+    const missingEvidenceDocumentId = randomUUID();
+    const transferId = randomUUID();
+    const missingEvidenceJson = JSON.stringify({
+      registrationEvidenceDocumentId: missingEvidenceDocumentId,
+    }).replaceAll("'", "''");
+    await executeTestSql(
+      databaseUrl,
+      `do $$ begin
+         update contract
+            set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+                outstanding_balance_minor_units = 0
+          where id = '${fixture.contractId}'::uuid;
+         update vehicle_unit set status = 'TRANSFERRED'
+          where id = '${fixture.vehicleId}'::uuid;
+         insert into privacy.document
+           (id, person_id, document_type, object_key, declared_mime_type,
+            declared_size_bytes, upload_ticket_hash, upload_expires_at, status)
+         values ('${missingEvidenceDocumentId}'::uuid,
+                 '${fixture.applicantId}'::uuid, 'TRANSFER_EVIDENCE',
+                 'legacy/${missingEvidenceDocumentId}', 'application/pdf', 128,
+                 repeat('a', 64), now() + interval '5 minutes', 'UPLOADED');
+         insert into registration_record
+           (vehicle_unit_id, registration_number, registered_owner,
+            valid_from, valid_to, evidence_document_id)
+         values ('${fixture.vehicleId}'::uuid, 'GT-LEGACY-26', 'CUSTOMER',
+                 '2026-08-01', '2027-08-01', '${missingEvidenceDocumentId}'::uuid);
+         insert into ownership_transfer
+           (id, contract_id, status, evidence, approved_by, transferred_at)
+         values ('${transferId}'::uuid, '${fixture.contractId}'::uuid, 'COMPLETED',
+                 '${missingEvidenceJson}'::jsonb, '${actorId}'::uuid,
+                 '2026-08-14T12:00:00.000Z');
+       end $$`,
+    );
+
+    await expect(
+      withTransaction(database, async (tx) =>
+        collectionsRepo(tx).completeOwnershipTransfer({
+          contractId: fixture.contractId,
+          approvedBy: actorId,
+          evidence: {
+            registrationEvidenceDocumentId: missingEvidenceDocumentId,
+          },
+          transferredAt: new Date("2026-08-14T12:00:00.000Z"),
+        }),
+      ),
+    ).rejects.toThrow(
+      "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+    );
+    expect(
+      await queryTestSql<{
+        contract_status: string;
+        ownership_holder: string;
+        vehicle_status: string;
+        registration_count: number;
+      }>(
+        databaseUrl,
+        `select c.status::text as contract_status,
+                c.ownership_holder,
+                v.status::text as vehicle_status,
+                (select count(*)::int from registration_record
+                  where vehicle_unit_id = v.id) as registration_count
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+          where c.id = $1`,
+        [fixture.contractId],
+      ),
+    ).toEqual({
+      contract_status: "TRANSFERRED",
+      ownership_holder: "CUSTOMER",
+      vehicle_status: "TRANSFERRED",
+      registration_count: 1,
+    });
   });
 });
 

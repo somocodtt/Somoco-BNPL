@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(33);
+    expect(before.rows[0]?.count).toBe(34);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -665,6 +665,23 @@ describe("PostgreSQL persistence", () => {
       vehicle_status: "TRANSFERRED",
       registered_owner: "CUSTOMER",
       evidence_document_id: registrationEvidenceDocumentId,
+    });
+
+    await expect(
+      completeOwnershipTransfer(database, {
+        id: transferId,
+        expectedVersion: 2,
+        evidence: { registrationEvidenceDocumentId },
+        transferredAt: new Date("2026-08-14T12:01:00.000Z"),
+        effects: writeEffects(
+          transferId,
+          "OWNERSHIP_TRANSFER_COMPLETED_REPLAY",
+        ),
+      }),
+    ).resolves.toMatchObject({
+      id: transferId,
+      status: "COMPLETED",
+      version: 2,
     });
   });
 
@@ -1967,11 +1984,7 @@ describe("populated legacy schema migration", () => {
   });
 
   it("upgrades populated 0032 settlement and reconciliation rows through 0033", async () => {
-    const journal = JSON.parse(
-      await readFile(`${migrationsFolder}meta/_journal.json`, "utf8"),
-    ) as { entries: ReadonlyArray<{ tag: string }> };
-    for (const entry of journal.entries.slice(1, -1))
-      await applyMigrationFile(pool, `${entry.tag}.sql`);
+    await applyMigrationsBefore0033(pool);
 
     const legacy = await insertLegacyFinancialGraph(pool, {
       provider: "SOMOCO_PAYMENTS",
@@ -2035,6 +2048,421 @@ describe("populated legacy schema migration", () => {
     ).resolves.toMatchObject({
       rows: [{ contract_id: legacy.contractId }],
     });
+  });
+
+  it("fails populated 0034 closed when one original has historical reversal and refund compensations", async () => {
+    await applyMigrationsBefore0033(pool);
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const original = await pool.query<{ provider_transaction_id: string }>(
+      `select provider_transaction_id from payment_transaction where id = $1`,
+      [legacy.paymentTransactionId],
+    );
+    const originalProviderTransactionId =
+      original.rows[0]!.provider_transaction_id;
+    const compensationIds = [randomUUID(), randomUUID()];
+    await pool.query(
+      `insert into payment_transaction
+         (id, provider, channel, provider_transaction_id, event_type,
+          contract_id, payer_reference, amount_minor_units, provider_payload,
+          occurred_at, status)
+       values
+         ($1, 'SOMOCO_PAYMENTS', 'MOBILE_MONEY', $2, 'PAYMENT_REVERSED', $3,
+          '+233201234567', 10000, $4::jsonb, '2026-08-14T12:01:00.000Z', 'REVERSED'),
+         ($5, 'SOMOCO_PAYMENTS', 'MOBILE_MONEY', $6, 'PAYMENT_REFUNDED', $3,
+          '+233201234567', 10000, $4::jsonb, '2026-08-14T12:02:00.000Z', 'REFUNDED')`,
+      [
+        compensationIds[0],
+        `REVERSAL-${randomUUID()}`,
+        legacy.contractId,
+        JSON.stringify({ originalProviderTransactionId }),
+        compensationIds[1],
+        `REFUND-${randomUUID()}`,
+      ],
+    );
+
+    await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+    const before = await pool.query(
+      `select id, provider_transaction_id, original_payment_transaction_id
+         from payment_transaction where contract_id = $1 order by id`,
+      [legacy.contractId],
+    );
+
+    await expect(
+      applyMigrationFile(
+        pool,
+        "0034_populated_financial_ownership_remediation.sql",
+      ),
+    ).rejects.toMatchObject({
+      code: "P0001",
+      message: expect.stringContaining(
+        "HISTORICAL_MULTIPLE_PAYMENT_COMPENSATIONS_REMEDIATION_REQUIRED",
+      ),
+      detail: expect.stringContaining(legacy.paymentTransactionId),
+      hint: expect.stringContaining("approved adjustment/reconciliation"),
+    });
+    await expect(
+      pool.query(
+        `select id, provider_transaction_id, original_payment_transaction_id
+           from payment_transaction where contract_id = $1 order by id`,
+        [legacy.contractId],
+      ),
+    ).resolves.toEqual(before);
+    await expect(
+      pool.query(
+        `select to_regclass('public.ownership_transfer') as ownership_transfer`,
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ ownership_transfer: "ownership_transfer" }],
+    });
+
+    // Simulate the approved reconciliation outcome: preserve both historical
+    // transaction rows while binding the second compensation to its confirmed
+    // original, then rerun the migration without any migration-side rewrite.
+    const replacementOriginalId = randomUUID();
+    const replacementProviderTransactionId = `ORIGINAL-${randomUUID()}`;
+    await pool.query(
+      `insert into payment_transaction
+         (id, provider, channel, provider_transaction_id, event_type,
+          contract_id, payer_reference, amount_minor_units, provider_payload,
+          occurred_at, status)
+       values ($1, 'SOMOCO_PAYMENTS', 'MOBILE_MONEY', $2, 'PAYMENT_SUCCEEDED',
+          $3, '+233201234567', 10000, $4::jsonb,
+          '2026-08-14T12:03:00.000Z', 'POSTED')`,
+      [
+        replacementOriginalId,
+        replacementProviderTransactionId,
+        legacy.contractId,
+        JSON.stringify({ event: "approved-reconciliation-original" }),
+      ],
+    );
+    await pool.query(
+      `update payment_transaction
+          set original_payment_transaction_id = $1,
+              provider_payload = jsonb_set(
+                provider_payload,
+                '{originalProviderTransactionId}',
+                to_jsonb($2::text),
+                true
+              ),
+              version = version + 1,
+              updated_at = now()
+        where id = $3`,
+      [
+        replacementOriginalId,
+        replacementProviderTransactionId,
+        compensationIds[1],
+      ],
+    );
+    const beforeRemediatedRerun = await pool.query(
+      `select
+         (select count(*)::int from payment_transaction) as payment_count,
+         (select count(*)::int from ledger_entry) as ledger_count,
+         (select count(*)::int from audit_event) as audit_count`,
+    );
+    await applyMigrationFile(
+      pool,
+      "0034_populated_financial_ownership_remediation.sql",
+    );
+    await expect(
+      pool.query(
+        `select original_payment_transaction_id
+           from payment_transaction where id = $1`,
+        [compensationIds[1]],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ original_payment_transaction_id: replacementOriginalId }],
+    });
+    await expect(
+      pool.query(
+        `select
+           (select count(*)::int from payment_transaction) as payment_count,
+           (select count(*)::int from ledger_entry) as ledger_count,
+           (select count(*)::int from audit_event) as audit_count`,
+      ),
+    ).resolves.toEqual(beforeRemediatedRerun);
+  });
+
+  it("upgrades ordinary single-compensation populated data through 0034 without adding financial rows", async () => {
+    await applyMigrationsBefore0033(pool);
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const original = await pool.query<{ provider_transaction_id: string }>(
+      `select provider_transaction_id from payment_transaction where id = $1`,
+      [legacy.paymentTransactionId],
+    );
+    const compensationId = randomUUID();
+    await pool.query(
+      `insert into payment_transaction
+         (id, provider, channel, provider_transaction_id, event_type,
+          contract_id, payer_reference, amount_minor_units, provider_payload,
+          occurred_at, status)
+       values ($1, 'SOMOCO_PAYMENTS', 'MOBILE_MONEY', $2, 'PAYMENT_REVERSED', $3,
+          '+233201234567', 10000, $4::jsonb, '2026-08-14T12:01:00.000Z', 'REVERSED')`,
+      [
+        compensationId,
+        `REVERSAL-${randomUUID()}`,
+        legacy.contractId,
+        JSON.stringify({
+          originalProviderTransactionId:
+            original.rows[0]!.provider_transaction_id,
+        }),
+      ],
+    );
+
+    await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+    const beforeCounts = await pool.query(
+      `select
+         (select count(*)::int from payment_transaction) as payment_count,
+         (select count(*)::int from ledger_entry) as ledger_count,
+         (select count(*)::int from registration_record) as registration_count`,
+    );
+    await applyMigrationFile(
+      pool,
+      "0034_populated_financial_ownership_remediation.sql",
+    );
+    await expect(
+      pool.query(
+        `select original_payment_transaction_id
+           from payment_transaction where id = $1`,
+        [compensationId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ original_payment_transaction_id: legacy.paymentTransactionId }],
+    });
+    await expect(
+      pool.query(
+        `select
+           (select count(*)::int from payment_transaction) as payment_count,
+           (select count(*)::int from ledger_entry) as ledger_count,
+           (select count(*)::int from registration_record) as registration_count`,
+      ),
+    ).resolves.toEqual(beforeCounts);
+  });
+
+  it("backfills derivable legacy completed ownership transfers with accepted evidence and preserves registration history", async () => {
+    await applyMigrationsBefore0033(pool);
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const staffId = randomUUID();
+    const documentId = randomUUID();
+    const transferId = randomUUID();
+    await pool.query(
+      `update contract
+          set status = 'SETTLED', outstanding_balance_minor_units = 0,
+              settled_at = '2026-08-14T12:00:00.000Z'
+        where id = $1`,
+      [legacy.contractId],
+    );
+    await pool.query(
+      `update vehicle_unit set status = 'HANDED_OVER' where id = (
+        select vehicle_unit_id from contract where id = $1
+      )`,
+      [legacy.contractId],
+    );
+    await pool.query(
+      `insert into staff_user (id, email, password_hash) values ($1, $2, 'hash')`,
+      [staffId, `${staffId}@example.test`],
+    );
+    const applicant = await pool.query<{ applicant_person_id: string }>(
+      `select applicant_person_id from application
+         where id = (select application_id from contract where id = $1)`,
+      [legacy.contractId],
+    );
+    await pool.query(
+      `insert into privacy.document
+         (id, person_id, document_type, object_key, declared_mime_type,
+          declared_size_bytes, upload_ticket_hash, upload_expires_at,
+          accepted_object_key, accepted_object_version_id, accepted_object_etag,
+          sha256, status, malware_scanned)
+       values ($1, $2, 'TRANSFER_EVIDENCE', $3, 'application/pdf', 128,
+               repeat('a', 64), now() + interval '5 minutes', $4, 'v1', 'etag',
+               repeat('b', 64), 'ACCEPTED', true)`,
+      [
+        documentId,
+        applicant.rows[0]!.applicant_person_id,
+        `pending/${documentId}`,
+        `accepted/${documentId}`,
+      ],
+    );
+    await pool.query(
+      `insert into settlement_evidence
+         (id, contract_id, evidence_document_id, evidence_document_reference,
+          evidence_hash, evidence_object_key, evidence_object_version_id,
+          evidence_object_etag, verification_status, accepted_by, accepted_at)
+       values ($1, $2, $3, $4, repeat('b', 64), $4, 'v1', 'etag', 'CLEAN', $5, now())`,
+      [
+        randomUUID(),
+        legacy.contractId,
+        documentId,
+        `accepted/${documentId}`,
+        staffId,
+      ],
+    );
+    await pool.query(
+      `insert into ownership_transfer
+         (id, contract_id, status, evidence, approved_by, transferred_at)
+       values ($1, $2, 'COMPLETED', $3::jsonb, $4, '2026-08-14T12:00:00.000Z')`,
+      [
+        transferId,
+        legacy.contractId,
+        JSON.stringify({ registrationEvidenceDocumentId: documentId }),
+        staffId,
+      ],
+    );
+
+    await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+    await applyMigrationFile(
+      pool,
+      "0034_populated_financial_ownership_remediation.sql",
+    );
+    await expect(
+      pool.query(
+        `select c.status::text as contract_status, c.ownership_holder,
+                v.status::text as vehicle_status,
+                registration.registered_owner::text,
+                registration.evidence_document_id::text as evidence_document_id
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+           join lateral (
+             select * from registration_record
+              where vehicle_unit_id = v.id
+              order by created_at desc, id desc limit 1
+           ) registration on true
+          where c.id = $1`,
+        [legacy.contractId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          contract_status: "TRANSFERRED",
+          ownership_holder: "CUSTOMER",
+          vehicle_status: "TRANSFERRED",
+          registered_owner: "CUSTOMER",
+          evidence_document_id: documentId,
+        },
+      ],
+    });
+    await expect(
+      pool.query(
+        `select count(*)::int as count,
+                count(*) filter (where registered_owner = 'SOMOCO')::int as somoco_count,
+                count(*) filter (where registered_owner = 'CUSTOMER')::int as customer_count
+           from registration_record
+          where vehicle_unit_id = (select vehicle_unit_id from contract where id = $1)`,
+        [legacy.contractId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ count: 2, somoco_count: 1, customer_count: 1 }],
+    });
+
+    await applyMigrationFile(
+      pool,
+      "0034_populated_financial_ownership_remediation.sql",
+    );
+    await expect(
+      pool.query(
+        `select c.status::text as contract_status, c.ownership_holder,
+                v.status::text as vehicle_status,
+                count(registration.id)::int as registration_count
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+           join registration_record registration
+             on registration.vehicle_unit_id = v.id
+          where c.id = $1
+          group by c.status, c.ownership_holder, v.status`,
+        [legacy.contractId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          contract_status: "TRANSFERRED",
+          ownership_holder: "CUSTOMER",
+          vehicle_status: "TRANSFERRED",
+          registration_count: 2,
+        },
+      ],
+    });
+  });
+
+  it("fails non-derivable legacy completed ownership transfers closed without partial mutation", async () => {
+    await applyMigrationsBefore0033(pool);
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const staffId = randomUUID();
+    const transferId = randomUUID();
+    await pool.query(
+      `update contract
+          set status = 'SETTLED', outstanding_balance_minor_units = 0,
+              settled_at = '2026-08-14T12:00:00.000Z'
+        where id = $1`,
+      [legacy.contractId],
+    );
+    await pool.query(
+      `insert into staff_user (id, email, password_hash) values ($1, $2, 'hash')`,
+      [staffId, `${staffId}@example.test`],
+    );
+    await pool.query(
+      `insert into ownership_transfer
+         (id, contract_id, status, evidence, approved_by, transferred_at)
+       values ($1, $2, 'COMPLETED', '{}'::jsonb, $3, '2026-08-14T12:00:00.000Z')`,
+      [transferId, legacy.contractId, staffId],
+    );
+
+    await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+    const before = await pool.query(
+      `select c.status::text as contract_status, c.ownership_holder,
+              c.outstanding_balance_minor_units::text as balance,
+              v.status::text as vehicle_status,
+              (select count(*)::int from registration_record
+                where vehicle_unit_id = v.id) as registration_count
+         from contract c
+         join vehicle_unit v on v.id = c.vehicle_unit_id
+        where c.id = $1`,
+      [legacy.contractId],
+    );
+    await expect(
+      applyMigrationFile(
+        pool,
+        "0034_populated_financial_ownership_remediation.sql",
+      ),
+    ).rejects.toMatchObject({
+      code: "P0001",
+      message: expect.stringContaining(
+        "LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED",
+      ),
+      detail: expect.stringContaining(legacy.contractId),
+      hint: expect.stringContaining("approved reconciliation"),
+    });
+    await expect(
+      pool.query(
+        `select c.status::text as contract_status, c.ownership_holder,
+                c.outstanding_balance_minor_units::text as balance,
+                v.status::text as vehicle_status,
+                (select count(*)::int from registration_record
+                  where vehicle_unit_id = v.id) as registration_count
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+          where c.id = $1`,
+        [legacy.contractId],
+      ),
+    ).resolves.toEqual(before);
   });
 
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {
@@ -2284,6 +2712,20 @@ async function applyMigrationFile(pool: Pool, filename: string): Promise<void> {
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function applyMigrationsBefore0033(pool: Pool): Promise<void> {
+  const journal = JSON.parse(
+    await readFile(`${migrationsFolder}meta/_journal.json`, "utf8"),
+  ) as { entries: ReadonlyArray<{ tag: string }> };
+  for (const entry of journal.entries.filter(
+    ({ tag }) =>
+      tag !== "0000_worthless_glorian" &&
+      tag !== "0033_final_controlled_pilot_hardening" &&
+      tag !== "0034_populated_financial_ownership_remediation",
+  )) {
+    await applyMigrationFile(pool, `${entry.tag}.sql`);
   }
 }
 

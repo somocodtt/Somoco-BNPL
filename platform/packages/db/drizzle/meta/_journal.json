@@ -232,6 +232,13 @@
       "when": 1787565600000,
       "tag": "0033_final_controlled_pilot_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1787569200000,
+      "tag": "0034_populated_financial_ownership_remediation",
+      "breakpoints": true
     }
   ]
 }
