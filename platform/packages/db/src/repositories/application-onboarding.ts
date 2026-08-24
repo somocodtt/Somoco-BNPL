@@ -88,6 +88,7 @@ export async function saveApplicantSection(
   database: Database,
   input: MutationInput & {
     expectedVersion: number;
+    productId?: string;
     vehicleModelId: string;
     profile: Record<string, unknown>;
     now: Date;
@@ -108,11 +109,28 @@ export async function saveApplicantSection(
       select id from vehicle_model where id = ${input.vehicleModelId}::uuid and active = true
     `);
     if (model.rows.length !== 1) throw new Error("VEHICLE_MODEL_UNAVAILABLE");
+    if (input.productId !== undefined) {
+      const product = await getInternalTransaction(tx).execute<{
+        id: string;
+      }>(sql`
+        select p.id
+          from product p
+         where p.id = ${input.productId}::uuid
+           and p.vehicle_model_id = ${input.vehicleModelId}::uuid
+           and p.status = 'ACTIVE'
+      `);
+      if (product.rows.length !== 1) throw new Error("PRODUCT_UNAVAILABLE");
+    }
     await upsertProfile(tx, input.actor.personId, input.profile, input.now);
+    const productAssignment =
+      input.productId === undefined
+        ? sql`product_id`
+        : sql`${input.productId}::uuid`;
     const updatedRows = await getInternalTransaction(tx)
       .execute<CommandResult>(sql`
       update application
-         set vehicle_model_id = ${input.vehicleModelId}::uuid,
+         set product_id = ${productAssignment},
+             vehicle_model_id = ${input.vehicleModelId}::uuid,
              version = version + 1,
              updated_at = ${input.now}
        where id = ${input.applicationId}::uuid
@@ -383,9 +401,8 @@ export async function resolveGuarantorInvitation(
   database: Database,
   input: { tokenHash: string; guarantorPersonId: string; now: Date },
 ) {
-  const result = await getInternalExecutor(database).execute<
-    ResolvedInvitationRow
-  >(sql`
+  const result = await getInternalExecutor(database)
+    .execute<ResolvedInvitationRow>(sql`
     select gi.expires_at, gi.claimed_at, gi.revoked_at,
            gr.status relationship_status, gr.version relationship_version,
            a.version application_version
@@ -433,9 +450,8 @@ export async function findGuarantorInvitationDeliveryContext(
   database: Database,
   invitationId: string,
 ) {
-  const result = await getInternalExecutor(database).execute<
-    InvitationDeliveryRow
-  >(sql`
+  const result = await getInternalExecutor(database)
+    .execute<InvitationDeliveryRow>(sql`
     select p.phone_e164, gi.expires_at, gi.claimed_at, gi.revoked_at
       from guarantor_invitation gi
       join privacy.person p on p.id = gi.guarantor_person_id

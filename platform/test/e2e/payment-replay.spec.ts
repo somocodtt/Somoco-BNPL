@@ -50,4 +50,34 @@ describe("controlled-pilot payment replay boundary", () => {
       duplicate: true,
     });
   }, 60_000);
+
+  it("recovers a simulator provider outage without accepting an unsigned event", async () => {
+    runtime = await startRealPilot();
+    const request = createApiRequest(runtime.app);
+    const flow = await completeOnboarding(request, runtime);
+    const event: CanonicalPaymentEvent = {
+      eventId: "controlled-pilot-provider-outage-event-001",
+      eventType: "PAYMENT_SUCCEEDED",
+      channel: "MOBILE_MONEY",
+      providerTransactionId: "controlled-pilot-provider-outage-transaction-001",
+      payerPhoneE164: "+233241000001",
+      customerReference: "UNKNOWN-CONTROLLED-PILOT-OUTAGE",
+      amount: { currency: "GHS", minorUnits: "100" },
+      occurredAt: "2026-08-01T12:40:00.000Z",
+    };
+    runtime.controls.setPaymentAvailable(false);
+    const unavailable = await postPayment(request, flow, event);
+    expect(unavailable.status()).toBe(401);
+    await expect(body(unavailable)).resolves.toMatchObject({
+      code: "PAYMENT_VERIFICATION_FAILED",
+    });
+    runtime.controls.setPaymentAvailable(true);
+    const recovered = await postPayment(request, flow, event);
+    expect(recovered.status()).toBe(202);
+    await expect(body(recovered)).resolves.toMatchObject({
+      accepted: true,
+      outcome: "QUARANTINED",
+      duplicate: false,
+    });
+  }, 60_000);
 });

@@ -18,9 +18,10 @@ async function inject(
   const headers = (options.headers ?? {}) as Record<string, string>;
   const payload =
     options.data === undefined ? undefined : JSON.stringify(options.data);
+  const parsedUrl = new URL(url);
   const response = await app.inject({
     method,
-    url: new URL(url).pathname,
+    url: `${parsedUrl.pathname}${parsedUrl.search}`,
     headers,
     ...(payload === undefined ? {} : { payload }),
   });

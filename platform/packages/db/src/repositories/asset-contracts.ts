@@ -387,6 +387,109 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       return result.rows[0] ?? null;
     },
 
+    async bindPreContractDeposit(input: {
+      contractId: string;
+      applicationId: string;
+      offerId: string;
+      expectedAmountMinor: bigint;
+      occurredAt: Date;
+      allowUnlinkedReconciledDeposit?: boolean;
+    }): Promise<{
+      paymentTransactionId: string | null;
+      ledgerEntryId: string;
+    }> {
+      const deposit = await executor.execute<{
+        id: string;
+        payment_transaction_id: string | null;
+        amount_minor_units: bigint | string;
+        evidence_hash: string;
+      }>(sql`
+        select id, payment_transaction_id, amount_minor_units, evidence_hash
+          from deposit_reconciliation
+         where application_id = ${input.applicationId}::uuid
+           and offer_id = ${input.offerId}::uuid
+           and status = 'RECONCILED'
+         order by reconciled_at desc nulls last, id desc
+         limit 1
+         for update
+      `);
+      const row = deposit.rows[0];
+      if (
+        row === undefined ||
+        BigInt(row.amount_minor_units) !== input.expectedAmountMinor ||
+        (row.payment_transaction_id === null &&
+          input.allowUnlinkedReconciledDeposit !== true)
+      )
+        throw new Error("DEPOSIT_RECONCILIATION_REQUIRED");
+      let paymentId = row.payment_transaction_id;
+      let policyVersion = "finance-policy-v1";
+      if (paymentId !== null) {
+        const provider = await executor.execute<{
+          allocation_policy_version: string | null;
+        }>(sql`
+          select provider_payload->>'allocationPolicyVersion' as allocation_policy_version
+            from payment_transaction
+           where id = ${paymentId}::uuid
+           for update
+        `);
+        policyVersion =
+          provider.rows[0]?.allocation_policy_version ?? "finance-policy-v1";
+        const payment = await executor.execute<{ id: string }>(sql`
+          update payment_transaction
+             set contract_id = ${input.contractId}::uuid,
+                 status = 'POSTED',
+                 version = version + 1,
+                 updated_at = ${input.occurredAt}
+           where id = ${paymentId}::uuid
+             and contract_id is null
+             and status = 'MATCHED'
+           returning id
+        `);
+        paymentId = payment.rows[0]?.id ?? paymentId;
+      }
+      const contract = await executor.execute<{
+        outstanding_balance_minor_units: bigint | string;
+      }>(sql`
+        select outstanding_balance_minor_units
+          from contract
+         where id = ${input.contractId}::uuid
+         for update
+      `);
+      const contractRow = contract.rows[0];
+      if (contractRow === undefined) throw new Error("CONTRACT_NOT_FOUND");
+      const ledger = await executor.execute<{ id: string }>(sql`
+        insert into ledger_entry
+          (id, posting_key, contract_id, payment_transaction_id, entry_type,
+           direction, currency, amount_minor_units, balance_after_minor_units,
+           allocation_policy_version, metadata, occurred_at)
+        values (
+          ${randomUUID()}::uuid,
+          ${`PRE_CONTRACT_DEPOSIT:${paymentId ?? row.id}`},
+          ${input.contractId}::uuid,
+          ${paymentId === null ? sql`null` : sql`${paymentId}::uuid`},
+          'DEPOSIT',
+          'CREDIT',
+          'GHS',
+          ${input.expectedAmountMinor}::bigint,
+          ${contractRow.outstanding_balance_minor_units}::bigint,
+          ${policyVersion},
+          ${JSON.stringify({
+            source: "PRE_CONTRACT_DEPOSIT",
+            depositReconciliationId: row.id,
+            evidenceHash: row.evidence_hash,
+          })}::jsonb,
+          ${input.occurredAt}
+        )
+        on conflict (posting_key) do update
+           set posting_key = excluded.posting_key
+        returning id
+      `);
+      const ledgerRow = ledger.rows[0];
+      if (ledgerRow === undefined)
+        throw new Error("DEPOSIT_LEDGER_POST_FAILED");
+      return { paymentTransactionId: paymentId, ledgerEntryId: ledgerRow.id };
+    },
+
     async currentAssignment(
       applicationId: string,
       lock = false,
@@ -450,7 +553,8 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
                   approved_at, created_at
       `);
       const row = result.rows[0];
-      if (row === undefined) throw new Error("REASSIGNMENT_APPROVAL_INSERT_FAILED");
+      if (row === undefined)
+        throw new Error("REASSIGNMENT_APPROVAL_INSERT_FAILED");
       return row;
     },
 

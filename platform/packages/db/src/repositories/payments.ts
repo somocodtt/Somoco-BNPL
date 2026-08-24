@@ -35,6 +35,14 @@ export interface ContractPaymentContext {
   payerPersonId: string;
 }
 
+export interface PreContractDepositContext {
+  applicationId: string;
+  offerId: string;
+  offerVersionId: string;
+  depositMinorUnits: bigint;
+  payerPersonId: string;
+}
+
 export interface InstallmentPaymentRow {
   id: string;
   installmentNumber: number;
@@ -167,6 +175,39 @@ export function paymentRepo(db: DatabaseTransaction) {
         outstandingBalanceMinorUnits: BigInt(
           row.outstanding_balance_minor_units,
         ),
+        payerPersonId: row.payer_person_id,
+      };
+    },
+    async findPreContractDepositByReference(
+      reference: string,
+    ): Promise<PreContractDepositContext | null> {
+      const result = await executor.execute<{
+        application_id: string;
+        offer_id: string;
+        offer_version_id: string;
+        deposit_minor_units: bigint | string;
+        payer_person_id: string;
+      }>(sql`
+        select a.id as application_id,
+               o.id as offer_id,
+               ov.id as offer_version_id,
+               ov.deposit_minor_units,
+               a.applicant_person_id as payer_person_id
+          from application a
+          join offer o on o.application_id = a.id and o.status = 'ACCEPTED'
+          join offer_version ov on ov.id = o.accepted_version_id
+          left join contract c on c.application_id = a.id
+         where c.id is null
+           and (a.id::text = ${reference} or o.id::text = ${reference})
+         limit 1
+      `);
+      const row = result.rows[0];
+      if (row === undefined) return null;
+      return {
+        applicationId: row.application_id,
+        offerId: row.offer_id,
+        offerVersionId: row.offer_version_id,
+        depositMinorUnits: BigInt(row.deposit_minor_units),
         payerPersonId: row.payer_person_id,
       };
     },
@@ -392,6 +433,16 @@ export function paymentRepo(db: DatabaseTransaction) {
         .from(ledgerEntry)
         .where(eq(ledgerEntry.paymentTransactionId, paymentTransactionId))
         .orderBy(asc(ledgerEntry.createdAt));
+    },
+    async findDepositByPaymentTransaction(paymentTransactionId: string) {
+      const [row] = await executor
+        .select()
+        .from(depositReconciliation)
+        .where(
+          eq(depositReconciliation.paymentTransactionId, paymentTransactionId),
+        )
+        .limit(1);
+      return row ?? null;
     },
     async reconcileDeposit(input: {
       applicationId: string;

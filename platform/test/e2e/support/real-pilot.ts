@@ -95,7 +95,12 @@ export interface PilotRuntime {
   };
   readonly paymentPolicy: AllocationPolicy;
   readonly app: Awaited<ReturnType<typeof buildApp>>;
-  attachProduct(applicationId: string): Promise<void>;
+  readonly controls: {
+    setNiaAvailable(available: boolean): void;
+    setMalwareVerdict(verdict: "CLEAN" | "INFECTED" | "ERROR"): void;
+    setPaymentAvailable(available: boolean): void;
+    setTrackerAvailable(available: boolean): void;
+  };
   uploadDocument(
     ticket: {
       uploadUrl: string;
@@ -166,7 +171,11 @@ export async function startRealPilot(): Promise<PilotRuntime> {
   const paymentPolicy = allocationPolicy();
   await persistAllocationPolicy(databaseUrl, paymentPolicy);
   const objectStorage = memoryObjectStorage();
-  const nia: NiaPort = dynamicNiaSimulator();
+  let niaAvailable = true;
+  let malwareVerdict: "CLEAN" | "INFECTED" | "ERROR" = "CLEAN";
+  let paymentAvailable = true;
+  let trackerAvailable = true;
+  const nia: NiaPort = dynamicNiaSimulator(() => niaAvailable);
   const sms: SmsPort = dynamicSmsSimulator();
   const paymentFixtures: Array<{
     rawBody: Uint8Array;
@@ -176,13 +185,14 @@ export async function startRealPilot(): Promise<PilotRuntime> {
   }> = [];
   const paymentVerifier: PaymentWebhookVerifier = {
     async verify(input) {
+      if (!paymentAvailable) throw new Error("SIMULATOR_PROVIDER_UNAVAILABLE");
       return createPaymentWebhookSimulator({
         environment: "test",
         fixtures: paymentFixtures,
       }).verify(input);
     },
   };
-  const tracker: TrackerPort = createTrackerSimulator({
+  const trackerSimulator = createTrackerSimulator({
     environment: "test",
     fixtures: [
       {
@@ -196,6 +206,12 @@ export async function startRealPilot(): Promise<PilotRuntime> {
       },
     ],
   });
+  const tracker: TrackerPort = {
+    async getLastKnown(input) {
+      if (!trackerAvailable) return null;
+      return trackerSimulator.getLastKnown(input);
+    },
+  };
 
   const app = await buildApp({
     config: configFor(databaseUrl),
@@ -233,13 +249,13 @@ export async function startRealPilot(): Promise<PilotRuntime> {
         malwareScanner: {
           async scan() {
             return {
-              verdict: "CLEAN" as const,
-              scannerReference: "controlled-pilot-malware",
+              verdict: malwareVerdict,
+              scannerReference: `controlled-pilot-malware-${malwareVerdict.toLowerCase()}`,
             };
           },
         },
         policy: {
-          allowedMimeTypes: ["image/png"],
+          allowedMimeTypes: ["image/png", "application/pdf"],
           maxBytes: 1024,
           uploadTtlMs: 60_000,
           downloadTtlMs: 30_000,
@@ -331,15 +347,19 @@ export async function startRealPilot(): Promise<PilotRuntime> {
     customer: { applicant, guarantor },
     paymentPolicy,
     app,
-    async attachProduct(applicationId: string) {
-      // Setup-only linkage: the public customer application-create route does
-      // not accept a product and no product-assignment route exists. The
-      // customer/staff workflow remains public from this point onward.
-      await executeTestSql(
-        databaseUrl,
-        "update application set product_id = $2 where id = $1",
-        [applicationId, productId],
-      );
+    controls: {
+      setNiaAvailable(available) {
+        niaAvailable = available;
+      },
+      setMalwareVerdict(verdict) {
+        malwareVerdict = verdict;
+      },
+      setPaymentAvailable(available) {
+        paymentAvailable = available;
+      },
+      setTrackerAvailable(available) {
+        trackerAvailable = available;
+      },
     },
     uploadDocument(ticket, bytes, contentType) {
       objectStorage.upload(ticket, bytes, contentType);
@@ -559,9 +579,10 @@ async function persistAllocationPolicy(
   );
 }
 
-function dynamicNiaSimulator(): NiaPort {
+function dynamicNiaSimulator(isAvailable: () => boolean): NiaPort {
   return {
     async verify(input) {
+      if (!isAvailable()) throw new Error("NIA_PROVIDER_UNAVAILABLE");
       const fixture: NiaSimulatorFixture = {
         input,
         result: {

@@ -37,6 +37,7 @@ export interface PaymentWebhookAcknowledgement {
   paymentTransactionId?: string;
   receiptId?: string;
   reason?: string;
+  depositReconciled?: boolean;
 }
 
 export interface PaymentWebhookService {
@@ -213,6 +214,7 @@ async function processEvent(input: {
       providerPayload: {
         channel: event.channel,
         settlementReference: event.settlementReference,
+        allocationPolicyVersion: input.policy.version,
       },
     });
   }
@@ -240,6 +242,7 @@ function acknowledgementForResult(
     paymentTransactionId: result.paymentTransaction.id,
     ...(result.receiptId === undefined ? {} : { receiptId: result.receiptId }),
     ...(result.reason === undefined ? {} : { reason: result.reason }),
+    ...(result.depositReconciled ? { depositReconciled: true } : {}),
   };
 }
 

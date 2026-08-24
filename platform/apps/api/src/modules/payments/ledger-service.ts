@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendAuditEvent,
+  enqueueOutbox,
   paymentRepo,
   withTransaction,
   type Database,
@@ -220,6 +221,12 @@ export function createLedgerService(options: {
         const context = await repo.findContractByReference(
           input.contractReference,
         );
+        const preContractDeposit =
+          context === null
+            ? await repo.findPreContractDepositByReference(
+                input.contractReference,
+              )
+            : null;
         const paymentId = randomUUID();
         const insertedPayment = await repo.insertIfAbsent(
           {
@@ -271,6 +278,77 @@ export function createLedgerService(options: {
           return duplicateResult(repo, insertedPayment.payment);
         const payment = insertedPayment.payment;
         if (context === null) {
+          if (preContractDeposit !== null) {
+            if (
+              input.amountMinorUnits !== preContractDeposit.depositMinorUnits
+            ) {
+              const reason = "DEPOSIT_AMOUNT_REQUIRES_RECONCILIATION";
+              await repo.createReconciliationCase({
+                paymentTransactionId: payment.id,
+                reason,
+              });
+              return {
+                paymentTransaction: payment,
+                outcome: "QUARANTINED",
+                ledgerEntryIds: [],
+                depositReconciled: false,
+                reason,
+              };
+            }
+            const matched = await repo.updateStatus(payment.id, "MATCHED");
+            const receipt =
+              options.receipts === undefined
+                ? await issueReceipt(repo, matched, input.occurredAt)
+                : await options.receipts.issue({
+                    payment: matched,
+                    now: input.occurredAt,
+                    transaction: tx,
+                  });
+            await repo.reconcileDeposit({
+              applicationId: preContractDeposit.applicationId,
+              offerId: preContractDeposit.offerId,
+              paymentTransactionId: matched.id,
+              amountMinorUnits: input.amountMinorUnits,
+              evidenceHash: sha256(input.eventId),
+            });
+            await appendAuditEvent(tx, {
+              aggregateType: "payment_transaction",
+              aggregateId: matched.id,
+              action: "DEPOSIT_RECONCILED_PRE_CONTRACT",
+              actorStaffUserId: null,
+              actorPersonId: preContractDeposit.payerPersonId,
+              requestId: null,
+              data: {
+                applicationId: preContractDeposit.applicationId,
+                offerId: preContractDeposit.offerId,
+                offerVersionId: preContractDeposit.offerVersionId,
+                receiptId: receipt.id,
+                allocationPolicyVersion: input.policy!.version,
+              },
+              occurredAt: input.occurredAt,
+            });
+            await enqueueOutbox(tx, {
+              id: randomUUID(),
+              topic: "payments.deposit_reconciled",
+              aggregateType: "payment_transaction",
+              aggregateId: matched.id,
+              payload: {
+                paymentTransactionId: matched.id,
+                applicationId: preContractDeposit.applicationId,
+                offerId: preContractDeposit.offerId,
+                offerVersionId: preContractDeposit.offerVersionId,
+                receiptId: receipt.id,
+              },
+              occurredAt: input.occurredAt,
+            });
+            return {
+              paymentTransaction: matched,
+              outcome: "POSTED",
+              ledgerEntryIds: [],
+              receiptId: receipt.id,
+              depositReconciled: true,
+            };
+          }
           await repo.createReconciliationCase({
             paymentTransactionId: payment.id,
             reason: "UNMATCHED_CUSTOMER_REFERENCE",
@@ -770,6 +848,7 @@ async function duplicateResult(
 ): Promise<LedgerPostResult> {
   const duplicateLedger = await repo.findLedgerForPayment(duplicate.id);
   const receipt = await repo.findReceipt(duplicate.id);
+  const deposit = await repo.findDepositByPaymentTransaction(duplicate.id);
   return {
     paymentTransaction: duplicate,
     outcome:
@@ -779,10 +858,12 @@ async function duplicateResult(
           ? "REFUNDED"
           : duplicateLedger.length > 0
             ? "POSTED"
-            : "QUARANTINED",
+            : deposit?.status === "RECONCILED"
+              ? "POSTED"
+              : "QUARANTINED",
     ledgerEntryIds: duplicateLedger.map((entry) => entry.id),
     ...(receipt === null ? {} : { receiptId: receipt.id }),
-    depositReconciled: false,
+    depositReconciled: deposit?.status === "RECONCILED",
     reason: "DUPLICATE_PROVIDER_TRANSACTION",
   };
 }

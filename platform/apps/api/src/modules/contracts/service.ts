@@ -3,6 +3,7 @@ import {
   appendAuditEvent,
   assetContractRepo,
   enqueueOutbox,
+  findApplicationSignatureEvidence,
   withTransaction,
   type AssetContractRow,
   type Database,
@@ -144,8 +145,11 @@ export function createContractService(options: {
   template?: ContractTemplateAttestation;
   environment?: "test" | "production";
   headOffice?: { id: string; location: string };
+  requireSignatureEvidence?: boolean;
 }): ContractService {
   const environment = options.environment ?? "production";
+  const requireSignatureEvidence =
+    options.requireSignatureEvidence ?? environment === "production";
   const headOffice =
     options.headOffice ??
     (environment === "test"
@@ -339,6 +343,16 @@ export function createContractService(options: {
             outstandingBalanceMinor: BigInt(offer.principal_minor_units ?? 0),
             generatedAt: now,
           });
+          const boundDeposit = await repo.bindPreContractDeposit({
+            contractId: contract.id,
+            applicationId: input.applicationId,
+            offerId: offer.id,
+            expectedAmountMinor: BigInt(offer.deposit_minor_units ?? 0),
+            occurredAt: now,
+            ...(environment === "production"
+              ? {}
+              : { allowUnlinkedReconciledDeposit: true }),
+          });
           const response = serializeContract(contract);
           const command = await repo.insertCommand({
             scope,
@@ -373,6 +387,8 @@ export function createContractService(options: {
               applicationId: input.applicationId,
               templateVersionId: templateRow.id,
               canonicalHash,
+              depositPaymentTransactionId: boundDeposit.paymentTransactionId,
+              depositLedgerEntryId: boundDeposit.ledgerEntryId,
             },
             occurredAt: now,
           });
@@ -381,7 +397,11 @@ export function createContractService(options: {
             topic: "contract.generated",
             aggregateType: "contract",
             aggregateId: contract.id,
-            payload: response,
+            payload: {
+              ...response,
+              depositPaymentTransactionId: boundDeposit.paymentTransactionId,
+              depositLedgerEntryId: boundDeposit.ledgerEntryId,
+            },
             occurredAt: now,
           });
           return response;
@@ -499,6 +519,28 @@ export function createContractService(options: {
             403,
             "SIGNATORY_BINDING_INVALID",
             "The witnessed signatories must be the application applicant and confirmed guarantor.",
+          );
+        const signatureEvidence = await findApplicationSignatureEvidence(
+          tx,
+          contract.application_id,
+        );
+        const boundSignatures = new Set(
+          signatureEvidence
+            .filter(
+              (evidence) =>
+                evidence.offerVersionId === contract.offer_version_id,
+            )
+            .map((evidence) => evidence.personId),
+        );
+        if (
+          requireSignatureEvidence &&
+          (!boundSignatures.has(application.applicant_person_id) ||
+            !boundSignatures.has(confirmedGuarantorPersonId))
+        )
+          throw new AppError(
+            409,
+            "SIGNATURE_EVIDENCE_INCOMPLETE",
+            "Applicant and confirmed guarantor signature evidence for the locked offer is required before physical execution.",
           );
         const document = await repo.cleanDocument(
           input.executedDocumentId,
@@ -953,7 +995,11 @@ function parseLockedSchedule(
   lockedTotalMinor: bigint,
   now: Date,
 ): { sequence: number; dueDate: string; totalMinor: string }[] {
-  if (value === null || value === undefined || !Array.isArray(value.installments))
+  if (
+    value === null ||
+    value === undefined ||
+    !Array.isArray(value.installments)
+  )
     throw new AppError(
       409,
       "LOCKED_SCHEDULE_INVALID",
@@ -966,7 +1012,8 @@ function parseLockedSchedule(
       "LOCKED_SCHEDULE_INVALID",
       "The accepted offer schedule cannot be empty.",
     );
-  const parsed: { sequence: number; dueDate: string; totalMinor: string }[] = [];
+  const parsed: { sequence: number; dueDate: string; totalMinor: string }[] =
+    [];
   let sum = 0n;
   for (let index = 0; index < rows.length; index += 1) {
     const item = rows[index];
@@ -1053,7 +1100,8 @@ function sameOptionalInstant(
   value: Date | string | null,
   expected: Date | undefined,
 ): boolean {
-  if (value === null || expected === undefined) return value === null && expected === undefined;
+  if (value === null || expected === undefined)
+    return value === null && expected === undefined;
   return toDate(value).getTime() === expected.getTime();
 }
 

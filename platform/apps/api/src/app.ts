@@ -292,6 +292,7 @@ export async function buildApp(
       ? {}
       : { headOffice: configuredHeadOffice }),
     environment: config.environment === "production" ? "production" : "test",
+    requireSignatureEvidence: true,
   });
   const handoverService = createHandoverService({
     database,

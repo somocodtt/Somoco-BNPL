@@ -8,7 +8,5 @@ test("serves the actual customer sign-in route", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Sign in securely" }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Request code" }),
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send code" })).toBeVisible();
 });

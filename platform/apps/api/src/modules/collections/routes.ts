@@ -47,6 +47,36 @@ export async function registerCollectionsRoutes(
     async (request, reply) =>
       reply.send(await collections.listArrears(requireStaffPrincipal(request))),
   );
+  app.post<{
+    Params: { contractId: string };
+    Body: { asOfDate: string };
+  }>(
+    "/v1/staff/contracts/:contractId/arrears/compute",
+    {
+      preHandler: mutation,
+      schema: {
+        params: contractParams,
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["asOfDate"],
+          properties: {
+            asOfDate: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const result = await collections.computeArrears({
+        contractId: request.params.contractId,
+        asOfDate: request.body.asOfDate,
+      });
+      return reply.send({
+        ...result,
+        overdueMinor: result.overdueMinor.toString(),
+      });
+    },
+  );
   app.get(
     "/v1/staff/collections/cases",
     { preHandler: authenticateStaff },

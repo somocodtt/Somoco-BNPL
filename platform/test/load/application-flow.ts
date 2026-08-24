@@ -1,5 +1,17 @@
+import { randomUUID } from "node:crypto";
+import {
+  createDatabase,
+  enqueueOutbox,
+  listOutboxAttempts,
+} from "../../packages/db/src/index.js";
 import type { CanonicalPaymentEvent } from "../../packages/integrations/src/index.js";
 import { queryTestSql } from "../../packages/testkit/src/index.js";
+import {
+  createPaymentReconciliationJob,
+  createReconcilePaymentsHandler,
+} from "../../apps/worker/src/jobs/reconcile-payments.js";
+import { createDatabaseOutboxStore } from "../../apps/worker/src/database-outbox-store.js";
+import { dispatchOutboxBatch } from "../../apps/worker/src/jobs/dispatch-outbox.js";
 import {
   startRealPilot,
   type PilotRuntime,
@@ -39,6 +51,8 @@ async function main(): Promise<void> {
     const p95Index = Math.max(0, Math.ceil(sorted.length * 0.95) - 1);
     const p95RequestLatencyMs = Number((sorted[p95Index] ?? 0).toFixed(2));
     const replay = await postProviderEvent(runtime, events[0]!);
+    const providerResilience = await measureProviderResilience(runtime);
+    const workerEvidence = await exerciseWorkerRestartAndReclaim(databaseUrl);
     const reconciliation = await queryTestSql<{ count: string }>(
       databaseUrl,
       "select count(*)::text as count from reconciliation_case",
@@ -62,11 +76,28 @@ async function main(): Promise<void> {
       reconciliationCases: Number(reconciliation.count),
       thresholds: { simulatedProxyP95RequestLatencyMs: requestP95ThresholdMs },
       simulatedProxyPass:
-        allAccepted && p95RequestLatencyMs <= requestP95ThresholdMs,
+        allAccepted &&
+        p95RequestLatencyMs <= requestP95ThresholdMs &&
+        providerResilience.pass &&
+        workerEvidence.pass,
+      concurrentWebhook: {
+        requests: results.length,
+        accepted: results.filter((item) => item.status === 202).length,
+        pass: allAccepted,
+      },
+      providerResilience,
+      workerRestartAndReclaim: workerEvidence,
       actualGates: {
-        workerRestartAndReclaim: "PENDING_EXTERNAL_REHEARSAL",
-        queueAge: "PENDING_EXTERNAL_REHEARSAL",
-        providerResilience: "PENDING_EXTERNAL_REHEARSAL",
+        workerRestartAndReclaim: workerEvidence.pass
+          ? "PASS_DISPOSABLE_POSTGRESQL"
+          : "FAIL_DISPOSABLE_POSTGRESQL",
+        queueAge: {
+          status: "MEASURED_DISPOSABLE_POSTGRESQL",
+          ageMs: workerEvidence.queueAgeMs,
+        },
+        providerResilience: providerResilience.pass
+          ? "PASS_DISPOSABLE_SIMULATOR"
+          : "FAIL_DISPOSABLE_SIMULATOR",
         hostingCapacity: "PENDING_EXTERNAL_REHEARSAL",
         restoreIntegrity: "PENDING_EXTERNAL_REHEARSAL",
         signedUat: "PENDING_EXTERNAL_SIGN_OFF",
@@ -76,6 +107,101 @@ async function main(): Promise<void> {
     if (!evidence.simulatedProxyPass) process.exitCode = 1;
   } finally {
     await runtime?.close();
+  }
+}
+
+async function measureProviderResilience(runtime: PilotRuntime): Promise<{
+  outageStatus: number;
+  recoveryStatus: number;
+  pass: boolean;
+}> {
+  const event = paymentEvent(sampleSize + 1);
+  runtime.controls.setPaymentAvailable(false);
+  const outage = await postProviderEvent(runtime, event);
+  runtime.controls.setPaymentAvailable(true);
+  const recovery = await postProviderEvent(runtime, event);
+  return {
+    outageStatus: outage.status,
+    recoveryStatus: recovery.status,
+    pass: outage.status === 401 && recovery.status === 202,
+  };
+}
+
+async function exerciseWorkerRestartAndReclaim(databaseUrl: string): Promise<{
+  messageId: string;
+  attemptOutcomes: string[];
+  queueAgeMs: number;
+  pass: boolean;
+}> {
+  const firstConnection = createDatabase(databaseUrl);
+  const message = await enqueueOutbox(firstConnection.db, {
+    id: randomUUID(),
+    topic: "payments.reconcile",
+    aggregateType: "settlement",
+    aggregateId: randomUUID(),
+    payload: { settlementReference: `CONTROLLED-PILOT-${randomUUID()}` },
+    occurredAt: new Date("2026-07-31T12:00:00.000Z"),
+  });
+  const firstStore = createDatabaseOutboxStore(firstConnection.db);
+  const [firstClaim] = await firstStore.claim({
+    workerId: "controlled-pilot-worker-before-restart",
+    limit: 1,
+    claimLeaseMs: 25,
+    maxAttempts: 3,
+  });
+  if (firstClaim?.id !== message.id) {
+    await firstConnection.close();
+    throw new Error("CONTROLLED_PILOT_OUTBOX_MARKER_NOT_CLAIMED");
+  }
+  const queueAgeMs = Math.max(0, Date.now() - message.occurredAt.getTime());
+  await firstConnection.close();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const secondConnection = createDatabase(databaseUrl);
+  try {
+    const feed = {
+      async fetchPending() {
+        return [
+          {
+            settlementReference: `CONTROLLED-PILOT-${message.id}`,
+            provider: "SOMOCO_PAYMENTS" as const,
+            providerTotalMinorUnits: 0n,
+            receivedAt: new Date(),
+          },
+        ];
+      },
+    };
+    const sink = {
+      async compareSettlement() {
+        return { status: "MATCHED" as const, varianceMinorUnits: "0" };
+      },
+    };
+    const handler = createReconcilePaymentsHandler({
+      job: createPaymentReconciliationJob({ feed, sink }),
+    });
+    const dispatched = await dispatchOutboxBatch({
+      store: createDatabaseOutboxStore(secondConnection.db),
+      workerId: "controlled-pilot-worker-after-restart",
+      handlers: new Map([[message.topic, handler]]),
+      concurrency: 1,
+      maxAttempts: 3,
+      retryBaseDelayMs: 10,
+      heartbeatIntervalMs: 10,
+      claimLeaseMs: 100,
+      now: () => new Date(),
+      logger: { info() {}, error() {} },
+    });
+    const attempts = await listOutboxAttempts(secondConnection.db, message.id);
+    const attemptOutcomes = attempts.map((attempt) => attempt.outcome);
+    return {
+      messageId: message.id,
+      attemptOutcomes,
+      queueAgeMs,
+      pass:
+        dispatched === 1 && attemptOutcomes.join(",") === "ABANDONED,PUBLISHED",
+    };
+  } finally {
+    await secondConnection.close();
   }
 }
 

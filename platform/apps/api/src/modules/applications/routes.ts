@@ -26,6 +26,7 @@ const applicantBody = {
   properties: {
     expectedVersion: version,
     mutationId: uuid,
+    productId: uuid,
     vehicleModelId: uuid,
     profile,
   },
@@ -65,6 +66,18 @@ const submitBody = {
   required: ["expectedVersion", "mutationId"],
   properties: { expectedVersion: version, mutationId: uuid },
 } as const;
+const signatureBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["signature", "idempotencyKey"],
+  properties: {
+    signature: { type: "string", minLength: 8, maxLength: 4096 },
+    idempotencyKey: {
+      type: "string",
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+    },
+  },
+} as const;
 
 export async function registerApplicationRoutes(
   app: FastifyInstance,
@@ -72,6 +85,10 @@ export async function registerApplicationRoutes(
   service: ApplicationService,
 ): Promise<void> {
   const authenticate = createCustomerAuthenticationHook(otp);
+  const signatureMutationPreHandler =
+    app.csrfProtection === undefined
+      ? authenticate
+      : [authenticate, app.csrfProtection];
 
   app.get(
     "/v1/customer/vehicle-models",
@@ -103,6 +120,7 @@ export async function registerApplicationRoutes(
     Body: {
       expectedVersion: number;
       mutationId: string;
+      productId?: string;
       vehicleModelId: string;
       profile: Record<string, unknown>;
     };
@@ -220,6 +238,29 @@ export async function registerApplicationRoutes(
           request.body,
         ),
       );
+    },
+  );
+
+  app.post<{
+    Params: { applicationId: string };
+    Body: { signature: string; idempotencyKey: string };
+  }>(
+    "/v1/customer/applications/:applicationId/signatures",
+    {
+      schema: { params: applicationParams, body: signatureBody },
+      preHandler: signatureMutationPreHandler,
+    },
+    async (request, reply) => {
+      const principal = requireCustomerPrincipal(request);
+      return reply
+        .code(201)
+        .send(
+          await service.recordSignature(
+            request.params.applicationId,
+            context(principal, request.id),
+            request.body,
+          ),
+        );
     },
   );
 }

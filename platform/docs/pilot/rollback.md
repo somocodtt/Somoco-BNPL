@@ -7,7 +7,7 @@ Rollback is a controlled stop and recovery of service. Never delete financial, a
 
 ## Rehearsal evidence status
 
-This runbook is an unsigned control template. The bounded load output is labelled `SIMULATED_PROXY` and measures request latency against disposable PostgreSQL and simulator adapters only; it is not queue-age, worker-restart/reclaim, provider-resilience, hosting-capacity, or restore-integrity evidence. Those checks remain `PENDING_EXTERNAL_REHEARSAL`. The real-app API tests also leave the pilot blocked where no public guarantor-signature or deposit-reconciliation-before-contract boundary exists. Do not close those gaps by writing workflow tables, replaying against production, or deleting evidence.
+This runbook is an unsigned control template. The bounded load output is labelled `SIMULATED_PROXY` and measures request latency against disposable PostgreSQL and simulator adapters; it also records separate simulator provider outage/recovery, database queue age, and production worker claim/restart/reclaim evidence. It is not provider-contract, hosting-capacity, backup/restore, penetration, or signed-UAT evidence; those gates remain `PENDING_EXTERNAL_REHEARSAL` or `PENDING_EXTERNAL_SIGN_OFF`. The real-app tests exercise public signatures, deposit reconciliation/binding, ledger/receipt replay, execution/handover/activation, settlement, and ownership controls. Do not close external gaps by writing workflow tables, replaying against production, or deleting evidence.
 
 ## Trigger and authority
 

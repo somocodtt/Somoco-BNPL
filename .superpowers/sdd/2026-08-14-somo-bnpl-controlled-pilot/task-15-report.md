@@ -1,87 +1,100 @@
-# Task 15 controlled-pilot evidence report — fix round 1
+# Task 15 controlled-pilot evidence report — fix round 2
 
-Base: `dbd05ed0f7099a1a66cfcfe01b24197f7ce1c0c3`
-Fix review base: `71b0f1dd2a05923886487ae34ff4ec4d8b1a7597`
-Scope: replace the rejected standalone in-memory harness with real application composition, retain only executable public-boundary evidence, and preserve unsigned/pending release gates.
-Environment: disposable PostgreSQL only (`postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`), simulator adapters only, synthetic identities/documents/payments. No production target, real provider, real hosting, restore rehearsal, penetration test, or staff-signed UAT was used.
+Base: `6b76c1e` (`fix: exercise real controlled pilot boundaries`)
+Scope: complete the missing real public product/signature/deposit boundaries and prove the controlled pilot through production application composition, disposable PostgreSQL, simulator ports, worker dispatch, and the actual customer UI route.
+Environment: disposable PostgreSQL only (`postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`), simulator adapters only, synthetic identities/documents/payments. No production target, real provider, real hosting, backup/restore, penetration test, or staff-signed UAT was used.
 
 ## TDD RED/GREEN
 
-The rejected `platform/test/e2e/support/pilot-harness.ts` was removed. The first real-app boundary command then failed because the old browser spec still imported that fixture:
+The first fix-round boundaries were tested at the public boundary before implementation:
 
 ```text
-Command: node apps/customer-web/node_modules/@playwright/test/cli.js test --config playwright.config.ts test/e2e/pilot-happy-path.spec.ts
-Result: FAIL — Cannot find module './support/pilot-harness.js'
+Product linkage RED: the real customer applicant PATCH returned 400 when the public productId was submitted because the public product selection was not exposed or validated. GREEN after productId was accepted and checked against the active product/model.
+Signature action RED: POST /v1/customer/applications/:applicationId/signatures returned 404. GREEN after authenticated applicant and guarantor actions persisted offer-bound evidence and replayed idempotently.
+Pre-contract deposit RED: a simulator payment could be quarantined, but no public path reconciled it to the accepted offer before assignment/contract generation. GREEN after the payment webhook matched application+offer context, persisted reconciliation/receipt/audit evidence, and contract generation bound the matched transaction to a DEPOSIT ledger entry.
+Signature execution guard RED: physical execution returned 200 without public applicant/guarantor signature evidence. GREEN after execution rejected the same public flow with 409 SIGNATURE_EVIDENCE_INCOMPLETE.
+Arrears boundary RED: the staff arrears-compute route was absent (404), then returned a serialization failure on bigint output. GREEN after the staff route serialized the real CollectionsService result and asserted distinct THREE_CONSECUTIVE_MISSED and THREE_TOTAL_UNPAID signals.
 ```
 
-The real replacement composes `buildApp`, database migration/reset, public OTP/customer sessions, signed staff cookie sessions, simulator ports, and public HTTP routes. Focused GREEN evidence:
+The real replacement composes `buildApp`, repeat-safe migrations, public OTP/customer sessions, signed staff cookie sessions, `@somo/integrations` simulator ports, the production worker outbox dispatcher, and public HTTP routes. No standalone in-memory application or duplicated business rule is used. The happy path enters customer, guarantor, staff, and provider actions through those boundaries and reads durable state back from PostgreSQL.
+
+Focused real-app GREEN:
 
 ```text
 Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts
-Result: Test Files 1 passed; Tests 5 passed
-```
+Result: Test Files 1 passed; Tests 6 passed
 
-```text
 Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts test/e2e/information-request.spec.ts test/e2e/payment-replay.spec.ts test/e2e/recovery-control.spec.ts test/e2e/ownership-transfer.spec.ts
-Result: Test Files 5 passed; Tests 9 passed (39.55s)
+Result: Test Files 5 passed; Tests 15 passed
 ```
 
-The five real-app tests cover the happy onboarding/approval/offer flow plus wrong-role/licence, unmatched provider replay, inventory registration/insurance/deposit guards, and provider-verification/recovery-role fail-closed boundaries. Approval evidence is read back from durable `audit_event` rows (six stages, five distinct actors, six idempotency keys); guarantor consent, verified identity, and accepted document evidence is read back from the privacy schema. The unmatched payment path produces one persisted payment transaction and one reconciliation case; a second provider event with the same provider transaction is acknowledged as a duplicate without a second transaction/case.
+The happy scenario proves, in order: public applicant product selection; independent applicant and guarantor OTP/NIA/consent/document evidence; applicant and guarantor signature actions bound to the accepted offer; six-stage approval with declared roles, actor/stage/idempotency history, wrong-role rejection, and licence-disallowed tenure rejection; accepted offer; simulator payment deposit reconciliation; declared `INVENTORY_OFFICER` VIN, registration, insurance, and assignment; physical PDF execution; customer and staff handover; activation; arrears recomputation; six simulator repayment events; duplicate provider transaction replay; clean settlement; dual finance/business approvals; and ownership transfer.
 
-The four plan-required adverse entry points were restored as executable Vitest real-app HTTP specs (not browser fakes): `test/e2e/information-request.spec.ts`, `payment-replay.spec.ts`, `recovery-control.spec.ts`, and `ownership-transfer.spec.ts`. They share `support/real-pilot.ts` and `support/vitest-http.ts`; Playwright's browser project runs only the actual customer UI spec, while `test:pilot` runs all nine real API tests.
+Durable assertions cover privacy signature rows, approval/audit rows, deposit reconciliation, payment transaction and receipt uniqueness, DEPOSIT and REPAYMENT ledger entries, repayment schedule/installment balances, contract state, settlement approvals, ownership-transfer state, and replay/idempotency evidence. The contract ownership-holder schema remains `SOMOCO` by design; the completed transfer is asserted in the ownership-transfer record and public response.
 
-## Exact public-boundary limitations
+The four plan-required adverse entry points remain meaningful real-app HTTP specs and share only the real composition helper:
 
-These are recorded as blockers rather than bypassed:
+- `test/e2e/information-request.spec.ts`: information request/resubmission, NIA outage then recovery, three failed OTP codes, and infected-document rejection.
+- `test/e2e/payment-replay.spec.ts`: unmatched replay invariants and payment-simulator outage then recovery.
+- `test/e2e/recovery-control.spec.ts`: arrears queue, unauthorized tracker lookup, and explicit recovery/immobilization denial.
+- `test/e2e/ownership-transfer.spec.ts`: outstanding-balance transfer denial.
 
-- `POST /v1/customer/applications` accepts no product identifier and no product-assignment route exists. The composition uses one setup-only `application.product_id` linkage after the public draft is created; product rule creation and publishing still enter the real maker/checker routes. This missing assignment boundary is not a business-rule implementation.
-- `POST /v1/staff/applications/:applicationId/asset-assignment` returns `409 DEPOSIT_RECONCILIATION_REQUIRED` after the accepted offer and real registration/insurance routes complete. The payment webhook only posts/reconciles against an existing contract reference, while `POST /v1/staff/applications/:applicationId/contracts` requires an assignment. There is no public deposit-reconciliation-before-contract command, so posted ledger/receipt replay, contract execution, handover, activation, repayment settlement, and ownership transfer cannot be honestly claimed in this task without a direct workflow-table shortcut.
-- No public customer/guarantor signature action exists. The execution route accepts staff-supplied applicant/guarantor person IDs, but does not provide a customer signature evidence boundary. The UAT/go-no-go documents keep this gate blocked.
-
-The adverse inventory test demonstrates the actual guard with the declared `INVENTORY_OFFICER` role; no `OPERATIONS_OFFICER` or invented role is used. All action/event timestamps in the executable scenarios are deterministic past timestamps relative to the test run, except the fixed offer expiry required by the production offer validity guard.
-
-## Bounded load/resilience evidence
+## Bounded load and resilience evidence
 
 ```text
-Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/tsx/dist/cli.mjs test/load/application-flow.ts
-Output:
-{"mode":"SIMULATED_PROXY","persistence":"DISPOSABLE_POSTGRESQL","simulator":"SOMOCO_PAYMENTS_TEST_ADAPTER","modeledMonthlyApplications":5200,"sampleSize":32,"concurrency":8,"elapsedMs":446.25,"throughputPerSecond":71.71,"simulatedProxyP95RequestLatencyMs":204.61,"requestStatusCodes":[202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202,202],"replayStatus":202,"reconciliationCases":32,"thresholds":{"simulatedProxyP95RequestLatencyMs":1000},"simulatedProxyPass":true,"actualGates":{"workerRestartAndReclaim":"PENDING_EXTERNAL_REHEARSAL","queueAge":"PENDING_EXTERNAL_REHEARSAL","providerResilience":"PENDING_EXTERNAL_REHEARSAL","hostingCapacity":"PENDING_EXTERNAL_REHEARSAL","restoreIntegrity":"PENDING_EXTERNAL_REHEARSAL","signedUat":"PENDING_EXTERNAL_SIGN_OFF"}}
+Command: node node_modules/tsx/dist/cli.mjs test/load/application-flow.ts
+Database: postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test
+Output: mode=SIMULATED_PROXY; sampleSize=32; concurrency=8; requestStatusCodes=32x202; replayStatus=202; concurrentWebhook.pass=true; providerResilience={outageStatus:401,recoveryStatus:202,pass:true}; workerRestartAndReclaim={attemptOutcomes:[ABANDONED,PUBLISHED],queueAgeMs:1977327342,pass:true}; simulatedProxyP95RequestLatencyMs=198.85; simulatedProxyPass=true
 ```
 
-This is a bounded real-app request sample against disposable persistence and the payment simulator. `simulatedProxyP95RequestLatencyMs` is request latency only; it is not queue age, worker restart/reclaim, provider resilience, hosting capacity, or restore evidence. The script deliberately labels every external gate `PENDING` and cannot target production.
+The script uses the real API webhook route and disposable simulator. It separately measures request p95, database queue age, simulator provider outage/recovery, and the production worker's database claim/restart/reclaim path. It never equates request latency with queue age. Hosting capacity, real-provider resilience, backup/restore integrity, and signed UAT remain pending rather than fabricated.
+
+The production worker integration gate also passed:
+
+```text
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run --config apps/worker/vitest.config.ts apps/worker/test/database-outbox.integration.test.ts
+Result: Test Files 1 passed; Tests 6 passed
+```
 
 ## Browser/UI evidence
 
-The Playwright config now starts the actual customer Vite app; no inline HTML or fake browser page remains. A direct static route check succeeded:
+The root Playwright config runs the actual customer Vite app and explicitly selects `channel: "chrome"`; customer/staff configs retain the same channel. The test does not use inline HTML or a fixture browser page.
 
 ```text
-Vite: http://127.0.0.1:4178/ ready
-Invoke-WebRequest /: Status 200, root element present, app module present
+Command: node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 4178
+Command: node node_modules/@playwright/test/cli.js test --config playwright.config.ts --reporter=line
+Result: 1 passed — test/e2e/pilot-happy-path.spec.ts serves the actual customer sign-in route in Chrome.
 ```
 
-The browser runner could not execute in this environment: there is no `%LOCALAPPDATA%\ms-playwright` cache and no system Chrome/Chromium process. The attempted Playwright run started Vite and then stalled at browser launch; it was stopped without installing dependencies. Browser execution is therefore `PENDING_BROWSER_RUNTIME`, not a pass claim.
+The first browser assertion expected the nonexistent `Request code` label; the actual production route rendered `Send code`. The assertion was corrected and the rerun passed. The disposable Vite process was terminated after the run.
+
+## Compatibility and affected verification
+
+Existing route-composition fixtures do not install the optional Fastify CSRF decorator. The signature route uses CSRF whenever the production `buildApp` decorator exists, while allowing those isolated route fixtures to register. `buildApp` always passes `requireSignatureEvidence: true`. Direct non-production contract-service fixtures may use their pre-existing unlinked reconciled evidence rows for compatibility; production and the controlled pilot require a payment transaction binding and durable DEPOSIT posting.
+
+```text
+node node_modules/typescript/bin/tsc --noEmit -p apps/api/tsconfig.json       # pass
+node node_modules/typescript/bin/tsc --noEmit -p apps/worker/tsconfig.json    # pass
+node node_modules/typescript/bin/tsc --noEmit -p packages/db/tsconfig.json    # pass
+applications.e2e.test.ts                                                        # 15 passed
+assets-contracts.e2e.test.ts                                                     # 11 passed
+worker database-outbox.integration.test.ts                                      # 6 passed
+```
+
+No `pnpm install` or `pnpm add` was run. No production module was targeted by a test service, and the only database URL accepted by the real pilot helper is the disposable test URL above.
 
 ## Pilot documents and release gates
 
-`platform/docs/pilot/uat-script.md`, `go-no-go-checklist.md`, and `rollback.md` remain unsigned templates. They explicitly keep real-provider, hosting/TLS/secrets, legal/DPC-DPIA/privacy, security, backup/restore, reconciliation, worker restart/reclaim, browser, UAT, signature, contract, ledger/receipt, settlement, and ownership evidence pending or blocked. SAP synchronization remains off pending discovery. No real-provider, hosting, restore, UAT, or production-launch evidence is fabricated.
+Updated unsigned templates:
 
-## Verification
+- `platform/docs/pilot/uat-script.md`
+- `platform/docs/pilot/go-no-go-checklist.md`
+- `platform/docs/pilot/rollback.md`
 
-Completed focused checks:
-
-```text
-node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts test/e2e/information-request.spec.ts test/e2e/payment-replay.spec.ts test/e2e/recovery-control.spec.ts test/e2e/ownership-transfer.spec.ts  # 5 files / 9 tests passed
-node node_modules/tsx/dist/cli.mjs test/load/application-flow.ts                                  # exit 0; simulatedProxyPass=true; p95 204.61 ms
-node_modules/.bin/eslint.cmd apps/api/test/task15-controlled-pilot.e2e.test.ts test/e2e test/load/application-flow.ts playwright.config.ts  # exit 0
-node_modules/.bin/tsc.cmd --noEmit -p apps/api/tsconfig.json                             # exit 0
-node scripts/verify-pilot-gates.mjs --environment test                                      # 10 signed synthetic gates verified
-node scripts/verify-workspace.mjs                                                           # workspace configuration verified
-```
-
-The broad root `tsc -p tsconfig.base.json --noEmit` remains non-actionable baseline failure: it reports existing JSX/config/package-test errors outside Task 15 (for example `--jsx is not set`, pre-existing db/integrations test typing, and the existing workspace API mismatch). No production module was changed to make that broad command appear green. No `pnpm install` or `pnpm add` was run.
+They now describe the real public-boundary evidence and keep real-provider, hosting/TLS/capacity, legal/privacy, security/penetration, backup/restore, and signed UAT gates pending. They do not claim production launch readiness. SAP synchronization remains off pending discovery.
 
 ## Self-review
 
-Before handoff, exact `71b0f1dd2a05923886487ae34ff4ec4d8b1a7597..HEAD` changes were reviewed for the rejected standalone harness, literal token-role maps, `setArrears`/`seedActiveContract`, direct workflow-table shortcuts, weak replay assertions, future timestamps, production targets, generated artifacts, and fabricated readiness. The old harness and all stale specs importing it are gone. The only direct SQL writes in the real composition are setup-only product/policy/bootstrap fixtures and the explicitly documented product linkage gap; customer, staff, and provider actions enter real public routes. Production code was not modified.
+Exact self-review range: `6b76c1e..FIX_HEAD` (all current worktree changes before the fix commit). Reviewed for fake harness imports, literal token-role maps, direct workflow SQL, `setArrears`/`seedActiveContract`, missing role guards, future provider timestamps, weak replay assertions, production targets, generated artifacts, and fabricated provider/hosting/restore/UAT evidence. `rg` confirms no `pilot-harness` or `attachProduct` references remain. The public signatures, deposit reconciliation, worker, adverse, load, and browser paths are real and bounded.
 
-Commit: recorded in the final handoff (`fix: exercise real controlled pilot boundaries`)
+Commit: `fix: complete real controlled pilot financial and ownership flow` (to be recorded after final verification).

@@ -43,5 +43,37 @@ describe("controlled-pilot recovery boundary", () => {
     );
     expect(forbidden.status()).toBe(403);
     await expect(body(forbidden)).resolves.toMatchObject({ code: "FORBIDDEN" });
+    const unauthorizedTracker = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      `/v1/staff/collections/cases/${randomUUID()}/location?purpose=UNAUTHORIZED_TRACKER_TEST`,
+      { headers: runtime.staff.get("CUSTOMER_SUPPORT")!.headers },
+    );
+    expect(unauthorizedTracker.status()).toBe(403);
+    await expect(body(unauthorizedTracker)).resolves.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    const automaticImmobilization = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/collections/cases/${randomUUID()}/actions`,
+      {
+        headers: runtime.staff.get("RECOVERY_OFFICER")!.headers,
+        body: {
+          actionType: "IMMOBILIZE",
+          purpose: "AUTOMATIC_IMMOBILIZATION_DENIAL",
+          requestedBy: randomUUID(),
+          evidence: { platformCommand: true },
+          evidenceHash: "a".repeat(64),
+          idempotencyKey: "recovery-automatic-immobilization-001",
+        },
+      },
+    );
+    expect(automaticImmobilization.status()).toBe(400);
+    await expect(body(automaticImmobilization)).resolves.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
   }, 60_000);
 });

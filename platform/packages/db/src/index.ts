@@ -82,6 +82,15 @@ export {
   type NewAuditEvent,
 } from "./repositories/audit.js";
 export {
+  APPLICATION_SIGNATURE_PURPOSE,
+  findApplicationSignatureEvidence,
+  recordApplicationSignature,
+  type ApplicationSignatureActor,
+  type ApplicationSignatureEvidence,
+  type ApplicationSignatureRecord,
+  type RecordApplicationSignatureInput,
+} from "./repositories/signatures.js";
+export {
   financingRepo,
   type ApplicationGateRecord,
   type ExceptionRecord,

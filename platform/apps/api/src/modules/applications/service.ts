@@ -5,6 +5,7 @@ import {
   listActiveVehicleModels,
   readOwnedApplicationState,
   readResumableApplication,
+  recordApplicationSignature,
   resolveGuarantorInvitation,
   saveApplicantSection,
   saveGuarantorSection,
@@ -91,6 +92,19 @@ export interface ApplicationService {
     context: ApplicationContext,
     input: MutationVersionInput,
   ): Promise<ApplicationCommandResult>;
+  recordSignature(
+    applicationId: string,
+    context: ApplicationContext,
+    input: SignatureInput,
+  ): Promise<{
+    id: string;
+    applicationId: string;
+    personId: string;
+    purpose: "CONTRACT_EXECUTION";
+    signatureHash: string;
+    signedAt: string;
+    replay: boolean;
+  }>;
 }
 
 export interface MutationVersionInput {
@@ -99,6 +113,7 @@ export interface MutationVersionInput {
 }
 
 export interface ApplicantSaveInput extends MutationVersionInput {
+  productId?: string;
   vehicleModelId: string;
   profile: Record<string, unknown>;
 }
@@ -109,6 +124,11 @@ export interface GuarantorInviteInput extends MutationVersionInput {
 
 export interface GuarantorSaveInput extends MutationVersionInput {
   profile: Record<string, unknown>;
+}
+
+export interface SignatureInput {
+  idempotencyKey: string;
+  signature: string;
 }
 
 interface ApplicationCommandResult {
@@ -148,6 +168,8 @@ export function createApplicationService(options: {
 
     async saveApplicant(applicationId, context, input) {
       assertMutation(input);
+      if (input.productId !== undefined)
+        assertUuid(input.productId, "PRODUCT_ID_INVALID");
       assertUuid(input.vehicleModelId, "VEHICLE_MODEL_INVALID");
       assertProfile(input.profile);
       const command = mutationCommand(
@@ -156,6 +178,9 @@ export function createApplicationService(options: {
         input,
         "SAVE_APPLICANT",
         {
+          ...(input.productId === undefined
+            ? {}
+            : { productId: input.productId }),
           vehicleModelId: input.vehicleModelId,
           profile: input.profile,
         },
@@ -164,6 +189,9 @@ export function createApplicationService(options: {
         saveApplicantSection(options.database, {
           ...command,
           expectedVersion: input.expectedVersion,
+          ...(input.productId === undefined
+            ? {}
+            : { productId: input.productId }),
           vehicleModelId: input.vehicleModelId,
           profile: input.profile,
           now: clock.now(),
@@ -293,6 +321,32 @@ export function createApplicationService(options: {
         ),
       );
     },
+
+    async recordSignature(applicationId, context, input) {
+      assertUuid(applicationId, "APPLICATION_ID_INVALID");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey))
+        throw new AppError(
+          400,
+          "SIGNATURE_IDEMPOTENCY_INVALID",
+          "A valid signature retry key is required.",
+        );
+      const signature = input.signature.trim();
+      if (signature.length < 8 || signature.length > 4096)
+        throw new AppError(
+          400,
+          "SIGNATURE_INVALID",
+          "A non-empty signature is required.",
+        );
+      return mapErrors(() =>
+        recordApplicationSignature(options.database, {
+          applicationId,
+          actor: context,
+          idempotencyKey: input.idempotencyKey,
+          signature,
+          now: clock.now(),
+        }),
+      );
+    },
   };
 }
 
@@ -376,7 +430,11 @@ function assertProfile(profile: Record<string, unknown>): void {
 
 function assertInvitationToken(value: string): void {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) {
-    throw new AppError(404, "INVITATION_NOT_FOUND", "Invitation was not found.");
+    throw new AppError(
+      404,
+      "INVITATION_NOT_FOUND",
+      "Invitation was not found.",
+    );
   }
 }
 
@@ -436,6 +494,22 @@ async function mapErrors<T>(operation: () => Promise<T>): Promise<T> {
       VEHICLE_MODEL_UNAVAILABLE: [
         409,
         "The selected vehicle model is no longer available.",
+      ],
+      PRODUCT_UNAVAILABLE: [
+        409,
+        "The selected financing product is no longer available for this model.",
+      ],
+      SIGNATURE_NOT_AUTHORIZED: [
+        403,
+        "Only the applicant or confirmed guarantor can sign this application.",
+      ],
+      OFFER_NOT_ACCEPTED: [
+        409,
+        "The offer must be accepted before contract signatures are recorded.",
+      ],
+      SIGNATURE_ALREADY_RECORDED: [
+        409,
+        "A contract signature is already recorded for this person.",
       ],
       GUARANTOR_MUST_BE_INDEPENDENT: [
         400,

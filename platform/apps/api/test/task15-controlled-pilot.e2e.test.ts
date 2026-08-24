@@ -13,6 +13,7 @@ import {
   call,
   completeOnboarding,
   createAndAcceptOffer,
+  prepareContractWithoutSignatures,
   postPayment,
   type ApiRequest,
   type ApiResponse,
@@ -93,6 +94,563 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       identity_count: "1",
       document_count: "1",
     });
+
+    const applicantSignature = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/customer/applications/${flow.applicationId}/signatures`,
+      {
+        headers: runtime.customer.applicant.headers,
+        body: {
+          signature: "applicant-signature-controlled-pilot-v1",
+          idempotencyKey: "pilot-applicant-signature-001",
+        },
+      },
+    );
+    expect(applicantSignature.status()).toBe(201);
+    const applicantSignatureBody = await body(applicantSignature);
+    expect(applicantSignatureBody).toMatchObject({
+      applicationId: flow.applicationId,
+      personId: runtime.applicationFixtures.applicantId,
+      purpose: "CONTRACT_EXECUTION",
+      replay: false,
+    });
+    const applicantSignatureReplay = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/customer/applications/${flow.applicationId}/signatures`,
+      {
+        headers: runtime.customer.applicant.headers,
+        body: {
+          signature: "applicant-signature-controlled-pilot-v1",
+          idempotencyKey: "pilot-applicant-signature-001",
+        },
+      },
+    );
+    expect(applicantSignatureReplay.status()).toBe(201);
+    await expect(body(applicantSignatureReplay)).resolves.toMatchObject({
+      id: applicantSignatureBody.id,
+      replay: true,
+    });
+
+    const guarantorSignature = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/customer/applications/${flow.applicationId}/signatures`,
+      {
+        headers: runtime.customer.guarantor.headers,
+        body: {
+          signature: "guarantor-signature-controlled-pilot-v1",
+          idempotencyKey: "pilot-guarantor-signature-001",
+        },
+      },
+    );
+    expect(guarantorSignature.status()).toBe(201);
+    await expect(body(guarantorSignature)).resolves.toMatchObject({
+      applicationId: flow.applicationId,
+      personId: runtime.applicationFixtures.guarantorId,
+      purpose: "CONTRACT_EXECUTION",
+      replay: false,
+    });
+
+    const signatures = await queryTestSql<{
+      signature_count: string;
+      applicant_count: string;
+      guarantor_count: string;
+    }>(
+      databaseUrl,
+      `select count(*)::text as signature_count,
+              count(*) filter (where person_id = $2)::text as applicant_count,
+              count(*) filter (where person_id = $3)::text as guarantor_count
+         from privacy.signature_evidence
+        where purpose = 'CONTRACT_EXECUTION'
+          and evidence->>'applicationId' = $1`,
+      [
+        flow.applicationId,
+        runtime.applicationFixtures.applicantId,
+        runtime.applicationFixtures.guarantorId,
+      ],
+    );
+    expect(signatures).toEqual({
+      signature_count: "2",
+      applicant_count: "1",
+      guarantor_count: "1",
+    });
+
+    const depositEvent: CanonicalPaymentEvent = {
+      eventId: "controlled-pilot-deposit-event-001",
+      eventType: "PAYMENT_SUCCEEDED",
+      channel: "MOBILE_MONEY",
+      providerTransactionId: "controlled-pilot-deposit-provider-001",
+      payerPhoneE164: "+233241000001",
+      customerReference: flow.applicationId,
+      amount: { currency: "GHS", minorUnits: "10000" },
+      occurredAt: "2026-08-02T12:10:00.000Z",
+    };
+    const deposit = await postPayment(request, flow, depositEvent);
+    expect(deposit.status()).toBe(202);
+    await expect(body(deposit)).resolves.toMatchObject({
+      accepted: true,
+      duplicate: false,
+      outcome: "POSTED",
+      depositReconciled: true,
+    });
+    const depositEvidence = await queryTestSql<{
+      payment_count: string;
+      receipt_count: string;
+      reconciled_count: string;
+    }>(
+      databaseUrl,
+      `select
+          (select count(*) from payment_transaction where provider_transaction_id = $1)::text as payment_count,
+          (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id = $1)::text as receipt_count,
+          (select count(*) from deposit_reconciliation where application_id = $2 and status = 'RECONCILED')::text as reconciled_count`,
+      [depositEvent.providerTransactionId, flow.applicationId],
+    );
+    expect(depositEvidence).toEqual({
+      payment_count: "1",
+      receipt_count: "1",
+      reconciled_count: "1",
+    });
+
+    const vehicle = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      "/v1/staff/assets",
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          vehicleModelId: runtime.applicationFixtures.vehicleModelId,
+          vin: "CONTROLLED-PILOT-FLOW-VIN-001",
+          chassisNumber: "CONTROLLED-PILOT-FLOW-CHASSIS-001",
+          engineMotorIdentifier: "CONTROLLED-PILOT-FLOW-ENGINE-001",
+          condition: { state: "NEW" },
+          accessories: ["helmet"],
+          trackerIdentifier: "CONTROLLED-PILOT-FLOW-TRACKER-001",
+          idempotencyKey: "pilot-flow-vehicle-001",
+        },
+      },
+    );
+    expect(vehicle.status()).toBe(201);
+    const vehicleBody = await body(vehicle);
+    const vehicleId = String(vehicleBody.id);
+    let vehicleVersion = Number(vehicleBody.version);
+
+    const registration = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/assets/${vehicleId}/registration`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          registrationNumber: "GT-FLOW-26",
+          validFrom: "2026-08-01",
+          validTo: "2027-08-01",
+          expectedVehicleVersion: vehicleVersion,
+          idempotencyKey: "pilot-flow-registration-001",
+        },
+      },
+    );
+    expect(registration.status()).toBe(200);
+    vehicleVersion = Number((await body(registration)).version);
+
+    const insurance = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/assets/${vehicleId}/insurance`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          policyNumber: "CONTROLLED-PILOT-FLOW-POLICY-001",
+          provider: "Controlled Pilot Insurer",
+          validFrom: "2026-08-01",
+          validTo: "2027-08-01",
+          expectedVehicleVersion: vehicleVersion,
+          idempotencyKey: "pilot-flow-insurance-001",
+        },
+      },
+    );
+    expect(insurance.status()).toBe(200);
+    vehicleVersion = Number((await body(insurance)).version);
+
+    const assignment = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/applications/${flow.applicationId}/asset-assignment`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          vehicleUnitId: vehicleId,
+          expectedVehicleVersion: vehicleVersion,
+          idempotencyKey: "pilot-flow-assignment-001",
+        },
+      },
+    );
+    expect(assignment.status()).toBe(200);
+    await expect(body(assignment)).resolves.toMatchObject({
+      applicationId: flow.applicationId,
+      vehicleUnitId: vehicleId,
+    });
+
+    const generatedContract = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/applications/${flow.applicationId}/contracts`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          assignmentId: String((await body(assignment)).id),
+          idempotencyKey: "pilot-flow-contract-generate-001",
+        },
+      },
+    );
+    expect(generatedContract.status()).toBe(201);
+    const contractBody = await body(generatedContract);
+    expect(contractBody).toMatchObject({
+      applicationId: flow.applicationId,
+      status: "AWAITING_EXECUTION",
+    });
+    const contractId = String(contractBody.id);
+    const depositBinding = await queryTestSql<{
+      payment_status: string;
+      contract_id: string;
+      deposit_ledger_count: string;
+    }>(
+      databaseUrl,
+      `select p.status as payment_status,
+              p.contract_id::text as contract_id,
+              (select count(*) from ledger_entry l
+                where l.contract_id = p.contract_id
+                  and l.payment_transaction_id = p.id
+                  and l.entry_type = 'DEPOSIT')::text as deposit_ledger_count
+         from payment_transaction p
+        where p.provider_transaction_id = $1`,
+      [depositEvent.providerTransactionId],
+    );
+    expect(depositBinding).toEqual({
+      payment_status: "POSTED",
+      contract_id: contractId,
+      deposit_ledger_count: "1",
+    });
+
+    const execution = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/execution`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          expectedVersion: Number(contractBody.version),
+          applicantPersonId: runtime.applicationFixtures.applicantId,
+          guarantorPersonId: runtime.applicationFixtures.guarantorId,
+          staffWitnessId: runtime.staff.get("INVENTORY_OFFICER")!.staffUserId,
+          executionDate: "2026-08-03T12:00:00.000Z",
+          headOfficeId: "CONTROLLED-PILOT-HEAD-OFFICE",
+          headOfficeLocation: "Accra",
+          executedDocumentId: flow.applicantDocumentId,
+          executedDocumentHash: flow.applicantDocumentHash,
+          idempotencyKey: "pilot-flow-contract-execution-001",
+        },
+      },
+    );
+    expect(execution.status(), await execution.text()).toBe(200);
+    await expect(body(execution)).resolves.toMatchObject({
+      id: contractId,
+      status: "EXECUTED",
+    });
+
+    const handoverChecklist = {
+      items: [
+        { itemId: "identity_verified", result: "PASS" },
+        { itemId: "keys_received", result: "PASS" },
+        { itemId: "condition_recorded", result: "PASS" },
+        { itemId: "accessories_recorded", result: "PASS" },
+      ],
+    };
+    const acknowledgement = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/customer/contracts/${contractId}/handover-acknowledgement`,
+      {
+        headers: runtime.customer.applicant.headers,
+        body: {
+          checklistVersion: "handover-v1",
+          checklist: handoverChecklist,
+          idempotencyKey: "pilot-flow-handover-ack-001",
+        },
+      },
+    );
+    expect(acknowledgement.status()).toBe(201);
+    const acknowledgementBody = await body(acknowledgement);
+
+    const handover = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/handover`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          expectedVersion: Number((await body(execution)).version),
+          checklistVersion: "handover-v1",
+          checklist: handoverChecklist,
+          customerAcknowledged: true,
+          customerAcknowledgementId: String(acknowledgementBody.id),
+          customerAcknowledgedByPersonId:
+            runtime.applicationFixtures.applicantId,
+          condition: {
+            description: "New vehicle inspected with no visible damage.",
+            checkResult: "PASS",
+          },
+          accessories: { items: ["helmet"] },
+          headOfficeId: "CONTROLLED-PILOT-HEAD-OFFICE",
+          headOfficeLocation: "Accra",
+          handedOverAt: "2026-08-04T12:00:00.000Z",
+          idempotencyKey: "pilot-flow-handover-001",
+        },
+      },
+    );
+    expect(handover.status()).toBe(200);
+    await expect(body(handover)).resolves.toMatchObject({
+      id: contractId,
+      status: "EXECUTED",
+    });
+
+    const activation = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/activate`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          expectedVersion: Number((await body(handover)).version),
+          idempotencyKey: "pilot-flow-contract-activation-001",
+        },
+      },
+    );
+    expect(activation.status()).toBe(200);
+    await expect(body(activation)).resolves.toMatchObject({
+      id: contractId,
+      status: "ACTIVE",
+      ownershipHolder: "SOMOCO",
+    });
+    const schedule = await queryTestSql<{
+      schedule_count: string;
+      schedule_total: string;
+      installment_count: string;
+      installment_total: string;
+    }>(
+      databaseUrl,
+      `select count(*)::text as schedule_count,
+              coalesce(sum(total_minor_units), 0)::text as schedule_total,
+              (select count(*) from installment where contract_id = $1)::text as installment_count,
+              (select coalesce(sum(amount_minor_units), 0) from installment where contract_id = $1)::text as installment_total
+         from repayment_schedule
+        where contract_id = $1`,
+      [contractId],
+    );
+    expect(schedule).toEqual({
+      schedule_count: "1",
+      schedule_total: "90000",
+      installment_count: "6",
+      installment_total: "90000",
+    });
+
+    const arrears = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/arrears/compute`,
+      {
+        headers: runtime.staff.get("RECOVERY_OFFICER")!.headers,
+        body: { asOfDate: "2027-04-01" },
+      },
+    );
+    expect(arrears.status(), await arrears.text()).toBe(200);
+    await expect(body(arrears)).resolves.toMatchObject({
+      contractId,
+      totalUnpaid: 6,
+      consecutiveMissed: 6,
+      escalationSignals: ["THREE_CONSECUTIVE_MISSED", "THREE_TOTAL_UNPAID"],
+    });
+
+    const repaymentEvents: CanonicalPaymentEvent[] = Array.from(
+      { length: 6 },
+      (_, index) => ({
+        eventId: `controlled-pilot-repayment-event-00${index + 1}`,
+        eventType: "PAYMENT_SUCCEEDED" as const,
+        channel: "MOBILE_MONEY" as const,
+        providerTransactionId: `controlled-pilot-repayment-provider-00${index + 1}`,
+        payerPhoneE164: "+233241000001",
+        customerReference: contractId,
+        amount: { currency: "GHS" as const, minorUnits: "15000" },
+        occurredAt: `2026-08-22T12:${String(10 + index).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+    for (const repaymentEvent of repaymentEvents) {
+      const repayment = await postPayment(request, flow, repaymentEvent);
+      expect(repayment.status()).toBe(202);
+      await expect(body(repayment)).resolves.toMatchObject({
+        accepted: true,
+        duplicate: false,
+        outcome: "POSTED",
+      });
+    }
+    const repaymentEvent = repaymentEvents[0]!;
+    const repaymentReplay = await postPayment(request, flow, {
+      ...repaymentEvent,
+      eventId: "controlled-pilot-repayment-event-replay",
+    });
+    expect(repaymentReplay.status()).toBe(202);
+    await expect(body(repaymentReplay)).resolves.toMatchObject({
+      accepted: true,
+      duplicate: true,
+      outcome: "POSTED",
+    });
+    const repaymentEvidence = await queryTestSql<{
+      transaction_count: string;
+      receipt_count: string;
+      repayment_ledger_count: string;
+      installment_status: string;
+      outstanding_balance: string;
+    }>(
+      databaseUrl,
+      `select
+          (select count(*) from payment_transaction where provider_transaction_id = $1)::text as transaction_count,
+          (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id = $1)::text as receipt_count,
+          (select count(*) from ledger_entry l join payment_transaction p on p.id = l.payment_transaction_id where p.provider_transaction_id = $1 and l.entry_type = 'REPAYMENT')::text as repayment_ledger_count,
+          (select status::text from installment where contract_id = $2 order by installment_number limit 1) as installment_status,
+          (select outstanding_balance_minor_units::text from contract where id = $2) as outstanding_balance`,
+      [repaymentEvent.providerTransactionId, contractId],
+    );
+    expect(repaymentEvidence).toEqual({
+      transaction_count: "1",
+      receipt_count: "1",
+      repayment_ledger_count: "1",
+      installment_status: "PAID",
+      outstanding_balance: "0",
+    });
+
+    const evidence = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/settlement/evidence`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: { evidenceDocumentId: flow.transferEvidenceDocumentId },
+      },
+    );
+    expect(evidence.status()).toBe(200);
+    await expect(body(evidence)).resolves.toMatchObject({
+      contractId,
+      evidenceDocumentId: flow.transferEvidenceDocumentId,
+      verificationStatus: "CLEAN",
+    });
+
+    const financeApproval = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/settlement/finance-approval`,
+      {
+        headers: runtime.staff.get("FINANCE_OFFICER")!.headers,
+        body: {
+          reason: "All simulator receipts and ledger postings reconciled.",
+          idempotencyKey: "pilot-flow-finance-approval-001",
+        },
+      },
+    );
+    expect(financeApproval.status()).toBe(200);
+    await expect(body(financeApproval)).resolves.toMatchObject({
+      contractId,
+      approvalType: "FINANCE_RECONCILIATION",
+    });
+
+    const businessApproval = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/settlement/business-approval`,
+      {
+        headers: runtime.staff.get("MD")!.headers,
+        body: {
+          reason: "Ownership transfer evidence and handover are complete.",
+          idempotencyKey: "pilot-flow-business-approval-001",
+        },
+      },
+    );
+    expect(businessApproval.status()).toBe(200);
+    await expect(body(businessApproval)).resolves.toMatchObject({
+      contractId,
+      approvalType: "BUSINESS_OWNERSHIP_TRANSFER",
+    });
+
+    const settlement = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/settlement/commit`,
+      { headers: runtime.staff.get("FINANCE_OFFICER")!.headers },
+    );
+    expect(settlement.status()).toBe(200);
+    await expect(body(settlement)).resolves.toMatchObject({
+      contractId,
+      status: "SETTLED",
+      ownershipHolder: "SOMOCO",
+    });
+
+    const transfer = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contractId}/ownership-transfer`,
+      { headers: runtime.staff.get("MD")!.headers },
+    );
+    expect(transfer.status()).toBe(200);
+    await expect(body(transfer)).resolves.toMatchObject({
+      contractId,
+      status: "TRANSFERRED",
+      ownershipHolder: "CUSTOMER",
+    });
+    const ownershipEvidence = await queryTestSql<{
+      contract_status: string;
+      ownership_holder: string;
+      finance_approvals: string;
+      business_approvals: string;
+      transfer_count: string;
+      transfer_status: string;
+    }>(
+      databaseUrl,
+      `select c.status as contract_status,
+              c.ownership_holder,
+              (select count(*) from settlement_approval where contract_id = c.id and approval_type = 'FINANCE_RECONCILIATION')::text as finance_approvals,
+              (select count(*) from settlement_approval where contract_id = c.id and approval_type = 'BUSINESS_OWNERSHIP_TRANSFER')::text as business_approvals,
+              (select count(*) from ownership_transfer where contract_id = c.id)::text as transfer_count,
+              (select status::text from ownership_transfer where contract_id = c.id) as transfer_status
+         from contract c
+        where c.id = $1`,
+      [contractId],
+    );
+    expect(ownershipEvidence).toEqual({
+      contract_status: "SETTLED",
+      ownership_holder: "SOMOCO",
+      finance_approvals: "1",
+      business_approvals: "1",
+      transfer_count: "1",
+      transfer_status: "COMPLETED",
+    });
   }, 60_000);
 
   it("rejects a wrong-role approval and licence-disallowed tenure at public boundaries", async () => {
@@ -143,6 +701,38 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     expect(disallowedTenure.status()).toBe(400);
     await expect(body(disallowedTenure)).resolves.toMatchObject({
       code: "TENURE_NOT_ALLOWED",
+    });
+  }, 60_000);
+
+  it("rejects physical execution when public applicant and guarantor signatures are absent", async () => {
+    runtime = await startRealPilot();
+    const request = injectRequest(runtime.app);
+    const flow = await completeOnboarding(request, runtime);
+    const contract = await prepareContractWithoutSignatures(request, flow);
+    const execution = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${contract.contractId}/execution`,
+      {
+        headers: runtime.staff.get("INVENTORY_OFFICER")!.headers,
+        body: {
+          expectedVersion: contract.contractVersion,
+          applicantPersonId: runtime.applicationFixtures.applicantId,
+          guarantorPersonId: runtime.applicationFixtures.guarantorId,
+          staffWitnessId: runtime.staff.get("INVENTORY_OFFICER")!.staffUserId,
+          executionDate: "2026-08-03T12:00:00.000Z",
+          headOfficeId: "CONTROLLED-PILOT-HEAD-OFFICE",
+          headOfficeLocation: "Accra",
+          executedDocumentId: flow.applicantDocumentId,
+          executedDocumentHash: flow.applicantDocumentHash,
+          idempotencyKey: "pilot-signature-gate-execution-001",
+        },
+      },
+    );
+    expect(execution.status()).toBe(409);
+    await expect(body(execution)).resolves.toMatchObject({
+      code: "SIGNATURE_EVIDENCE_INCOMPLETE",
     });
   }, 60_000);
 
@@ -415,6 +1005,7 @@ async function inject(
   options: Record<string, unknown> = {},
 ): Promise<ApiResponse> {
   const headers = (options.headers ?? {}) as Record<string, string>;
+  const parsedUrl = new URL(url);
   const injectOptions: {
     method: "GET" | "POST" | "PATCH";
     url: string;
@@ -422,7 +1013,7 @@ async function inject(
     payload?: string;
   } = {
     method,
-    url: new URL(url).pathname,
+    url: `${parsedUrl.pathname}${parsedUrl.search}`,
     headers,
   };
   if (options.data !== undefined)

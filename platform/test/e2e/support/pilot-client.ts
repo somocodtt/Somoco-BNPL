@@ -24,6 +24,9 @@ export interface PilotFlow {
   runtime: PilotRuntime;
   applicationId: string;
   invitationToken: string;
+  applicantDocumentId: string;
+  applicantDocumentHash: string;
+  transferEvidenceDocumentId: string;
 }
 
 const invitationSecret = "controlled-pilot-invitation-secret-at-least-32-chars";
@@ -31,6 +34,12 @@ const pngBytes = Uint8Array.from(
   Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
     "base64",
+  ),
+);
+const executedContractBytes = Uint8Array.from(
+  Buffer.from(
+    "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<<>>\n%%EOF\n",
+    "utf8",
   ),
 );
 
@@ -143,6 +152,81 @@ export async function completeOnboarding(
     throw new Error(
       `DOCUMENT_COMPLETE_FAILED_${completed.status()}_${await completed.text()}`,
     );
+  const executedUpload = await call(
+    request,
+    runtime.baseUrl,
+    "post",
+    "/v1/customer/documents/uploads",
+    {
+      headers: applicant.headers,
+      body: {
+        documentType: "EXECUTED_CONTRACT",
+        mimeType: "application/pdf",
+        sizeBytes: executedContractBytes.byteLength,
+      },
+    },
+  );
+  assertStatus(executedUpload, 201);
+  const executedUploadBody = await body(executedUpload);
+  runtime.uploadDocument(
+    {
+      uploadUrl: String(executedUploadBody.uploadUrl),
+      requiredHeaders: (executedUploadBody.requiredHeaders ?? {}) as Readonly<
+        Record<string, string>
+      >,
+    },
+    executedContractBytes,
+    "application/pdf",
+  );
+  const executedCompleted = await call(
+    request,
+    runtime.baseUrl,
+    "post",
+    `/v1/customer/documents/${String(executedUploadBody.documentId)}/complete`,
+    { headers: applicant.headers, body: {} },
+  );
+  if (executedCompleted.status() !== 200)
+    throw new Error(
+      `EXECUTED_DOCUMENT_COMPLETE_FAILED_${executedCompleted.status()}_${await executedCompleted.text()}`,
+    );
+  const executedCompletedBody = await body(executedCompleted);
+  const transferUpload = await call(
+    request,
+    runtime.baseUrl,
+    "post",
+    "/v1/customer/documents/uploads",
+    {
+      headers: applicant.headers,
+      body: {
+        documentType: "TRANSFER_EVIDENCE",
+        mimeType: "application/pdf",
+        sizeBytes: executedContractBytes.byteLength,
+      },
+    },
+  );
+  assertStatus(transferUpload, 201);
+  const transferUploadBody = await body(transferUpload);
+  runtime.uploadDocument(
+    {
+      uploadUrl: String(transferUploadBody.uploadUrl),
+      requiredHeaders: (transferUploadBody.requiredHeaders ?? {}) as Readonly<
+        Record<string, string>
+      >,
+    },
+    executedContractBytes,
+    "application/pdf",
+  );
+  const transferCompleted = await call(
+    request,
+    runtime.baseUrl,
+    "post",
+    `/v1/customer/documents/${String(transferUploadBody.documentId)}/complete`,
+    { headers: applicant.headers, body: {} },
+  );
+  if (transferCompleted.status() !== 200)
+    throw new Error(
+      `TRANSFER_DOCUMENT_COMPLETE_FAILED_${transferCompleted.status()}_${await transferCompleted.text()}`,
+    );
   const created = await call(
     request,
     runtime.baseUrl,
@@ -155,7 +239,6 @@ export async function completeOnboarding(
       `APPLICATION_CREATE_FAILED_${created.status()}_${await created.text()}`,
     );
   const applicationId = String((await body(created)).id);
-  await runtime.attachProduct(applicationId);
   const saved = await call(
     request,
     runtime.baseUrl,
@@ -166,6 +249,7 @@ export async function completeOnboarding(
       body: {
         expectedVersion: 1,
         mutationId: "32000000-0000-4000-8000-000000000001",
+        productId: runtime.productId,
         vehicleModelId: runtime.applicationFixtures.vehicleModelId,
         profile: { occupation: "Courier", residentialArea: "Dansoman" },
       },
@@ -309,7 +393,14 @@ export async function completeOnboarding(
     },
   );
   assertStatus(submitted, 200);
-  return { runtime, applicationId, invitationToken };
+  return {
+    runtime,
+    applicationId,
+    invitationToken,
+    applicantDocumentId: String(executedUploadBody.documentId),
+    applicantDocumentHash: String(executedCompletedBody.sha256),
+    transferEvidenceDocumentId: String(transferUploadBody.documentId),
+  };
 }
 
 export async function approveAllStages(
@@ -361,8 +452,8 @@ export async function createAndAcceptOffer(
         depositMinor: "10000",
         frequency: "MONTHLY",
         tenureMonths: 6,
-        firstDueDate: "2026-08-15",
-        expiresAt: "2026-08-31T00:00:00.000Z",
+        firstDueDate: "2026-09-15",
+        expiresAt: "2026-09-30T00:00:00.000Z",
         idempotencyKey: "offer-create-001",
       },
     },
@@ -392,6 +483,121 @@ export async function createAndAcceptOffer(
   );
   assertStatus(accepted, 200);
   return body(accepted);
+}
+
+export async function prepareContractWithoutSignatures(
+  request: ApiRequest,
+  flow: PilotFlow,
+): Promise<{ contractId: string; contractVersion: number }> {
+  await approveAllStages(request, flow);
+  await createAndAcceptOffer(request, flow);
+  const depositEvent: CanonicalPaymentEvent = {
+    eventId: `controlled-pilot-signature-gate-deposit-${randomUUID()}`,
+    eventType: "PAYMENT_SUCCEEDED",
+    channel: "MOBILE_MONEY",
+    providerTransactionId: `controlled-pilot-signature-gate-provider-${randomUUID()}`,
+    payerPhoneE164: applicantPhone,
+    customerReference: flow.applicationId,
+    amount: { currency: "GHS", minorUnits: "10000" },
+    occurredAt: "2026-08-02T12:10:00.000Z",
+  };
+  const deposit = await postPayment(request, flow, depositEvent);
+  assertStatus(deposit, 202);
+  const suffix = randomUUID().slice(0, 8).toUpperCase();
+  const vehicle = await call(
+    request,
+    flow.runtime.baseUrl,
+    "post",
+    "/v1/staff/assets",
+    {
+      headers: flow.runtime.staff.get("INVENTORY_OFFICER")!.headers,
+      body: {
+        vehicleModelId: flow.runtime.applicationFixtures.vehicleModelId,
+        vin: `CONTROLLED-PILOT-SIG-VIN-${suffix}`,
+        chassisNumber: `CONTROLLED-PILOT-SIG-CHASSIS-${suffix}`,
+        engineMotorIdentifier: `CONTROLLED-PILOT-SIG-ENGINE-${suffix}`,
+        condition: { state: "NEW" },
+        accessories: ["helmet"],
+        idempotencyKey: `pilot-signature-gate-vehicle-${suffix}`,
+      },
+    },
+  );
+  assertStatus(vehicle, 201);
+  const vehicleBody = await body(vehicle);
+  const vehicleId = String(vehicleBody.id);
+  let vehicleVersion = Number(vehicleBody.version);
+  const registration = await call(
+    request,
+    flow.runtime.baseUrl,
+    "post",
+    `/v1/staff/assets/${vehicleId}/registration`,
+    {
+      headers: flow.runtime.staff.get("INVENTORY_OFFICER")!.headers,
+      body: {
+        registrationNumber: `GT-SIG-${suffix}`,
+        validFrom: "2026-08-01",
+        validTo: "2027-08-01",
+        expectedVehicleVersion: vehicleVersion,
+        idempotencyKey: `pilot-signature-gate-registration-${suffix}`,
+      },
+    },
+  );
+  assertStatus(registration, 200);
+  vehicleVersion = Number((await body(registration)).version);
+  const insurance = await call(
+    request,
+    flow.runtime.baseUrl,
+    "post",
+    `/v1/staff/assets/${vehicleId}/insurance`,
+    {
+      headers: flow.runtime.staff.get("INVENTORY_OFFICER")!.headers,
+      body: {
+        policyNumber: `CONTROLLED-PILOT-SIG-POLICY-${suffix}`,
+        provider: "Controlled Pilot Insurer",
+        validFrom: "2026-08-01",
+        validTo: "2027-08-01",
+        expectedVehicleVersion: vehicleVersion,
+        idempotencyKey: `pilot-signature-gate-insurance-${suffix}`,
+      },
+    },
+  );
+  assertStatus(insurance, 200);
+  vehicleVersion = Number((await body(insurance)).version);
+  const assignment = await call(
+    request,
+    flow.runtime.baseUrl,
+    "post",
+    `/v1/staff/applications/${flow.applicationId}/asset-assignment`,
+    {
+      headers: flow.runtime.staff.get("INVENTORY_OFFICER")!.headers,
+      body: {
+        vehicleUnitId: vehicleId,
+        expectedVehicleVersion: vehicleVersion,
+        idempotencyKey: `pilot-signature-gate-assignment-${suffix}`,
+      },
+    },
+  );
+  assertStatus(assignment, 200);
+  const assignmentBody = await body(assignment);
+  const generated = await call(
+    request,
+    flow.runtime.baseUrl,
+    "post",
+    `/v1/staff/applications/${flow.applicationId}/contracts`,
+    {
+      headers: flow.runtime.staff.get("INVENTORY_OFFICER")!.headers,
+      body: {
+        assignmentId: String(assignmentBody.id),
+        idempotencyKey: `pilot-signature-gate-contract-${suffix}`,
+      },
+    },
+  );
+  assertStatus(generated, 201);
+  const contract = await body(generated);
+  return {
+    contractId: String(contract.id),
+    contractVersion: Number(contract.version),
+  };
 }
 
 export async function postPayment(

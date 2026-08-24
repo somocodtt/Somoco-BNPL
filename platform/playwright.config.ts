@@ -12,10 +12,11 @@ export default defineConfig({
     command: "node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 4178",
     cwd: "apps/customer-web",
     url: "http://127.0.0.1:4178",
-    reuseExistingServer: false,
+    reuseExistingServer: true,
     timeout: 120_000,
   },
   use: {
     baseURL: "http://127.0.0.1:4178",
+    channel: "chrome",
   },
 });

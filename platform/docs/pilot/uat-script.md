@@ -8,17 +8,17 @@ This rehearsal proves the simulator-backed core and launch controls. It does not
 
 ## Automated evidence boundary
 
-The real-app API composition is exercised by `apps/api/test/task15-controlled-pilot.e2e.test.ts` against the disposable PostgreSQL service `postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`. It uses production `buildApp`, migrations, OTP/customer sessions, signed staff cookies, simulator ports, and public HTTP routes. The current automated run proves onboarding, independent guarantor consent/NIA/document evidence, six-stage approval attribution, offer acceptance, wrong-role/licence/asset/provider/recovery guards, and unmatched-payment replay quarantine.
+The real-app API composition is exercised by `apps/api/test/task15-controlled-pilot.e2e.test.ts` and the four adverse HTTP specs against the disposable PostgreSQL service `postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`. It uses production `buildApp`, repeat-safe migrations, OTP/customer sessions, signed staff cookies, simulator ports, worker dispatch code, and public HTTP routes. The current automated run proves applicant product selection, independent applicant/guarantor consent/NIA/document evidence and signatures, six-stage approval attribution, offer acceptance, simulator payment deposit reconciliation and replay-safe contract binding, declared `INVENTORY_OFFICER` VIN/registration/insurance assignment, physical execution and handover, activation, distinct arrears signals, repayment ledger/receipt replay, clean settlement with dual approvals, and ownership transfer. Durable assertions read back privacy signature evidence, audit actor/stage/idempotency history, payment/receipt/ledger rows, contract state, settlement approvals, and transfer state.
 
-The following remain `BLOCKED/PENDING` and must not be marked Pass from simulator output: customer/guarantor signature action (no public signature route is exposed), deposit reconciliation before contract generation (assignment requires a reconciled deposit while provider ledger posting requires an existing contract), physical execution/handover/activation, posted ledger and receipt replay, settlement, ownership transfer, worker restart/reclaim, browser execution when the Playwright browser runtime is unavailable, provider/hosting/restore rehearsal, and signed UAT. These are explicit release gates, not test-fixture substitutions.
+The disposable run also proves NIA outage recovery, OTP abuse rejection, malware rejection, wrong-role/licence guards, unmatched payment quarantine, payment simulator outage/recovery, unauthorized tracker access, explicit automatic recovery/immobilization denial, outstanding-balance transfer denial, and a real outbox claim/restart/reclaim (`ABANDONED` then `PUBLISHED`) with queue age measured independently from request latency. The following remain `PENDING` and must not be marked Pass from simulator output: real provider contract/sandbox evidence, production hosting/TLS/capacity, backup/restore integrity, penetration/security sign-off, legal/privacy approval, and signed business UAT. These are release gates, not test-fixture substitutions.
 
 ## Entry checks
 
 Record the exact commit and commands before starting:
 
 - Commit: ____________________
-- `pnpm exec playwright test`: ____________________
-- `pnpm test:load`: ____________________
+- `node node_modules/@playwright/test/cli.js test --config playwright.config.ts`: ____________________
+- `node node_modules/tsx/dist/cli.mjs test/load/application-flow.ts`: ____________________
 - Pilot-gate verifier result: ____________________
 - Disposable database/service identifiers: ____________________
 - Evidence folder and hash manifest: ____________________
@@ -48,15 +48,16 @@ For every row, attach request/response evidence with secrets and personal data r
 
 Record the response code, sanitized problem code, and evidence hash for each:
 
-1. NIA outage is a bounded unavailable response and does not mark identity verified.
+1. NIA outage is a bounded unavailable response and does not mark identity verified; recovery succeeds through the simulator control.
 2. OTP request/verification abuse is rate-limited and locked without revealing secrets.
 3. Malware document is quarantined and cannot satisfy completeness.
-4. Wrong-role approval and unlicensed tenure are denied.
-5. Replayed and unmatched payments preserve ledger, receipt, and reconciliation invariants; cash is rejected.
+4. Wrong-role approval and licence-disallowed tenure are denied.
+5. Replayed, unmatched, and simulator-outage payments preserve transaction, ledger, receipt, and reconciliation invariants; cash is rejected.
 6. SAP synchronization remains disabled pending discovery; no production endpoint is called.
 7. Three-consecutive and three-total unpaid signals remain separate.
 8. Unauthorized tracker access, automatic recovery, and automatic immobilization are denied.
 9. Ownership transfer with an outstanding balance or unclean reconciliation is denied.
+10. Applicant and guarantor signature actions are independently authenticated, offer-bound, durable, and replay-safe.
 
 Adverse evidence references: ____________________________________________________________
 
