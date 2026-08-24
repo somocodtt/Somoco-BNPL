@@ -190,3 +190,64 @@ Result: 1 passed — `test/e2e/pilot-happy-path.spec.ts` served the checked-out 
 ```
 
 Limitations remain unchanged and explicit: no real provider, production database, hosting/capacity rehearsal, real backup restore, penetration/security assessment, or staff-signed UAT was used. The load output is a disposable PostgreSQL/simulator measurement and does not claim production capacity or launch readiness.
+
+## Fix round 4 — runtime receipt binding and nested provider outage recovery
+
+Scope: correct the two independent production findings from the Task 15 re-review and extend the customer receipt regression. Only the disposable PostgreSQL service (`postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test`) was used for database-backed checks. No dependencies were installed, no database suites were run concurrently, and no production target or real provider was contacted.
+
+### TDD RED
+
+```text
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t "allows the runtime role to bind only an unbound receipt contract"
+Result: 1 failed, 38 skipped. Expected has_column_privilege('somo_runtime', 'payment_receipt', 'contract_id', 'UPDATE') to be true; received false. Table UPDATE, receipt-number UPDATE, and DELETE were already false. This reproduced that migration 0031 had made the trigger transition legal but had not restored a runtime capability.
+
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/payments.integration.test.ts -t "preserves a nested production transport outage and posts recovery once"
+Result: 1 failed, 37 skipped. The public payment webhook received a production-bound connector error `TypeError('fetch failed', { cause: { code: 'ECONNRESET' } })`; expected HTTP 503, received HTTP 401. This reproduced top-level-only outage detection.
+```
+
+### GREEN
+
+Migration `0032_runtime_receipt_contract_binding` first revokes table-wide UPDATE/DELETE and then grants only `UPDATE (contract_id)` to `somo_runtime`. `REVOKE` and column-level `GRANT` are repeat-safe and do not rewrite populated receipt rows. The existing `payment_receipt_append_only` trigger still permits only the first null-to-contract binding and rejects all other updates.
+
+`isPaymentProviderUnavailable` now walks at most eight Error/object `cause` links, records seen objects to terminate cycles, and protects property reads. It recognizes an unavailable code on each visited error/object but leaves ordinary signature failures on the existing 401 path.
+
+```text
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t "allows the runtime role to bind only an unbound receipt contract"
+Result: 1 passed, 38 skipped. An actual `SET LOCAL ROLE somo_runtime` transaction bound an unbound receipt's contract_id. Runtime receipt-number UPDATE and DELETE were rejected with 42501; attempting to clear the now-bound contract_id was rejected by the append-only trigger with 55000.
+
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/payments.integration.test.ts -t "preserves a nested production transport outage and posts recovery once"
+Result: 1 passed, 37 skipped. The public webhook returned 503 PAYMENT_PROVIDER_UNAVAILABLE, durably stored the exact raw-body base64 before posting money, then recovery plus replay resulted in exactly one payment transaction, receipt, credit ledger entry, and processed inbox record.
+
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts -t "completes customer onboarding, durable approvals, and an accepted offer"
+Result: 1 passed, 8 skipped. After contract generation binds the reconciled deposit receipt, the authenticated applicant retrieves it through both GET /v1/customer/receipts and GET /v1/customer/receipts/:receiptId; the public response matches the receipt id, payment transaction id, provider transaction id, amount, and POSTED state.
+```
+
+### Final focused verification
+
+```text
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t "applies the complete migration journal once and is repeat-safe"
+Result: 1 passed, 38 skipped. The journal applies all 32 migrations, and two repeat migrations add no further migration rows.
+
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts apps/api/test/payments.integration.test.ts -t "authenticates raw malformed bytes before JSON parsing"
+Result: 1 passed, 37 skipped. A genuine invalid signature remains HTTP 401 INVALID_SIGNATURE.
+
+Command: $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue; node node_modules/vitest/vitest.mjs run --config apps/api/vitest.config.ts test/e2e/payment-replay.spec.ts
+Result: Test Files 1 passed; Tests 2 passed.
+
+Command: node node_modules/eslint/bin/eslint.js apps/api/src/modules/payments/webhook-service.ts apps/api/test/payments.integration.test.ts apps/api/test/task15-controlled-pilot.e2e.test.ts packages/db/src/db.integration.test.ts
+Result: pass (exit 0).
+
+Command: node node_modules/typescript/bin/tsc --noEmit -p apps/api/tsconfig.json
+Result: pass (exit 0).
+
+Command: node node_modules/typescript/bin/tsc --noEmit -p packages/db/tsconfig.json
+Result: pass (exit 0).
+
+Command: node node_modules/prettier/bin/prettier.cjs --check apps/api/src/modules/payments/webhook-service.ts apps/api/test/payments.integration.test.ts apps/api/test/task15-controlled-pilot.e2e.test.ts packages/db/src/db.integration.test.ts packages/db/drizzle/meta/_journal.json
+Result: All matched files use Prettier code style.
+
+Command: git diff --check
+Result: pass; only the worktree's existing LF/CRLF normalization warnings were emitted.
+```
+
+The earlier external release gates remain unchanged: this is not evidence of a real provider, production runtime connection, hosting/capacity rehearsal, backup/restore validation, penetration/security assessment, legal/privacy approval, or staff-signed UAT. Those gates remain pending and the pilot remains blocked until their separately signed evidence exists.

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { sql } from "drizzle-orm";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   applicationBuilder,
@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(31);
+    expect(before.rows[0]?.count).toBe(32);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -322,6 +322,76 @@ describe("PostgreSQL persistence", () => {
       ledger_update: false,
       ledger_delete: false,
     });
+  });
+
+  it("allows the runtime role to bind only an unbound receipt contract", async () => {
+    const graph = await insertFinancialGraph(db);
+    const receiptId = randomUUID();
+    await db.execute(sql`
+      insert into payment_receipt
+        (id, payment_transaction_id, contract_id, receipt_number,
+         payer_reference, amount_minor_units, currency, issued_at, secure_path)
+      values
+        (${receiptId}::uuid, ${graph.paymentTransactionId}::uuid, null,
+         ${`SOMO-${receiptId.slice(0, 12).toUpperCase()}`}, '+233201234567',
+         10000, 'GHS', now(), ${`/receipts/${receiptId}`})
+    `);
+
+    const privileges = await db.execute<{
+      contract_update: boolean;
+      receipt_number_update: boolean;
+      table_update: boolean;
+      receipt_delete: boolean;
+    }>(sql`
+      select
+        has_column_privilege('somo_runtime', 'payment_receipt', 'contract_id', 'UPDATE') as contract_update,
+        has_column_privilege('somo_runtime', 'payment_receipt', 'receipt_number', 'UPDATE') as receipt_number_update,
+        has_table_privilege('somo_runtime', 'payment_receipt', 'UPDATE') as table_update,
+        has_table_privilege('somo_runtime', 'payment_receipt', 'DELETE') as receipt_delete
+    `);
+    expect(privileges.rows[0]).toEqual({
+      contract_update: true,
+      receipt_number_update: false,
+      table_update: false,
+      receipt_delete: false,
+    });
+
+    await runAsRuntimeRole((client) =>
+      client.query(
+        `update payment_receipt
+            set contract_id = $1::uuid
+          where id = $2::uuid`,
+        [graph.contractId, receiptId],
+      ),
+    );
+
+    await expect(
+      runAsRuntimeRole((client) =>
+        client.query(
+          `update payment_receipt
+              set receipt_number = 'TAMPERED'
+            where id = $1::uuid`,
+          [receiptId],
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "42501" });
+    await expect(
+      runAsRuntimeRole((client) =>
+        client.query(`delete from payment_receipt where id = $1::uuid`, [
+          receiptId,
+        ]),
+      ),
+    ).rejects.toMatchObject({ code: "42501" });
+    await expect(
+      runAsRuntimeRole((client) =>
+        client.query(
+          `update payment_receipt
+              set contract_id = null
+            where id = $1::uuid`,
+          [receiptId],
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "55000" });
   });
 
   it("keeps settlement evidence append-only and limits runtime privileges", async () => {
@@ -2058,6 +2128,26 @@ async function countRows(db: InternalDatabase, table: string): Promise<number> {
     `select count(*)::int as count from ${table}`,
   );
   return Number(result.rows[0]?.count);
+}
+
+async function runAsRuntimeRole<T>(
+  operation: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const pool = new Pool({ connectionString: databaseUrl, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query("set local role somo_runtime");
+    const result = await operation(client);
+    await client.query("commit");
+    return result;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+    await pool.end();
+  }
 }
 
 const migrationsFolder = fileURLToPath(new URL("../drizzle/", import.meta.url));

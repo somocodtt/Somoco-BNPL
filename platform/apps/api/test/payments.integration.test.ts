@@ -35,7 +35,10 @@ import type {
   PaymentWebhookVerifier,
   SmsPort,
 } from "@somo/integrations";
-import { otpDerivationKeyId } from "@somo/integrations";
+import {
+  createProductionConnectorBoundary,
+  otpDerivationKeyId,
+} from "@somo/integrations";
 import { sql } from "../../../packages/db/node_modules/drizzle-orm/index.js";
 import { buildApp } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
@@ -218,6 +221,144 @@ describe("Somoco payment boundary", () => {
         )
       ).rows[0]?.count,
     ).toBe(0);
+  });
+
+  it("preserves a nested production transport outage and posts recovery once", async () => {
+    const graph = await insertContractGraph(database);
+    const outageEvent: CanonicalPaymentEvent = {
+      ...event,
+      eventId: "evt-nested-production-outage",
+      providerTransactionId: "txn-nested-production-outage",
+      customerReference: graph.reference,
+    };
+    let paymentAvailable = false;
+    const verifier = createProductionConnectorBoundary().register({
+      kind: "PAYMENTS",
+      provenance: {
+        packageName: "@somo-external/somoco-payments",
+        packageVersion: "1.0.0",
+        connectorId: "somoco-payments",
+      },
+      adapter: {
+        async verify() {
+          if (!paymentAvailable) {
+            throw new TypeError("fetch failed", {
+              cause: { code: "ECONNRESET" },
+            });
+          }
+          return outageEvent;
+        },
+      },
+    });
+    const sms: SmsPort = {
+      send: async () => ({
+        providerReference: randomUUID(),
+        acceptedAt: new Date().toISOString(),
+      }),
+    };
+    const app = await buildApp({
+      config,
+      database,
+      logger: false,
+      payments: {
+        verifier,
+        allocationPolicy: policy(),
+        sms,
+        accountLinkBaseUrl: "https://customer.somo.example/account",
+        ussdInstructions: "Dial *123# and select Somoco Payments.",
+      },
+    });
+    const rawBody = JSON.stringify(outageEvent);
+    const request = {
+      method: "POST" as const,
+      url: "/v1/integrations/payments/somoco",
+      headers: {
+        "content-type": "application/json",
+        "x-payment-signature": "nested-outage-signature",
+        "x-payment-timestamp": outageEvent.occurredAt,
+      },
+      payload: rawBody,
+    };
+
+    try {
+      const outage = await app.inject(request);
+      expect(outage.statusCode).toBe(503);
+      expect(outage.json()).toMatchObject({
+        code: "PAYMENT_PROVIDER_UNAVAILABLE",
+      });
+      const preserved = await getInternalDatabase(database).execute<{
+        payment_count: number;
+        processed_count: number;
+        raw_body_base64: string | null;
+      }>(sql`
+        select
+          (select count(*)::int
+             from payment_transaction
+            where provider_transaction_id = ${outageEvent.providerTransactionId}) as payment_count,
+          (select count(*)::int
+             from inbox_message
+            where provider = 'SOMOCO_PAYMENTS'
+              and provider_event_id = ${outageEvent.eventId}
+              and processed_at is not null) as processed_count,
+          (select payload->>'rawBodyBase64'
+             from inbox_message
+            where provider = 'SOMOCO_PAYMENTS'
+              and provider_event_id = ${outageEvent.eventId}) as raw_body_base64
+      `);
+      expect(preserved.rows[0]).toEqual({
+        payment_count: 0,
+        processed_count: 0,
+        raw_body_base64: Buffer.from(rawBody).toString("base64"),
+      });
+
+      paymentAvailable = true;
+      const recovered = await app.inject(request);
+      expect(recovered.statusCode).toBe(202);
+      expect(recovered.json()).toMatchObject({
+        accepted: true,
+        duplicate: false,
+        outcome: "POSTED",
+      });
+      const replay = await app.inject(request);
+      expect(replay.statusCode).toBe(202);
+      expect(replay.json()).toMatchObject({
+        accepted: true,
+        outcome: "POSTED",
+      });
+      const recoveredEvidence = await getInternalDatabase(database).execute<{
+        payment_count: number;
+        receipt_count: number;
+        credit_ledger_count: number;
+        processed_count: number;
+      }>(sql`
+        select
+          (select count(*)::int
+             from payment_transaction
+            where provider_transaction_id = ${outageEvent.providerTransactionId}) as payment_count,
+          (select count(*)::int
+             from payment_receipt r
+             join payment_transaction p on p.id = r.payment_transaction_id
+            where p.provider_transaction_id = ${outageEvent.providerTransactionId}) as receipt_count,
+          (select count(*)::int
+             from ledger_entry l
+             join payment_transaction p on p.id = l.payment_transaction_id
+            where p.provider_transaction_id = ${outageEvent.providerTransactionId}
+              and l.direction = 'CREDIT') as credit_ledger_count,
+          (select count(*)::int
+             from inbox_message
+            where provider = 'SOMOCO_PAYMENTS'
+              and provider_event_id = ${outageEvent.eventId}
+              and processed_at is not null) as processed_count
+      `);
+      expect(recoveredEvidence.rows[0]).toEqual({
+        payment_count: 1,
+        receipt_count: 1,
+        credit_ledger_count: 1,
+        processed_count: 1,
+      });
+    } finally {
+      await app.close();
+    }
   });
 
   it("quarantines a duplicate provider transaction without a second posting", async () => {

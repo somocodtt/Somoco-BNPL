@@ -192,12 +192,19 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     };
     const deposit = await postPayment(request, flow, depositEvent);
     expect(deposit.status()).toBe(202);
-    await expect(body(deposit)).resolves.toMatchObject({
+    const depositAcknowledgement = await body(deposit);
+    expect(depositAcknowledgement).toMatchObject({
       accepted: true,
       duplicate: false,
       outcome: "POSTED",
       depositReconciled: true,
     });
+    const receiptId = String(depositAcknowledgement.receiptId);
+    const paymentTransactionId = String(
+      depositAcknowledgement.paymentTransactionId,
+    );
+    expect(receiptId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(paymentTransactionId).toMatch(/^[0-9a-f-]{36}$/i);
     const depositEvidence = await queryTestSql<{
       payment_count: string;
       receipt_count: string;
@@ -345,6 +352,36 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       contract_id: contractId,
       receipt_contract_id: contractId,
       deposit_ledger_count: "1",
+    });
+
+    const customerReceiptList = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      "/v1/customer/receipts",
+      { headers: runtime.customer.applicant.headers },
+    );
+    expect(customerReceiptList.status()).toBe(200);
+    await expect(customerReceiptList.json()).resolves.toEqual([
+      expect.objectContaining({
+        id: receiptId,
+        paymentTransactionId,
+        amountMinorUnits: "10000",
+      }),
+    ]);
+    const customerReceipt = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      `/v1/customer/receipts/${receiptId}`,
+      { headers: runtime.customer.applicant.headers },
+    );
+    expect(customerReceipt.status()).toBe(200);
+    await expect(body(customerReceipt)).resolves.toMatchObject({
+      id: receiptId,
+      paymentTransactionId,
+      providerTransactionId: depositEvent.providerTransactionId,
+      status: "POSTED",
     });
 
     const execution = await call(

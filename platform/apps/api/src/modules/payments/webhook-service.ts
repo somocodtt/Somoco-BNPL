@@ -386,22 +386,59 @@ async function preserveUnverifiedPayment(
   });
 }
 
+const paymentProviderUnavailableCodes = new Set([
+  "PAYMENT_PROVIDER_UNAVAILABLE",
+  "SIMULATOR_PROVIDER_UNAVAILABLE",
+  "PROVIDER_UNAVAILABLE",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EAI_AGAIN",
+]);
+const maximumPaymentProviderCauseDepth = 8;
+
 function isPaymentProviderUnavailable(cause: unknown): boolean {
-  const values = [
-    cause instanceof Error ? cause.message : String(cause),
-    ...(isRecord(cause) && typeof cause.code === "string" ? [cause.code] : []),
-  ];
-  return values.some((code) =>
-    [
-      "PAYMENT_PROVIDER_UNAVAILABLE",
-      "SIMULATOR_PROVIDER_UNAVAILABLE",
-      "PROVIDER_UNAVAILABLE",
-      "ETIMEDOUT",
-      "ECONNRESET",
-      "ECONNREFUSED",
-      "EAI_AGAIN",
-    ].includes(code),
+  let current: unknown = cause;
+  const visited = new Set<object>();
+  for (let depth = 0; depth < maximumPaymentProviderCauseDepth; depth += 1) {
+    const code = paymentProviderFailureCode(current);
+    if (code !== null && paymentProviderUnavailableCodes.has(code)) {
+      return true;
+    }
+    if (!isRecord(current) || visited.has(current)) return false;
+    visited.add(current);
+    current = readCause(current);
+    if (current === undefined) return false;
+  }
+  return false;
+}
+
+function paymentProviderFailureCode(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (!isRecord(value)) return null;
+  return (
+    readStringProperty(value, "code") ?? readStringProperty(value, "message")
   );
+}
+
+function readCause(value: Record<string, unknown>): unknown {
+  try {
+    return value.cause;
+  } catch {
+    return undefined;
+  }
+}
+
+function readStringProperty(
+  value: Record<string, unknown>,
+  property: string,
+): string | null {
+  try {
+    const candidate = value[property];
+    return typeof candidate === "string" ? candidate : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseUntrustedRecord(value: string): Record<string, unknown> | null {
