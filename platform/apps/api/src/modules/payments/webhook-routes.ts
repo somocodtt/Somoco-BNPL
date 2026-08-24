@@ -297,7 +297,7 @@ function assertFinanceRead(
 ): void {
   if (
     !actor.roles.some((role) =>
-      ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR", "MD"].includes(role),
+      ["FINANCE_OFFICER", "CFO", "COMPLIANCE_OFFICER", "MD"].includes(role),
     )
   )
     throw new AppError(403, "FORBIDDEN", "Finance access is required.");

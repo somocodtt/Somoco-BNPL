@@ -225,6 +225,13 @@
       "when": 1787534400000,
       "tag": "0032_runtime_receipt_contract_binding",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1787565600000,
+      "tag": "0033_final_controlled_pilot_hardening",
+      "breakpoints": true
     }
   ]
 }

@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { AppError } from "../../plugins/errors.js";
 
+export {
+  createPostgresPrivacyService,
+  isDurablePrivacyService,
+} from "./postgres-service.js";
+
 export type PrivacySubjectType = "APPLICANT" | "GUARANTOR";
 export type PrivacyRequestType = "ACCESS" | "CORRECTION" | "RESTRICTION";
 export type PrivacyRequestStatus =
@@ -151,13 +156,16 @@ export interface PrivacyServiceOptions {
   subjectIds?: readonly string[];
 }
 
-const complianceRoles = new Set([
-  "COMPLIANCE",
-  "COMPLIANCE_OFFICER",
-  "COMPLIANCE_AUDITOR",
-  "DPO",
-  "SYSTEM_ADMIN",
-]);
+const testOnlyInMemoryPrivacyServices = new WeakSet<object>();
+
+export function isTestOnlyInMemoryPrivacyService(
+  service: PrivacyService,
+): boolean {
+  return testOnlyInMemoryPrivacyServices.has(service);
+}
+
+const complianceRoles = new Set(["COMPLIANCE_OFFICER", "DPO"]);
+const privacyReadRoles = new Set([...complianceRoles, "COMPLIANCE_AUDITOR"]);
 
 const correctionFieldPattern = /^[a-z][A-Za-z0-9_]{0,63}$/;
 const immutableFieldPattern =
@@ -165,6 +173,7 @@ const immutableFieldPattern =
 const sensitiveKeyPattern =
   /(?:otp|password|secret|token|authorization|cookie|session|mfa|code|private.?key)/i;
 
+/** Test-only Map implementation. Production composition rejects this capability. */
 export function createPrivacyService(
   options: PrivacyServiceOptions = {},
 ): PrivacyService {
@@ -178,7 +187,7 @@ export function createPrivacyService(
   for (const subjectId of options.subjectIds ?? [])
     ensureSubject(subjects, subjectId, now().toISOString());
 
-  return {
+  const service: PrivacyService = {
     async openRequest(input) {
       assertSubjectId(input.subjectId);
       if (!isRequestType(input.requestType))
@@ -202,7 +211,7 @@ export function createPrivacyService(
 
     async listRequests(input = {}) {
       if (input.actor !== undefined || input.subjectId === undefined) {
-        assertComplianceActor(input.actor);
+        assertPrivacyReadActor(input.actor);
       }
       return [...requests.values()].filter(
         (request) =>
@@ -418,6 +427,8 @@ export function createPrivacyService(
       };
     },
   };
+  testOnlyInMemoryPrivacyServices.add(service);
+  return service;
 }
 
 function ensureSubject(
@@ -472,6 +483,15 @@ function assertComplianceActor(actor: PrivacyActor | undefined): void {
     actor === undefined ||
     !actor.id.trim() ||
     !complianceRoles.has(actor.role?.toUpperCase() ?? "")
+  )
+    throw privacyError("PRIVACY_COMPLIANCE_AUTHORIZATION_REQUIRED", 403);
+}
+
+function assertPrivacyReadActor(actor: PrivacyActor | undefined): void {
+  if (
+    actor === undefined ||
+    !actor.id.trim() ||
+    !privacyReadRoles.has(actor.role?.toUpperCase() ?? "")
   )
     throw privacyError("PRIVACY_COMPLIANCE_AUTHORIZATION_REQUIRED", 403);
 }

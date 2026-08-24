@@ -70,12 +70,13 @@ export interface ContractRecord extends Record<string, unknown> {
     | "EXECUTED"
     | "ACTIVE"
     | "SETTLED"
+    | "TRANSFERRED"
     | "RECOVERY"
     | "TERMINATED";
   version: number;
   canonicalHash: string;
   previewReference: string;
-  ownershipHolder: "SOMOCO";
+  ownershipHolder: "SOMOCO" | "CUSTOMER";
   outstandingBalanceMinor: string;
   generatedAt: string;
   activatedAt: string | null;
@@ -87,6 +88,9 @@ export interface CustomerContractView {
   previewAvailable: boolean;
   executed: boolean;
   assignedVehicleAvailable: boolean;
+  ownershipHolder: "SOMOCO" | "CUSTOMER";
+  vehicleStatus: string;
+  registrationOwner: "SOMOCO" | "CUSTOMER" | null;
   registrationNumber: string | null;
   registrationValidTo: string | null;
   insuranceValidTo: string | null;
@@ -833,6 +837,13 @@ export function createContractService(options: {
           contract.status === "ACTIVE",
         executed: execution !== null,
         assignedVehicleAvailable: vehicle?.handed_over === true,
+        ownershipHolder: contract.ownership_holder as "SOMOCO" | "CUSTOMER",
+        vehicleStatus: vehicle?.vehicle_status ?? "UNKNOWN",
+        registrationOwner:
+          vehicle?.registration_owner === "SOMOCO" ||
+          vehicle?.registration_owner === "CUSTOMER"
+            ? vehicle.registration_owner
+            : null,
         registrationNumber:
           vehicle?.handed_over === true ? vehicle.registration_number : null,
         registrationValidTo:
@@ -903,7 +914,7 @@ function serializeContract(row: AssetContractRow): ContractRecord {
     version: row.version,
     canonicalHash: row.canonical_hash,
     previewReference: row.preview_reference,
-    ownershipHolder: "SOMOCO",
+    ownershipHolder: row.ownership_holder as "SOMOCO" | "CUSTOMER",
     outstandingBalanceMinor: BigInt(
       row.outstanding_balance_minor_units,
     ).toString(),

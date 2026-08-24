@@ -39,7 +39,7 @@ const productionConfig: AppConfig = {
   paymentAdapter: "approved-payment",
   objectStoragePublic: false,
   encryptionKeyRef: "secret/somo/prod/document-encryption",
-  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
+  backupLastVerifiedAt: new Date(Date.now() - 60_000).toISOString(),
 };
 
 describe("Task 14 adversarial security controls", () => {
@@ -96,7 +96,9 @@ describe("Task 14 adversarial security controls", () => {
       code: "PRIVACY_COMPLIANCE_AUTHORIZATION_REQUIRED",
     });
     await expect(
-      listRequests({ actor: { id: "compliance-1", role: "COMPLIANCE" } }),
+      listRequests({
+        actor: { id: "compliance-1", role: "COMPLIANCE_AUDITOR" },
+      }),
     ).resolves.toHaveLength(1);
   });
 
@@ -149,7 +151,7 @@ describe("Task 14 adversarial security controls", () => {
       service.approveRetentionPolicy({
         version: "retention-v1",
         retentionDays: 30,
-        actor: { id: "another-compliance", role: "COMPLIANCE" },
+        actor: { id: "another-compliance", role: "DPO" },
       }),
     ).resolves.toEqual(first);
   });

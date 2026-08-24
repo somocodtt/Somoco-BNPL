@@ -158,9 +158,7 @@ function MigrationPanel({
     Record<string, readonly string[]>
   >({});
   const canVerify = roles.includes("VERIFICATION_OFFICER");
-  const canImport = roles.some((role) =>
-    ["SYSTEM_ADMIN", "MIGRATION_IMPORTER"].includes(role),
-  );
+  const canImport = roles.some((role) => ["MIGRATION_IMPORTER"].includes(role));
   const canApprove = roles.some((role) =>
     ["CFO", "FINANCE_OFFICER"].includes(role),
   );

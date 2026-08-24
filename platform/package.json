@@ -11,7 +11,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "e2e": "playwright test",
-    "test:pilot": "vitest run --config apps/api/vitest.config.ts apps/api/test/task15-controlled-pilot.e2e.test.ts test/e2e/information-request.spec.ts test/e2e/payment-replay.spec.ts test/e2e/recovery-control.spec.ts test/e2e/ownership-transfer.spec.ts",
+    "test:pilot": "vitest run --config vitest.pilot.config.mts",
     "test:load": "tsx test/load/application-flow.ts",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "verify:workspace": "node scripts/verify-workspace.mjs",

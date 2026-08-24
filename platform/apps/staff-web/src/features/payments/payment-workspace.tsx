@@ -21,11 +21,11 @@ export function PaymentWorkspace({
   const [notice, setNotice] = useState("");
   const canMakeAdjustment = roles.includes("FINANCE_OFFICER");
   const canCheckAdjustment =
-    roles.includes("CFO") || roles.includes("COMPLIANCE_AUDITOR");
+    roles.includes("CFO") || roles.includes("COMPLIANCE_OFFICER");
   const canResolveReconciliation =
     roles.includes("FINANCE_OFFICER") ||
     roles.includes("CFO") ||
-    roles.includes("COMPLIANCE_AUDITOR");
+    roles.includes("COMPLIANCE_OFFICER");
   const canCompareSettlement = canResolveReconciliation;
 
   useEffect(() => {

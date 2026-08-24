@@ -179,6 +179,7 @@ export const paymentTransaction = pgTable(
     contractId: uuid("contract_id").references(() => contract.id, {
       onDelete: "restrict",
     }),
+    originalPaymentTransactionId: uuid("original_payment_transaction_id"),
     payerReference: text("payer_reference").notNull(),
     currency: text("currency").notNull().default("GHS"),
     amountMinorUnits: bigint("amount_minor_units", {
@@ -209,6 +210,9 @@ export const paymentTransaction = pgTable(
     uniqueIndex("payment_provider_event_unique")
       .on(table.provider, table.eventId)
       .where(sql`${table.eventId} is not null`),
+    uniqueIndex("payment_original_compensation_unique")
+      .on(table.originalPaymentTransactionId)
+      .where(sql`${table.originalPaymentTransactionId} is not null`),
     index("payment_contract_idx").on(table.contractId),
     check("payment_currency_ghs", sql`${table.currency} = 'GHS'`),
     check("payment_amount_nonnegative", sql`${table.amountMinorUnits} >= 0`),
@@ -217,6 +221,11 @@ export const paymentTransaction = pgTable(
       "payment_event_type_allowed",
       sql`${table.eventType} is null or ${table.eventType} in ('PAYMENT_SUCCEEDED', 'PAYMENT_REVERSED', 'PAYMENT_REFUNDED')`,
     ),
+    foreignKey({
+      columns: [table.originalPaymentTransactionId],
+      foreignColumns: [table.id],
+      name: "payment_original_transaction_fk",
+    }).onDelete("restrict"),
   ],
 );
 
@@ -252,6 +261,11 @@ export const ledgerEntry = pgTable(
   },
   (table) => [
     uniqueIndex("ledger_posting_key_unique").on(table.postingKey),
+    uniqueIndex("ledger_one_compensation_per_original_unique")
+      .on(table.reversesEntryId)
+      .where(
+        sql`${table.reversesEntryId} is not null and ${table.metadata}->>'compensationLifecycle' = 'ONE_PER_ORIGINAL_V1'`,
+      ),
     index("ledger_contract_occurred_idx").on(
       table.contractId,
       table.occurredAt,
@@ -296,6 +310,9 @@ export const reconciliationCase = pgTable(
       () => paymentTransaction.id,
       { onDelete: "restrict" },
     ),
+    contractId: uuid("contract_id").references(() => contract.id, {
+      onDelete: "restrict",
+    }),
     status: text("status").notNull().default("OPEN"),
     reason: text("reason").notNull(),
     dedupeKey: text("dedupe_key"),
@@ -398,7 +415,7 @@ export const paymentAdjustment = pgTable(
     ),
     check(
       "payment_adjustment_status_allowed",
-      sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED')`,
+      sql`${table.status} in ('PENDING', 'APPROVED', 'REJECTED', 'QUARANTINED')`,
     ),
     check(
       "payment_adjustment_checker_separate",

@@ -14,14 +14,8 @@ import {
   type Database,
 } from "@somo/db";
 import argon2 from "argon2";
-import {
-  createClamAvMalwareScanner,
-  createProductionConnectorBoundary,
-  createS3ObjectStorage,
-  otpDerivationKeyId,
-} from "@somo/integrations";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildApp, type BuildAppOptions } from "../src/app.js";
+import { buildApp } from "../src/app.js";
 import type { FastifyInstance } from "fastify";
 import { loadConfig, validateConfig, type AppConfig } from "../src/config.js";
 import {
@@ -61,7 +55,7 @@ const testConfig: AppConfig = {
   paymentAdapter: "approved-payment",
   objectStoragePublic: false,
   encryptionKeyRef: "secret/somo/test/document-encryption",
-  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
+  backupLastVerifiedAt: new Date(Date.now() - 60_000).toISOString(),
 };
 
 const deterministicMfaVerifier = {
@@ -70,85 +64,6 @@ const deterministicMfaVerifier = {
     return input.assertion === "valid-test-assertion";
   },
 };
-
-const productionConnectorBoundary = createProductionConnectorBoundary();
-const productionDeliverySecret =
-  "production-safe-test-delivery-secret-32-characters";
-const productionIdentityTestDependencies = {
-  sms: productionConnectorBoundary.register({
-    kind: "SMS",
-    provenance: {
-      packageName: "@somo-external/synthetic-sms",
-      packageVersion: "1.0.0",
-      connectorId: "synthetic-sms",
-    },
-    adapter: {
-      async send() {
-        return {
-          providerReference: "production-safe-sms-test-reference",
-          acceptedAt: "2026-08-14T12:00:00.000Z",
-        };
-      },
-    },
-  }),
-  otpPolicy: {
-    ttlMs: 120_000,
-    attemptLimit: 3,
-    resendCooldownMs: 30_000,
-    codeLength: 6,
-    hashSecret: "production-safe-test-otp-secret-32-characters",
-    deliveryDerivationSecret: productionDeliverySecret,
-    deliveryDerivationKeyId: otpDerivationKeyId(productionDeliverySecret),
-    sessionTtlMs: 3_600_000,
-  },
-  consentCatalog: {
-    documents: [
-      {
-        purpose: "NIA_IDENTITY_VERIFICATION",
-        currentVersion: "nia-consent-v1",
-      },
-    ],
-  },
-  nia: productionConnectorBoundary.register({
-    kind: "NIA",
-    provenance: {
-      packageName: "@somo-external/synthetic-nia",
-      packageVersion: "1.0.0",
-      connectorId: "synthetic-nia",
-    },
-    adapter: {
-      async verify() {
-        return {
-          providerReference: "production-safe-nia-test-reference",
-          decision: "REVIEW" as const,
-          checkedAt: "2026-08-14T12:00:00.000Z",
-        };
-      },
-    },
-  }),
-  documents: {
-    storage: createS3ObjectStorage({
-      endpoint: "https://storage.test.invalid",
-      region: "test-1",
-      bucket: "synthetic-production-test",
-      accessKeyId: "synthetic-access-key",
-      secretAccessKey: "synthetic-secret-key-at-least-32-characters",
-    }),
-    malwareScanner: createClamAvMalwareScanner({
-      host: "127.0.0.1",
-      port: 3310,
-      timeoutMs: 1_000,
-      maxBytes: 1_024,
-      maxResponseBytes: 1_024,
-    }),
-    policy: {
-      allowedMimeTypes: ["application/pdf"],
-      maxBytes: 1_024,
-      uploadTtlMs: 60_000,
-      downloadTtlMs: 30_000,
-    },
-  },
-} satisfies NonNullable<BuildAppOptions["identity"]>;
 
 let database: Database;
 let closeDatabase: () => Promise<void>;
@@ -483,7 +398,7 @@ describe("staff credentials and sessions", () => {
 
   it("refuses production staff login without a production MFA verifier", async () => {
     await seedStaff("production-mfa@somo.example", ["SYSTEM_ADMIN"]);
-    const productionApp = await buildApp({
+    const service = await createAccessService({
       config: {
         ...testConfig,
         environment: "production",
@@ -491,23 +406,18 @@ describe("staff credentials and sessions", () => {
         requireVerifiedMfa: true,
       },
       database,
-      logger: false,
-      identity: productionIdentityTestDependencies,
     });
-    try {
-      const response = await login(
-        productionApp,
-        "production-mfa@somo.example",
-        "opaque-production-assertion",
-        "203.0.113.24",
-      );
-      expect(response.statusCode).toBe(503);
-      expect(response.json()).toMatchObject({
-        code: "MFA_VERIFIER_UNAVAILABLE",
-      });
-    } finally {
-      await productionApp.close();
-    }
+    await expect(
+      service.createSession({
+        email: "production-mfa@somo.example",
+        password: "Correct-Horse-Battery-Staple-42!",
+        mfaAssertion: "opaque-production-assertion",
+        requestId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 503,
+      code: "MFA_VERIFIER_UNAVAILABLE",
+    });
   });
 });
 
@@ -568,6 +478,34 @@ describe("staff account administration", () => {
       true,
     );
   });
+
+  it.each(["COMPLIANCE_OFFICER", "DPO"])(
+    "creates a distinct %s business-role account through the staff HTTP boundary",
+    async (role) => {
+      const admin = await seedStaff(`role-admin-${role}@somo.example`, [
+        "SYSTEM_ADMIN",
+      ]);
+      const session = await login(
+        app,
+        admin.email,
+        "valid-test-assertion",
+        "203.0.113.39",
+      );
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/staff/users",
+        headers: authenticatedMutationHeaders(session),
+        payload: {
+          email: `${role.toLowerCase()}@somo.example`,
+          password: "another correct horse battery staple",
+          roles: [role],
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({ roles: [role] });
+    },
+  );
 
   it("rejects duplicate staff roles", async () => {
     const admin = await seedStaff("strict-admin@somo.example", [

@@ -66,7 +66,7 @@ export async function registerPrivacyRoutes(
       },
     },
     async (request, reply) => {
-      const actor = complianceActor(request);
+      const actor = privacyReadActor(request);
       return reply.send(
         await privacy.listRequests({
           actor,
@@ -302,13 +302,24 @@ export async function registerPrivacyRoutes(
 function complianceActor(request: Parameters<typeof requireStaffPrincipal>[0]) {
   const principal = requireStaffPrincipal(request);
   const role = principal.roles.find((item) =>
-    [
-      "COMPLIANCE",
-      "COMPLIANCE_OFFICER",
-      "COMPLIANCE_AUDITOR",
-      "DPO",
-      "SYSTEM_ADMIN",
-    ].includes(item),
+    ["COMPLIANCE_OFFICER", "DPO"].includes(item),
+  );
+  if (role === undefined) {
+    throw new AppError(
+      403,
+      "PRIVACY_COMPLIANCE_AUTHORIZATION_REQUIRED",
+      "Privacy compliance authorization is required.",
+    );
+  }
+  return { id: principal.staffUserId, role };
+}
+
+function privacyReadActor(
+  request: Parameters<typeof requireStaffPrincipal>[0],
+) {
+  const principal = requireStaffPrincipal(request);
+  const role = principal.roles.find((item) =>
+    ["COMPLIANCE_OFFICER", "COMPLIANCE_AUDITOR", "DPO"].includes(item),
   );
   if (role === undefined) {
     throw new AppError(

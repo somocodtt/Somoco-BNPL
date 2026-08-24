@@ -1,7 +1,4 @@
-import {
-  calculateFlatMarkup,
-  type FlatMarkupQuote,
-} from "./flat-markup.js";
+import { calculateFlatMarkup, type FlatMarkupQuote } from "./flat-markup.js";
 import {
   calculateReducingBalance,
   type ReducingBalanceQuote,
@@ -10,7 +7,6 @@ import {
   assertRate,
   assertSafeMinor,
   isSupportedTenure,
-  type Installment,
   type QuoteInput,
   type QuoteResult,
 } from "./types.js";
@@ -88,14 +84,18 @@ export function addCalendarMonths(isoDate: string, months: number): string {
   const parsed = parseIsoDate(isoDate);
   const absoluteMonth = parsed.year * 12 + (parsed.month - 1) + months;
   const year = Math.floor(absoluteMonth / 12);
-  const month = ((absoluteMonth % 12) + 12) % 12 + 1;
+  const month = (((absoluteMonth % 12) + 12) % 12) + 1;
   const day = Math.min(parsed.day, daysInMonth(year, month));
   return formatDate(year, month, day);
 }
 
 export function addCalendarWeeks(isoDate: string, weeks: number): string {
   const parsed = parseIsoDate(isoDate);
-  return formatCivilDate(civilFromDays(daysFromCivil(parsed.year, parsed.month, parsed.day) + weeks * 7));
+  return formatCivilDate(
+    civilFromDays(
+      daysFromCivil(parsed.year, parsed.month, parsed.day) + weeks * 7,
+    ),
+  );
 }
 
 export function assertInput(input: QuoteInput): void {
@@ -135,7 +135,13 @@ function parseIsoDate(value: string): DateParts {
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
-  if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth(year, month)
+  ) {
     throw new Error("DATE_INVALID");
   }
   return { year, month, day };
@@ -159,9 +165,7 @@ function daysFromCivil(year: number, month: number, day: number): number {
   const era = Math.floor(adjustedYear / 400);
   const yearOfEra = adjustedYear - era * 400;
   const dayOfYear =
-    Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) +
-    day -
-    1;
+    Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
   const dayOfEra =
     yearOfEra * 365 +
     Math.floor(yearOfEra / 4) -
@@ -171,19 +175,20 @@ function daysFromCivil(year: number, month: number, day: number): number {
 }
 
 function civilFromDays(days: number): DateParts {
-  let shifted = days + 719468;
+  const shifted = days + 719468;
   const era = Math.floor(shifted / 146097);
   const dayOfEra = shifted - era * 146097;
   const yearOfEra = Math.floor(
-    (dayOfEra - Math.floor(dayOfEra / 1460) + Math.floor(dayOfEra / 36524) - Math.floor(dayOfEra / 146096)) /
+    (dayOfEra -
+      Math.floor(dayOfEra / 1460) +
+      Math.floor(dayOfEra / 36524) -
+      Math.floor(dayOfEra / 146096)) /
       365,
   );
   let year = yearOfEra + era * 400;
   const dayOfYear =
     dayOfEra -
-    (365 * yearOfEra +
-      Math.floor(yearOfEra / 4) -
-      Math.floor(yearOfEra / 100));
+    (365 * yearOfEra + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100));
   const monthPart = Math.floor((5 * dayOfYear + 2) / 153);
   const day = dayOfYear - Math.floor((153 * monthPart + 2) / 5) + 1;
   const month = monthPart + (monthPart < 10 ? 3 : -9);
@@ -194,4 +199,3 @@ function civilFromDays(days: number): DateParts {
 function formatCivilDate(parts: DateParts): string {
   return formatDate(parts.year, parts.month, parts.day);
 }
-

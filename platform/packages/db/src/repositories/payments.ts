@@ -94,8 +94,9 @@ export function paymentRepo(db: DatabaseTransaction) {
     async findByProviderTransaction(
       provider: string,
       providerTransactionId: string,
+      lock = false,
     ): Promise<PaymentTransaction | null> {
-      const [row] = await executor
+      const query = executor
         .select()
         .from(paymentTransaction)
         .where(
@@ -103,8 +104,36 @@ export function paymentRepo(db: DatabaseTransaction) {
             eq(paymentTransaction.provider, provider as "SOMOCO_PAYMENTS"),
             eq(paymentTransaction.providerTransactionId, providerTransactionId),
           ),
+        );
+      const locked = lock ? query.for("update") : query;
+      const [row] = await locked.limit(1);
+      return row ?? null;
+    },
+    async findCompensationForOriginal(
+      originalPaymentTransactionId: string,
+    ): Promise<PaymentTransaction | null> {
+      const [row] = await executor
+        .select()
+        .from(paymentTransaction)
+        .where(
+          eq(
+            paymentTransaction.originalPaymentTransactionId,
+            originalPaymentTransactionId,
+          ),
         )
         .limit(1);
+      return row ?? null;
+    },
+    async contractLifecycle(contractId: string) {
+      const [row] = await executor
+        .select({
+          status: contract.status,
+          ownershipHolder: contract.ownershipHolder,
+        })
+        .from(contract)
+        .where(eq(contract.id, contractId))
+        .limit(1)
+        .for("update");
       return row ?? null;
     },
     async findByEventId(
@@ -512,6 +541,7 @@ export function paymentRepo(db: DatabaseTransaction) {
     },
     async createReconciliationCase(input: {
       paymentTransactionId?: string;
+      contractId?: string;
       reason: string;
       dedupeKey?: string;
       resolution?: Record<string, unknown>;
@@ -545,6 +575,9 @@ export function paymentRepo(db: DatabaseTransaction) {
         ...(input.paymentTransactionId === undefined
           ? {}
           : { paymentTransactionId: input.paymentTransactionId }),
+        ...(input.contractId === undefined
+          ? {}
+          : { contractId: input.contractId }),
         reason: input.reason,
         ...(input.dedupeKey === undefined
           ? {}
@@ -633,7 +666,7 @@ export function paymentRepo(db: DatabaseTransaction) {
     async decideAdjustment(input: {
       id: string;
       checkerStaffUserId: string;
-      status: "APPROVED" | "REJECTED";
+      status: "APPROVED" | "REJECTED" | "QUARANTINED";
       decisionReason: string;
       ledgerEntryId?: string;
     }): Promise<PaymentAdjustment> {

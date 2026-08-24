@@ -5,7 +5,7 @@
   "scripts": {
     "build": "vite build",
     "e2e": "playwright test",
-    "lint": "eslint src test vite.config.ts",
+    "lint": "eslint src vite.config.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

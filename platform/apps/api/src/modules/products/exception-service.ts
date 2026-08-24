@@ -17,7 +17,7 @@ const approverRoles: readonly StaffRole[] = [
   "AGM",
   "CFO",
   "MD",
-  "COMPLIANCE_AUDITOR",
+  "COMPLIANCE_OFFICER",
 ];
 
 type ExceptionRequestBase = {
@@ -113,7 +113,11 @@ export function createExceptionService(options: {
           ? undefined
           : parseDate(input.expiresAt, "EXCEPTION_EXPIRY_INVALID");
       if (expiresAt !== undefined && expiresAt <= new Date()) {
-        throw new AppError(400, "EXCEPTION_EXPIRY_INVALID", "The exception expiry must be in the future.");
+        throw new AppError(
+          400,
+          "EXCEPTION_EXPIRY_INVALID",
+          "The exception expiry must be in the future.",
+        );
       }
       const payloadHash = hashPayload({
         applicationId: input.applicationId,
@@ -133,14 +137,30 @@ export function createExceptionService(options: {
         expiresAt: expiresAt?.toISOString() ?? null,
       });
       const scope = `application:${input.applicationId}:exception-request`;
-      const existing = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
+      const existing = await financingRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
       if (existing !== null) {
         if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
-        if (existing.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
+        if (existing.actorStaffUserId !== input.actor.staffUserId)
+          throw idempotencyActorConflict();
         const responseId = existing.response["exceptionId"];
-        if (typeof responseId !== "string") throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is invalid.");
-        const replay = await financingRepo(options.database).findException(responseId);
-        if (replay === null) throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is missing.");
+        if (typeof responseId !== "string")
+          throw new AppError(
+            409,
+            "IDEMPOTENCY_REPLAY_INVALID",
+            "The saved command response is invalid.",
+          );
+        const replay = await financingRepo(options.database).findException(
+          responseId,
+        );
+        if (replay === null)
+          throw new AppError(
+            409,
+            "IDEMPOTENCY_REPLAY_INVALID",
+            "The saved command response is missing.",
+          );
         return replay;
       }
       const exceptionId = randomUUID();
@@ -148,9 +168,21 @@ export function createExceptionService(options: {
         return await withTransaction(options.database, async (tx) => {
           const repo = financingRepo(tx);
           const application = await repo.lockApplication(input.applicationId);
-          if (application === null) throw new AppError(404, "APPLICATION_NOT_FOUND", "Application not found.");
-          if (application.status === "REJECTED" || application.status === "SETTLED") {
-            throw new AppError(409, "EXCEPTION_APPLICATION_CLOSED", "This application cannot receive an exception.");
+          if (application === null)
+            throw new AppError(
+              404,
+              "APPLICATION_NOT_FOUND",
+              "Application not found.",
+            );
+          if (
+            application.status === "REJECTED" ||
+            application.status === "SETTLED"
+          ) {
+            throw new AppError(
+              409,
+              "EXCEPTION_APPLICATION_CLOSED",
+              "This application cannot receive an exception.",
+            );
           }
           const command = await repo.insertCommand({
             scope,
@@ -162,8 +194,10 @@ export function createExceptionService(options: {
             response: {},
           });
           if (!command.inserted) {
-            if (command.payloadHash !== payloadHash) throw idempotencyConflict();
-            if (command.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
+            if (command.payloadHash !== payloadHash)
+              throw idempotencyConflict();
+            if (command.actorStaffUserId !== input.actor.staffUserId)
+              throw idempotencyActorConflict();
             return replayException(options.database, command.response);
           }
           const created = await repo.insertException({
@@ -177,16 +211,32 @@ export function createExceptionService(options: {
             ruleVersionId: input.ruleVersionId,
             exceptionField: binding.exceptionField,
             valueType: binding.valueType,
-            ...(binding.proposedAmountMinor === undefined ? {} : { proposedAmountMinor: binding.proposedAmountMinor }),
-            ...(binding.policyAmountMinor === undefined ? {} : { policyAmountMinor: binding.policyAmountMinor }),
-            ...(binding.proposedFrequency === undefined ? {} : { proposedFrequency: binding.proposedFrequency }),
-            ...(binding.policyFrequency === undefined ? {} : { policyFrequency: binding.policyFrequency }),
-            ...(binding.proposedTenureMonths === undefined ? {} : { proposedTenureMonths: binding.proposedTenureMonths }),
-            ...(binding.policyTenureMonths === undefined ? {} : { policyTenureMonths: binding.policyTenureMonths }),
+            ...(binding.proposedAmountMinor === undefined
+              ? {}
+              : { proposedAmountMinor: binding.proposedAmountMinor }),
+            ...(binding.policyAmountMinor === undefined
+              ? {}
+              : { policyAmountMinor: binding.policyAmountMinor }),
+            ...(binding.proposedFrequency === undefined
+              ? {}
+              : { proposedFrequency: binding.proposedFrequency }),
+            ...(binding.policyFrequency === undefined
+              ? {}
+              : { policyFrequency: binding.policyFrequency }),
+            ...(binding.proposedTenureMonths === undefined
+              ? {}
+              : { proposedTenureMonths: binding.proposedTenureMonths }),
+            ...(binding.policyTenureMonths === undefined
+              ? {}
+              : { policyTenureMonths: binding.policyTenureMonths }),
             ...(expiresAt === undefined ? {} : { expiresAt }),
           });
           const response = serializeException(created);
-          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+          await repo.updateCommandResponse(
+            scope,
+            input.idempotencyKey,
+            response,
+          );
           await appendAuditEvent(tx, {
             aggregateType: "exception_request",
             aggregateId: created.id,
@@ -212,8 +262,15 @@ export function createExceptionService(options: {
           return created;
         });
       } catch (error) {
-        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
-        if (raced !== null && raced.payloadHash === payloadHash && raced.actorStaffUserId === input.actor.staffUserId) {
+        const raced = await financingRepo(options.database).findCommand(
+          scope,
+          input.idempotencyKey,
+        );
+        if (
+          raced !== null &&
+          raced.payloadHash === payloadHash &&
+          raced.actorStaffUserId === input.actor.staffUserId
+        ) {
           return replayException(options.database, raced.response);
         }
         throw mapError(error, "EXCEPTION_REQUEST_FAILED");
@@ -222,19 +279,49 @@ export function createExceptionService(options: {
 
     async decide(input) {
       assertStaffActor(input.actor);
-      if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
-        throw new AppError(400, "VERSION_INVALID", "The exception version is invalid.");
+      if (
+        !Number.isSafeInteger(input.expectedVersion) ||
+        input.expectedVersion < 1
+      ) {
+        throw new AppError(
+          400,
+          "VERSION_INVALID",
+          "The exception version is invalid.",
+        );
       }
       const reason = normalizeReason(input.reason);
-      const status = input.decision === "APPROVE" ? "APPROVED" : input.decision === "REJECT" ? "REJECTED" : null;
-      if (status === null) throw new AppError(400, "DECISION_INVALID", "The exception decision is invalid.");
-      const current = await financingRepo(options.database).findException(input.exceptionId);
-      if (current === null) throw new AppError(404, "EXCEPTION_NOT_FOUND", "Exception not found.");
-      if (!input.actor.roles.includes(current.requiredApproverRole as StaffRole)) {
-        throw new AppError(403, "EXCEPTION_APPROVER_UNAUTHORIZED", "The required approving authority is not present.");
+      const status =
+        input.decision === "APPROVE"
+          ? "APPROVED"
+          : input.decision === "REJECT"
+            ? "REJECTED"
+            : null;
+      if (status === null)
+        throw new AppError(
+          400,
+          "DECISION_INVALID",
+          "The exception decision is invalid.",
+        );
+      const current = await financingRepo(options.database).findException(
+        input.exceptionId,
+      );
+      if (current === null)
+        throw new AppError(404, "EXCEPTION_NOT_FOUND", "Exception not found.");
+      if (
+        !input.actor.roles.includes(current.requiredApproverRole as StaffRole)
+      ) {
+        throw new AppError(
+          403,
+          "EXCEPTION_APPROVER_UNAUTHORIZED",
+          "The required approving authority is not present.",
+        );
       }
       if (current.requestedBy === input.actor.staffUserId) {
-        throw new AppError(403, "EXCEPTION_REQUESTER_CANNOT_APPROVE", "The requester cannot decide their own exception.");
+        throw new AppError(
+          403,
+          "EXCEPTION_REQUESTER_CANNOT_APPROVE",
+          "The requester cannot decide their own exception.",
+        );
       }
       const payloadHash = hashPayload({
         exceptionId: input.exceptionId,
@@ -243,14 +330,30 @@ export function createExceptionService(options: {
         reason,
       });
       const scope = `exception:${input.exceptionId}:decision`;
-      const existing = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
+      const existing = await financingRepo(options.database).findCommand(
+        scope,
+        input.idempotencyKey,
+      );
       if (existing !== null) {
         if (existing.payloadHash !== payloadHash) throw idempotencyConflict();
-        if (existing.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
+        if (existing.actorStaffUserId !== input.actor.staffUserId)
+          throw idempotencyActorConflict();
         const responseId = existing.response["exceptionId"];
-        if (typeof responseId !== "string") throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is invalid.");
-        const replay = await financingRepo(options.database).findException(responseId);
-        if (replay === null) throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is missing.");
+        if (typeof responseId !== "string")
+          throw new AppError(
+            409,
+            "IDEMPOTENCY_REPLAY_INVALID",
+            "The saved command response is invalid.",
+          );
+        const replay = await financingRepo(options.database).findException(
+          responseId,
+        );
+        if (replay === null)
+          throw new AppError(
+            409,
+            "IDEMPOTENCY_REPLAY_INVALID",
+            "The saved command response is missing.",
+          );
         return replay;
       }
       const now = new Date();
@@ -266,8 +369,10 @@ export function createExceptionService(options: {
             response: {},
           });
           if (!command.inserted) {
-            if (command.payloadHash !== payloadHash) throw idempotencyConflict();
-            if (command.actorStaffUserId !== input.actor.staffUserId) throw idempotencyActorConflict();
+            if (command.payloadHash !== payloadHash)
+              throw idempotencyConflict();
+            if (command.actorStaffUserId !== input.actor.staffUserId)
+              throw idempotencyActorConflict();
             return replayException(options.database, command.response);
           }
           const decided = await repo.decideException({
@@ -279,11 +384,18 @@ export function createExceptionService(options: {
             now,
           });
           const response = serializeException(decided);
-          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+          await repo.updateCommandResponse(
+            scope,
+            input.idempotencyKey,
+            response,
+          );
           await appendAuditEvent(tx, {
             aggregateType: "exception_request",
             aggregateId: decided.id,
-            action: status === "APPROVED" ? "EXCEPTION_APPROVED" : "EXCEPTION_REJECTED",
+            action:
+              status === "APPROVED"
+                ? "EXCEPTION_APPROVED"
+                : "EXCEPTION_REJECTED",
             actorStaffUserId: input.actor.staffUserId,
             requestId: input.requestId,
             data: { version: decided.version, reason },
@@ -300,8 +412,15 @@ export function createExceptionService(options: {
           return decided;
         });
       } catch (error) {
-        const raced = await financingRepo(options.database).findCommand(scope, input.idempotencyKey);
-        if (raced !== null && raced.payloadHash === payloadHash && raced.actorStaffUserId === input.actor.staffUserId) {
+        const raced = await financingRepo(options.database).findCommand(
+          scope,
+          input.idempotencyKey,
+        );
+        if (
+          raced !== null &&
+          raced.payloadHash === payloadHash &&
+          raced.actorStaffUserId === input.actor.staffUserId
+        ) {
           return replayException(options.database, raced.response);
         }
         throw mapError(error, "EXCEPTION_DECISION_FAILED");
@@ -309,7 +428,11 @@ export function createExceptionService(options: {
     },
 
     async findApproved(applicationId, now = new Date(), binding) {
-      return financingRepo(options.database).findApprovedException(applicationId, now, binding);
+      return financingRepo(options.database).findApprovedException(
+        applicationId,
+        now,
+        binding,
+      );
     },
 
     async list() {
@@ -330,7 +453,11 @@ function assertStaffActor(actor: StaffPrincipal): void {
 
 function assertRole(role: StaffRole): void {
   if (!approverRoles.includes(role)) {
-    throw new AppError(400, "APPROVER_ROLE_INVALID", "The approving authority is invalid.");
+    throw new AppError(
+      400,
+      "APPROVER_ROLE_INVALID",
+      "The approving authority is invalid.",
+    );
   }
 }
 
@@ -344,7 +471,10 @@ function normalizeReason(reason: string): string {
 
 function parseDate(value: string, code: string): Date {
   const parsed = new Date(value);
-  if (!/^\d{4}-\d{2}-\d{2}T/.test(value) || !Number.isFinite(parsed.getTime())) {
+  if (
+    !/^\d{4}-\d{2}-\d{2}T/.test(value) ||
+    !Number.isFinite(parsed.getTime())
+  ) {
     throw new AppError(400, code, "The date is invalid.");
   }
   return parsed;
@@ -369,12 +499,18 @@ type NormalizedBinding = {
 
 function normalizeBinding(input: ExceptionRequestInput): NormalizedBinding {
   if (!/^[0-9a-f-]{36}$/i.test(input.ruleVersionId)) {
-    throw new AppError(400, "EXCEPTION_BINDING_REQUIRED", "An exception must bind a rule version and field.");
+    throw new AppError(
+      400,
+      "EXCEPTION_BINDING_REQUIRED",
+      "An exception must bind a rule version and field.",
+    );
   }
   if (input.valueType === "AMOUNT") {
     const proposedAmountMinor = parseMinor(input.proposedAmountMinor);
     const policyAmountMinor = parseMinor(input.policyAmountMinor);
-    const proposedValue = { minimumDepositMinor: proposedAmountMinor.toString() };
+    const proposedValue = {
+      minimumDepositMinor: proposedAmountMinor.toString(),
+    };
     const policyValue = { minimumDepositMinor: policyAmountMinor.toString() };
     if (
       input.exceptionField !== "minimumDepositMinor" ||
@@ -385,7 +521,11 @@ function normalizeBinding(input: ExceptionRequestInput): NormalizedBinding {
       "proposedTenureMonths" in input ||
       "policyTenureMonths" in input
     ) {
-      throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The amount exception contains an irrelevant or mismatched value.");
+      throw new AppError(
+        400,
+        "EXCEPTION_BINDING_INVALID",
+        "The amount exception contains an irrelevant or mismatched value.",
+      );
     }
     return {
       exceptionField: input.exceptionField,
@@ -401,14 +541,22 @@ function normalizeBinding(input: ExceptionRequestInput): NormalizedBinding {
       input.exceptionField !== "repaymentFrequency" ||
       !sameFrequency(input.proposedFrequency) ||
       !sameFrequency(input.policyFrequency) ||
-      !sameValue(input.proposedValue, { repaymentFrequency: input.proposedFrequency }) ||
-      !sameValue(input.policyValue, { repaymentFrequency: input.policyFrequency }) ||
+      !sameValue(input.proposedValue, {
+        repaymentFrequency: input.proposedFrequency,
+      }) ||
+      !sameValue(input.policyValue, {
+        repaymentFrequency: input.policyFrequency,
+      }) ||
       "proposedAmountMinor" in input ||
       "policyAmountMinor" in input ||
       "proposedTenureMonths" in input ||
       "policyTenureMonths" in input
     ) {
-      throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The frequency exception contains an irrelevant or mismatched value.");
+      throw new AppError(
+        400,
+        "EXCEPTION_BINDING_INVALID",
+        "The frequency exception contains an irrelevant or mismatched value.",
+      );
     }
     return {
       exceptionField: input.exceptionField,
@@ -424,14 +572,20 @@ function normalizeBinding(input: ExceptionRequestInput): NormalizedBinding {
     input.exceptionField !== "tenureMonths" ||
     !Number.isSafeInteger(input.proposedTenureMonths) ||
     !Number.isSafeInteger(input.policyTenureMonths) ||
-    !sameValue(input.proposedValue, { tenureMonths: input.proposedTenureMonths }) ||
+    !sameValue(input.proposedValue, {
+      tenureMonths: input.proposedTenureMonths,
+    }) ||
     !sameValue(input.policyValue, { tenureMonths: input.policyTenureMonths }) ||
     "proposedAmountMinor" in input ||
     "policyAmountMinor" in input ||
     "proposedFrequency" in input ||
     "policyFrequency" in input
   ) {
-    throw new AppError(400, "EXCEPTION_BINDING_INVALID", "The tenure exception contains an irrelevant or mismatched value.");
+    throw new AppError(
+      400,
+      "EXCEPTION_BINDING_INVALID",
+      "The tenure exception contains an irrelevant or mismatched value.",
+    );
   }
   return {
     exceptionField: input.exceptionField,
@@ -447,8 +601,12 @@ function sameFrequency(value: unknown): value is "WEEKLY" | "MONTHLY" {
   return value === "WEEKLY" || value === "MONTHLY";
 }
 
-function sameValue(value: unknown, normalized: Record<string, string | number>): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+function sameValue(
+  value: unknown,
+  normalized: Record<string, string | number>,
+): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
   try {
     return canonicalizeJson(value) === canonicalizeJson(normalized);
   } catch {
@@ -457,14 +615,25 @@ function sameValue(value: unknown, normalized: Record<string, string | number>):
 }
 
 function parseMinor(value: string | bigint): bigint {
-  const parsed = typeof value === "bigint" ? value : /^\d+$/.test(value) ? BigInt(value) : -1n;
+  const parsed =
+    typeof value === "bigint"
+      ? value
+      : /^\d+$/.test(value)
+        ? BigInt(value)
+        : -1n;
   if (parsed < 0n || parsed > 9_223_372_036_854_775_807n) {
-    throw new AppError(400, "EXCEPTION_AMOUNT_INVALID", "The exception amount is invalid.");
+    throw new AppError(
+      400,
+      "EXCEPTION_AMOUNT_INVALID",
+      "The exception amount is invalid.",
+    );
   }
   return parsed;
 }
 
-function serializeException(exception: ExceptionRecord): Record<string, unknown> {
+function serializeException(
+  exception: ExceptionRecord,
+): Record<string, unknown> {
   return {
     exceptionId: exception.id,
     applicationId: exception.applicationId,
@@ -473,30 +642,56 @@ function serializeException(exception: ExceptionRecord): Record<string, unknown>
   };
 }
 
-async function replayException(database: Database, response: Record<string, unknown>): Promise<ExceptionRecord> {
+async function replayException(
+  database: Database,
+  response: Record<string, unknown>,
+): Promise<ExceptionRecord> {
   const exceptionId = response["exceptionId"];
   if (typeof exceptionId !== "string") {
-    throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved command response is invalid.");
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved command response is invalid.",
+    );
   }
   const exception = await financingRepo(database).findException(exceptionId);
   if (exception === null) {
-    throw new AppError(409, "IDEMPOTENCY_REPLAY_INVALID", "The saved exception is missing.");
+    throw new AppError(
+      409,
+      "IDEMPOTENCY_REPLAY_INVALID",
+      "The saved exception is missing.",
+    );
   }
   return exception;
 }
 
 function idempotencyConflict(): AppError {
-  return new AppError(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "The idempotency key was reused with a different command.");
+  return new AppError(
+    409,
+    "IDEMPOTENCY_PAYLOAD_MISMATCH",
+    "The idempotency key was reused with a different command.",
+  );
 }
 
 function idempotencyActorConflict(): AppError {
-  return new AppError(409, "IDEMPOTENCY_ACTOR_MISMATCH", "The idempotency key belongs to a different actor.");
+  return new AppError(
+    409,
+    "IDEMPOTENCY_ACTOR_MISMATCH",
+    "The idempotency key belongs to a different actor.",
+  );
 }
 
 function mapError(error: unknown, fallback: string): AppError | unknown {
   if (error instanceof AppError) return error;
-  if (error instanceof Error && error.message === "EXCEPTION_DECISION_REJECTED") {
-    return new AppError(409, "EXCEPTION_STALE_OR_EXPIRED", "The exception is stale, expired, or already decided.");
+  if (
+    error instanceof Error &&
+    error.message === "EXCEPTION_DECISION_REJECTED"
+  ) {
+    return new AppError(
+      409,
+      "EXCEPTION_STALE_OR_EXPIRED",
+      "The exception is stale, expired, or already decided.",
+    );
   }
   return error instanceof Error ? error : new Error(fallback);
 }

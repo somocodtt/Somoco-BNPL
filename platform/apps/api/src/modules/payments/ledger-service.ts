@@ -162,7 +162,10 @@ export interface LedgerService {
     checker: StaffPrincipal;
     decision: "APPROVE" | "REJECT";
     reason: string;
-  }): Promise<{ id: string; status: "APPROVED" | "REJECTED" }>;
+  }): Promise<{
+    id: string;
+    status: "APPROVED" | "REJECTED" | "QUARANTINED";
+  }>;
 }
 
 export function createLedgerService(options: {
@@ -536,6 +539,7 @@ export function createLedgerService(options: {
         const original = await repo.findByProviderTransaction(
           "SOMOCO_PAYMENTS",
           input.originalProviderTransactionId,
+          true,
         );
         if (original === null)
           throw new AppError(
@@ -547,17 +551,22 @@ export function createLedgerService(options: {
           "SOMOCO_PAYMENTS",
           input.eventId,
         );
-        if (existing !== null)
-          return {
-            paymentTransaction: existing,
-            outcome:
-              input.eventType === "PAYMENT_REFUNDED" ? "REFUNDED" : "REVERSED",
-            ledgerEntryIds: (await repo.findLedgerForPayment(existing.id)).map(
-              (entry) => entry.id,
-            ),
-            depositReconciled: false,
-          };
-        const derivedProviderTransactionId = `${original.providerTransactionId}:${input.eventType}`;
+        if (existing !== null) return duplicateResult(repo, existing);
+        const existingCompensation = await repo.findCompensationForOriginal(
+          original.id,
+        );
+        if (existingCompensation !== null)
+          return duplicateResult(repo, existingCompensation);
+        const lifecycle =
+          original.contractId === null
+            ? null
+            : await repo.contractLifecycle(original.contractId);
+        const requiresException =
+          lifecycle !== null &&
+          (lifecycle.status === "SETTLED" ||
+            lifecycle.status === "TRANSFERRED" ||
+            lifecycle.ownershipHolder === "CUSTOMER");
+        const derivedProviderTransactionId = `${original.providerTransactionId}:COMPENSATION`;
         const insertedPayment = await repo.insertIfAbsent(
           {
             id: randomUUID(),
@@ -566,6 +575,7 @@ export function createLedgerService(options: {
             providerTransactionId: derivedProviderTransactionId,
             eventId: input.eventId,
             eventType: input.eventType,
+            originalPaymentTransactionId: original.id,
             ...(original.contractId === null
               ? {}
               : { contractId: original.contractId }),
@@ -578,6 +588,13 @@ export function createLedgerService(options: {
             status: "RECEIVED",
             providerPayload: {
               originalProviderTransactionId: original.providerTransactionId,
+              compensationLifecycle: "ONE_PER_ORIGINAL_V1",
+              ...(requiresException
+                ? {
+                    quarantineReason:
+                      "POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION",
+                  }
+                : {}),
             },
             occurredAt: input.occurredAt,
           },
@@ -594,7 +611,9 @@ export function createLedgerService(options: {
             },
             outbox: {
               id: randomUUID(),
-              topic: "payments.payment_reversed",
+              topic: requiresException
+                ? "payments.reversal_quarantined"
+                : "payments.payment_reversed",
               aggregateType: "payment_transaction",
               aggregateId: original.id,
               payload: {
@@ -608,6 +627,42 @@ export function createLedgerService(options: {
         if (!insertedPayment.inserted)
           return duplicateResult(repo, insertedPayment.payment);
         const payment = insertedPayment.payment;
+        if (requiresException && original.contractId !== null) {
+          await repo.createReconciliationCase({
+            paymentTransactionId: payment.id,
+            contractId: original.contractId,
+            reason: "POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION",
+            dedupeKey: `POST_SETTLEMENT_REVERSAL:${original.id}`,
+            resolution: {
+              originalPaymentTransactionId: original.id,
+              incomingEventId: input.eventId,
+              incomingEventType: input.eventType,
+              contractStatus: lifecycle?.status,
+              ownershipHolder: lifecycle?.ownershipHolder,
+            },
+          });
+          const quarantined = await repo.updateStatus(payment.id, "REJECTED");
+          await appendAuditEvent(tx, {
+            aggregateType: "payment_transaction",
+            aggregateId: payment.id,
+            action: "PAYMENT_REVERSAL_QUARANTINED",
+            actorStaffUserId: null,
+            actorPersonId: null,
+            requestId: null,
+            data: {
+              originalPaymentTransactionId: original.id,
+              reason: "POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION",
+            },
+            occurredAt: input.occurredAt,
+          });
+          return {
+            paymentTransaction: quarantined,
+            outcome: "QUARANTINED",
+            ledgerEntryIds: [],
+            depositReconciled: false,
+            reason: "POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION",
+          };
+        }
         const originals = await repo.findLedgerForPayment(original.id);
         const entryIds: string[] = [];
         for (const entry of originals) {
@@ -624,7 +679,7 @@ export function createLedgerService(options: {
           });
           const compensation = await repo.appendLedger({
             id: randomUUID(),
-            postingKey: `${input.eventId}:${entry.id}:COMPENSATION`,
+            postingKey: `COMPENSATION:${entry.id}:ONE_PER_ORIGINAL_V1`,
             contractId: entry.contractId,
             paymentTransactionId: payment.id,
             installmentId: entry.installmentId,
@@ -636,7 +691,11 @@ export function createLedgerService(options: {
             balanceAfterMinorUnits: aggregate.balanceAfterMinorUnits,
             reversesEntryId: entry.id,
             allocationPolicyVersion: entry.allocationPolicyVersion,
-            metadata: { reversesEntryId: entry.id },
+            metadata: {
+              reversesEntryId: entry.id,
+              compensationLifecycle: "ONE_PER_ORIGINAL_V1",
+              originalPaymentTransactionId: original.id,
+            },
             occurredAt: input.occurredAt,
           });
           entryIds.push(compensation.id);
@@ -704,7 +763,7 @@ export function createLedgerService(options: {
     async approveAdjustment(input) {
       if (
         !input.checker.roles.includes("CFO") &&
-        !input.checker.roles.includes("COMPLIANCE_AUDITOR")
+        !input.checker.roles.includes("COMPLIANCE_OFFICER")
       )
         throw new AppError(
           403,
@@ -727,6 +786,46 @@ export function createLedgerService(options: {
             "The adjustment maker cannot approve the same adjustment.",
           );
         if (input.decision === "APPROVE") {
+          const lifecycle = await repo.contractLifecycle(adjustment.contractId);
+          if (
+            lifecycle !== null &&
+            (lifecycle.status === "SETTLED" ||
+              lifecycle.status === "TRANSFERRED" ||
+              lifecycle.ownershipHolder === "CUSTOMER")
+          ) {
+            await repo.createReconciliationCase({
+              contractId: adjustment.contractId,
+              reason: "POST_SETTLEMENT_ADJUSTMENT_REQUIRES_EXCEPTION",
+              dedupeKey: `POST_SETTLEMENT_ADJUSTMENT:${adjustment.id}`,
+              resolution: {
+                adjustmentId: adjustment.id,
+                contractStatus: lifecycle.status,
+                ownershipHolder: lifecycle.ownershipHolder,
+                requestedDecision: input.decision,
+              },
+            });
+            const quarantined = await repo.decideAdjustment({
+              id: adjustment.id,
+              checkerStaffUserId: input.checker.staffUserId,
+              status: "QUARANTINED",
+              decisionReason: input.reason,
+            });
+            await appendAuditEvent(tx, {
+              aggregateType: "payment_adjustment",
+              aggregateId: quarantined.id,
+              action: "PAYMENT_ADJUSTMENT_QUARANTINED",
+              actorStaffUserId: input.checker.staffUserId,
+              actorPersonId: null,
+              requestId: null,
+              data: {
+                reason: input.reason,
+                contractStatus: lifecycle.status,
+                ownershipHolder: lifecycle.ownershipHolder,
+              },
+              occurredAt: new Date(),
+            });
+            return quarantined;
+          }
           const aggregate = await repo.adjustContractBalance({
             contractId: adjustment.contractId,
             amountMinorUnits: adjustment.amountMinorUnits,
@@ -800,7 +899,7 @@ export function createLedgerService(options: {
       });
       return {
         id: result.id,
-        status: result.status as "APPROVED" | "REJECTED",
+        status: result.status as "APPROVED" | "REJECTED" | "QUARANTINED",
       };
     },
   };

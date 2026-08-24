@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createExceptionService, type ExceptionRequestInput } from "./exception-service.js";
+import {
+  createExceptionService,
+  type ExceptionRequestInput,
+} from "./exception-service.js";
 
 const actor = {
   kind: "staff" as const,
@@ -25,17 +28,33 @@ const base = {
 };
 
 describe("exception binding validation", () => {
+  it("rejects a read-only auditor as a product exception authority", async () => {
+    const service = createExceptionService({ database: undefined as never });
+    await expect(
+      service.request({
+        ...base,
+        requiredApproverRole: "COMPLIANCE_AUDITOR",
+      }),
+    ).rejects.toMatchObject({ code: "APPROVER_ROLE_INVALID" });
+  });
+
   it("rejects irrelevant typed fields in a discriminated amount exception", async () => {
     const service = createExceptionService({ database: undefined as never });
     await expect(
-      service.request({ ...base, proposedFrequency: "MONTHLY" } as unknown as ExceptionRequestInput),
+      service.request({
+        ...base,
+        proposedFrequency: "MONTHLY",
+      } as unknown as ExceptionRequestInput),
     ).rejects.toMatchObject({ code: "EXCEPTION_BINDING_INVALID" });
   });
 
   it("rejects proposed or policy values that do not match normalized typed values", async () => {
     const service = createExceptionService({ database: undefined as never });
     await expect(
-      service.request({ ...base, proposedValue: { minimumDepositMinor: "9999" } }),
+      service.request({
+        ...base,
+        proposedValue: { minimumDepositMinor: "9999" },
+      }),
     ).rejects.toMatchObject({ code: "EXCEPTION_BINDING_INVALID" });
   });
 });

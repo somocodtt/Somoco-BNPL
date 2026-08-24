@@ -66,7 +66,7 @@ const testConfig: AppConfig = {
   paymentAdapter: "approved-payment",
   objectStoragePublic: false,
   encryptionKeyRef: "secret/somo/test/document-encryption",
-  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
+  backupLastVerifiedAt: new Date(Date.now() - 60_000).toISOString(),
 };
 
 const otpPolicy: OtpPolicy = {
@@ -1684,16 +1684,18 @@ describe("customer identity and document routes", () => {
 
   it("fails startup when production identity dependencies are absent", async () => {
     await expect(
-      buildApp({
-        config: {
-          ...testConfig,
-          environment: "production",
-          port: 443,
-          requireVerifiedMfa: true,
-        },
-        database,
-        logger: false,
-      }),
+      withNodeEnvironment("production", () =>
+        buildApp({
+          config: {
+            ...testConfig,
+            environment: "production",
+            port: 443,
+            requireVerifiedMfa: true,
+          },
+          database,
+          logger: false,
+        }),
+      ),
     ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
   });
 
@@ -1703,7 +1705,7 @@ describe("customer identity and document routes", () => {
     try {
       await expect(
         buildApp({ config: testConfig, database, logger: false }),
-      ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
+      ).rejects.toThrow("BOOTSTRAP_ENVIRONMENT_MISMATCH");
     } finally {
       if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = priorNodeEnv;
@@ -1712,50 +1714,68 @@ describe("customer identity and document routes", () => {
 
   it("rejects partially configured production identity dependencies", async () => {
     await expect(
-      buildApp({
-        config: {
-          ...testConfig,
-          environment: "production",
-          port: 443,
-          requireVerifiedMfa: true,
-        },
-        database,
-        logger: false,
-        identity: {
-          sms: recordingSms(),
-          otpPolicy,
-          consentCatalog: consentCatalogV1,
-        },
-      }),
+      withNodeEnvironment("production", () =>
+        buildApp({
+          config: {
+            ...testConfig,
+            environment: "production",
+            port: 443,
+            requireVerifiedMfa: true,
+          },
+          database,
+          logger: false,
+          identity: {
+            sms: recordingSms(),
+            otpPolicy,
+            consentCatalog: consentCatalogV1,
+          },
+        }),
+      ),
     ).rejects.toThrow("PRODUCTION_IDENTITY_DEPENDENCIES_REQUIRED");
   });
 
   it("fails closed when a simulator is injected into production", async () => {
     await expect(
-      buildApp({
-        config: {
-          ...testConfig,
-          environment: "production",
-          port: 443,
-          requireVerifiedMfa: true,
-        },
-        database,
-        logger: false,
-        identity: {
-          sms: recordingSms(),
-          otpPolicy,
-          consentCatalog: consentCatalogV1,
-          nia: createNiaSimulator({ environment: "test", fixtures: [] }),
-          documents: {
-            storage: memoryObjectStorage(),
-            malwareScanner: recordingMalwareScanner("CLEAN"),
-            policy: documentPolicy,
+      withNodeEnvironment("production", () =>
+        buildApp({
+          config: {
+            ...testConfig,
+            environment: "production",
+            port: 443,
+            requireVerifiedMfa: true,
           },
-        },
-      }),
+          database,
+          logger: false,
+          identity: {
+            sms: recordingSms(),
+            otpPolicy,
+            consentCatalog: consentCatalogV1,
+            nia: createNiaSimulator({ environment: "test", fixtures: [] }),
+            documents: {
+              storage: memoryObjectStorage(),
+              malwareScanner: recordingMalwareScanner("CLEAN"),
+              policy: documentPolicy,
+            },
+          },
+        }),
+      ),
     ).rejects.toThrow("SIMULATOR_FORBIDDEN_IN_PRODUCTION");
   });
 });
+
+async function withNodeEnvironment<T>(
+  nodeEnvironment: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const priorNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = nodeEnvironment;
+  try {
+    return await run();
+  } finally {
+    if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = priorNodeEnv;
+  }
+}
 
 async function recordNiaConsent(
   person: { id: string; phoneE164: string },

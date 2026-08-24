@@ -11,12 +11,23 @@ import type { OtpService } from "../identity/otp-service.js";
 import type { ExceptionService } from "./exception-service.js";
 import type { OfferService } from "./offer-service.js";
 import type { ProductService } from "./service.js";
-import { serializeExceptionDto, serializeOfferDto, serializeRuleDto } from "./dto.js";
+import {
+  serializeExceptionDto,
+  serializeOfferDto,
+  serializeRuleDto,
+} from "./dto.js";
 import type { StaffRole } from "../access/policy.js";
 import { AppError } from "../../plugins/errors.js";
 
 const productRoles: readonly StaffRole[] = ["PRODUCT_ADMIN"];
-const exceptionRoles: readonly StaffRole[] = ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"];
+const exceptionRoles: readonly StaffRole[] = [
+  "PRODUCT_ADMIN",
+  "BSM",
+  "AGM",
+  "CFO",
+  "MD",
+  "COMPLIANCE_OFFICER",
+];
 
 const uuid = { type: "string", format: "uuid" } as const;
 const idempotency = { type: "string", minLength: 8, maxLength: 128 } as const;
@@ -69,9 +80,13 @@ export async function registerProductRoutes(
     { schema: { params: ruleParams }, preHandler: authenticateStaff },
     async (request, reply) => {
       requireStaffRole(request, productRoles);
-      const rule = (await products.listRules()).find((item) => item.id === request.params.ruleId);
+      const rule = (await products.listRules()).find(
+        (item) => item.id === request.params.ruleId,
+      );
       return rule === undefined
-        ? reply.code(404).send({ code: "RULE_NOT_FOUND", detail: "Rule not found." })
+        ? reply
+            .code(404)
+            .send({ code: "RULE_NOT_FOUND", detail: "Rule not found." })
         : reply.send(serializeRuleDto(rule));
     },
   );
@@ -90,7 +105,10 @@ export async function registerProductRoutes(
       requireStaffRole(request, exceptionRoles);
       const exception = await exceptions.find(request.params.exceptionId);
       return exception === null
-        ? reply.code(404).send({ code: "EXCEPTION_NOT_FOUND", detail: "Exception not found." })
+        ? reply.code(404).send({
+            code: "EXCEPTION_NOT_FOUND",
+            detail: "Exception not found.",
+          })
         : reply.send(serializeExceptionDto(exception));
     },
   );
@@ -140,10 +158,21 @@ export async function registerProductRoutes(
             versionNumber: { type: "integer", minimum: 1 },
             sellingPriceMinor: { type: "string", pattern: "^[0-9]+$" },
             minimumDepositMinor: { type: "string", pattern: "^[0-9]+$" },
-            method: { type: "string", enum: ["FLAT_MARKUP", "REDUCING_BALANCE"] },
+            method: {
+              type: "string",
+              enum: ["FLAT_MARKUP", "REDUCING_BALANCE"],
+            },
             rateBasisPoints: { type: "integer", minimum: 0 },
-            allowedTenuresMonths: { type: "array", minItems: 1, items: { type: "integer" } },
-            repaymentFrequencies: { type: "array", minItems: 1, items: { type: "string", enum: ["WEEKLY", "MONTHLY"] } },
+            allowedTenuresMonths: {
+              type: "array",
+              minItems: 1,
+              items: { type: "integer" },
+            },
+            repaymentFrequencies: {
+              type: "array",
+              minItems: 1,
+              items: { type: "string", enum: ["WEEKLY", "MONTHLY"] },
+            },
             permittedFees: { type: "object" },
             eligibilityPolicy: { type: "object" },
             requiredEvidence: { type: "array", items: { type: "string" } },
@@ -151,7 +180,10 @@ export async function registerProductRoutes(
             disclosureVersion: { type: "string", minLength: 1, maxLength: 128 },
             disclosureContent: { type: "object" },
             disclosureHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
-            fixtureHashes: { type: "array", items: { type: "string", pattern: "^[0-9a-f]{64}$" } },
+            fixtureHashes: {
+              type: "array",
+              items: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            },
             licencePermitted: { type: "boolean" },
           },
         },
@@ -172,7 +204,11 @@ export async function registerProductRoutes(
 
   app.post<{
     Params: { ruleId: string };
-    Body: { effectiveFrom: string; effectiveUntil?: string; idempotencyKey: string };
+    Body: {
+      effectiveFrom: string;
+      effectiveUntil?: string;
+      idempotencyKey: string;
+    };
   }>(
     "/v1/staff/products/rule-versions/:ruleId/publish",
     {
@@ -193,12 +229,14 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        serializeRuleDto(await products.publishRuleVersion({
-          ...request.body,
-          ruleId: request.params.ruleId,
-          actor: requireStaffRole(request, productRoles),
-          requestId: request.id,
-        })),
+        serializeRuleDto(
+          await products.publishRuleVersion({
+            ...request.body,
+            ruleId: request.params.ruleId,
+            actor: requireStaffRole(request, productRoles),
+            requestId: request.id,
+          }),
+        ),
       ),
   );
 
@@ -217,7 +255,9 @@ export async function registerProductRoutes(
       proposedTenureMonths?: number;
       policyTenureMonths?: number;
       reason: string;
-      requiredApproverRole: Parameters<ExceptionService["request"]>[0]["requiredApproverRole"];
+      requiredApproverRole: Parameters<
+        ExceptionService["request"]
+      >[0]["requiredApproverRole"];
       expiresAt?: string;
       idempotencyKey: string;
     };
@@ -229,13 +269,25 @@ export async function registerProductRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["proposedValue", "policyValue", "ruleVersionId", "exceptionField", "valueType", "reason", "requiredApproverRole", "idempotencyKey"],
+          required: [
+            "proposedValue",
+            "policyValue",
+            "ruleVersionId",
+            "exceptionField",
+            "valueType",
+            "reason",
+            "requiredApproverRole",
+            "idempotencyKey",
+          ],
           properties: {
             proposedValue: {},
             policyValue: {},
             ruleVersionId: uuid,
             exceptionField: { type: "string", minLength: 1, maxLength: 128 },
-            valueType: { type: "string", enum: ["AMOUNT", "FREQUENCY", "TENURE"] },
+            valueType: {
+              type: "string",
+              enum: ["AMOUNT", "FREQUENCY", "TENURE"],
+            },
             proposedAmountMinor: { type: "string", pattern: "^[0-9]+$" },
             policyAmountMinor: { type: "string", pattern: "^[0-9]+$" },
             proposedFrequency: { type: "string", enum: ["WEEKLY", "MONTHLY"] },
@@ -243,7 +295,17 @@ export async function registerProductRoutes(
             proposedTenureMonths: { type: "integer" },
             policyTenureMonths: { type: "integer" },
             reason: { type: "string", minLength: 1, maxLength: 4_000 },
-            requiredApproverRole: { type: "string", enum: ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"] },
+            requiredApproverRole: {
+              type: "string",
+              enum: [
+                "PRODUCT_ADMIN",
+                "BSM",
+                "AGM",
+                "CFO",
+                "MD",
+                "COMPLIANCE_OFFICER",
+              ],
+            },
             expiresAt: { type: "string", format: "date-time" },
             idempotencyKey: idempotency,
           },
@@ -253,18 +315,25 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.code(201).send(
-        serializeExceptionDto(await exceptions.request({
-          ...request.body,
-          applicationId: request.params.applicationId,
-          actor: requireStaffRole(request, exceptionRoles),
-          requestId: request.id,
-        } as unknown as Parameters<ExceptionService["request"]>[0])),
+        serializeExceptionDto(
+          await exceptions.request({
+            ...request.body,
+            applicationId: request.params.applicationId,
+            actor: requireStaffRole(request, exceptionRoles),
+            requestId: request.id,
+          } as unknown as Parameters<ExceptionService["request"]>[0]),
+        ),
       ),
   );
 
   app.post<{
     Params: { exceptionId: string };
-    Body: { expectedVersion: number; decision: "APPROVE" | "REJECT"; reason: string; idempotencyKey: string };
+    Body: {
+      expectedVersion: number;
+      decision: "APPROVE" | "REJECT";
+      reason: string;
+      idempotencyKey: string;
+    };
   }>(
     "/v1/staff/exceptions/:exceptionId/decide",
     {
@@ -286,12 +355,14 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        serializeExceptionDto(await exceptions.decide({
-          ...request.body,
-          exceptionId: request.params.exceptionId,
-          actor: requireStaffRole(request, exceptionRoles),
-          requestId: request.id,
-        })),
+        serializeExceptionDto(
+          await exceptions.decide({
+            ...request.body,
+            exceptionId: request.params.exceptionId,
+            actor: requireStaffRole(request, exceptionRoles),
+            requestId: request.id,
+          }),
+        ),
       ),
   );
 
@@ -327,7 +398,14 @@ export async function registerProductRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["depositMinor", "frequency", "tenureMonths", "firstDueDate", "expiresAt", "idempotencyKey"],
+          required: [
+            "depositMinor",
+            "frequency",
+            "tenureMonths",
+            "firstDueDate",
+            "expiresAt",
+            "idempotencyKey",
+          ],
           properties: {
             depositMinor: { type: "string", pattern: "^[0-9]+$" },
             frequency: { type: "string", enum: ["WEEKLY", "MONTHLY"] },
@@ -342,17 +420,26 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.code(201).send(
-        serializeOfferDto(await offers.create({
-          ...request.body,
-          applicationId: request.params.applicationId,
-          actor: requireCustomerPrincipal(request),
-          requestId: request.id,
-        })),
+        serializeOfferDto(
+          await offers.create({
+            ...request.body,
+            applicationId: request.params.applicationId,
+            actor: requireCustomerPrincipal(request),
+            requestId: request.id,
+          }),
+        ),
       ),
   );
   app.post<{
     Params: { offerId: string };
-    Body: { consent: boolean; expectedVersion: number; consentAt: string; disclosedVersion: string; disclosedHash: string; idempotencyKey: string };
+    Body: {
+      consent: boolean;
+      expectedVersion: number;
+      consentAt: string;
+      disclosedVersion: string;
+      disclosedHash: string;
+      idempotencyKey: string;
+    };
   }>(
     "/v1/customer/offers/:offerId/accept",
     {
@@ -361,7 +448,14 @@ export async function registerProductRoutes(
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["consent", "expectedVersion", "consentAt", "disclosedVersion", "disclosedHash", "idempotencyKey"],
+          required: [
+            "consent",
+            "expectedVersion",
+            "consentAt",
+            "disclosedVersion",
+            "disclosedHash",
+            "idempotencyKey",
+          ],
           properties: {
             consent: { type: "boolean", const: true },
             expectedVersion: { type: "integer", minimum: 1 },
@@ -376,12 +470,14 @@ export async function registerProductRoutes(
     },
     async (request, reply) =>
       reply.send(
-        serializeOfferDto(await offers.accept({
-          ...request.body,
-          offerId: request.params.offerId,
-          actor: requireCustomerPrincipal(request),
-          requestId: request.id,
-        })),
+        serializeOfferDto(
+          await offers.accept({
+            ...request.body,
+            offerId: request.params.offerId,
+            actor: requireCustomerPrincipal(request),
+            requestId: request.id,
+          }),
+        ),
       ),
   );
 }
@@ -392,7 +488,11 @@ function requireStaffRole(
 ) {
   const principal = requireStaffPrincipal(request);
   if (!principal.roles.some((role) => roles.includes(role))) {
-    throw new AppError(403, "FORBIDDEN", "This financing control is not permitted for the staff role.");
+    throw new AppError(
+      403,
+      "FORBIDDEN",
+      "This financing control is not permitted for the staff role.",
+    );
   }
   return principal;
 }

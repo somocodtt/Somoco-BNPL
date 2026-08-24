@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendAuditEvent,
   collectionsRepo,
@@ -221,16 +221,17 @@ export function createSettlementService(options: {
         assertGate(gate);
         const approvals = await repo.findSettlementApprovals(input.contractId);
         const finance = approvals.find(
-          (item) => item.approvalType === "FINANCE_RECONCILIATION",
+          (item) => item.id === workflow.financeApprovalId,
         );
         const business = approvals.find(
-          (item) => item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER",
+          (item) => item.id === workflow.businessApprovalId,
         );
         const evidence = await repo.findSettlementEvidence(input.contractId);
         if (
           finance === undefined ||
           business === undefined ||
           evidence === null ||
+          evidence.evidenceDocumentId === null ||
           evidence.verificationStatus !== "CLEAN"
         )
           throw new AppError(
@@ -245,6 +246,7 @@ export function createSettlementService(options: {
           approvedBy: input.actor.staffUserId,
           evidence: {
             evidenceId: evidence.id,
+            registrationEvidenceDocumentId: evidence.evidenceDocumentId,
             evidenceDocumentReference: evidence.evidenceDocumentReference,
             evidenceHash: evidence.evidenceHash,
             financeApprovalId: finance.id,
@@ -327,21 +329,35 @@ async function createApproval(
   return withTransaction(database, async (tx) => {
     const repo = collectionsRepo(tx);
     await repo.lockContractAggregate(input.contractId);
-    if ((await repo.findContractContext(input.contractId)) === null)
+    const gate = await repo.settlementGate(input.contractId);
+    if (gate === null)
       throw new AppError(
         404,
         "CONTRACT_NOT_FOUND",
         "The contract was not found.",
       );
+    if (gate.contract_status !== "ACTIVE" || BigInt(gate.balance) !== 0n)
+      throw new AppError(
+        409,
+        "CONTRACT_BALANCE_OUTSTANDING",
+        "The active contractual balance must be zero before approval.",
+      );
+    assertGate(gate);
+    const snapshot = await captureSettlementApprovalSnapshot(
+      repo,
+      input.contractId,
+    );
     const existingType = await repo.findSettlementApproval(
       input.contractId,
       input.approvalType,
+      snapshot.bundleDigest,
     );
     if (existingType !== null)
       return {
         id: existingType.id,
         contractId: input.contractId,
         approvalType: existingType.approvalType,
+        bundleDigest: existingType.bundleDigest,
         replay: true,
       };
     const oppositeType =
@@ -351,6 +367,7 @@ async function createApproval(
     const opposite = await repo.findSettlementApproval(
       input.contractId,
       oppositeType,
+      snapshot.bundleDigest,
     );
     if (opposite?.approvedBy === input.actor.staffUserId)
       throw new AppError(
@@ -366,11 +383,18 @@ async function createApproval(
       idempotencyKey: input.idempotencyKey,
       approvedBy: input.actor.staffUserId,
       reason,
+      contractVersion: snapshot.contractVersion,
+      ledgerHeadId: snapshot.ledgerHeadId,
+      ledgerDigest: snapshot.ledgerDigest,
+      balanceMinorUnits: snapshot.balanceMinorUnits,
+      reconciliationCheckpoint: snapshot.reconciliationCheckpoint,
+      bundleDigest: snapshot.bundleDigest,
       approvedAt: now,
     });
     if (
       result.row.contractId !== input.contractId ||
-      result.row.approvalType !== input.approvalType
+      result.row.approvalType !== input.approvalType ||
+      result.row.bundleDigest !== snapshot.bundleDigest
     )
       throw new AppError(
         409,
@@ -391,6 +415,12 @@ async function createApproval(
         data: {
           approvalId: result.row.id,
           approvalType: input.approvalType,
+          contractVersion: snapshot.contractVersion,
+          ledgerHeadId: snapshot.ledgerHeadId,
+          ledgerDigest: snapshot.ledgerDigest,
+          balanceMinorUnits: snapshot.balanceMinorUnits.toString(),
+          reconciliationCheckpoint: snapshot.reconciliationCheckpoint,
+          bundleDigest: snapshot.bundleDigest,
           reason,
         },
         occurredAt: now,
@@ -399,6 +429,7 @@ async function createApproval(
       id: result.row.id,
       contractId: input.contractId,
       approvalType: result.row.approvalType,
+      bundleDigest: result.row.bundleDigest,
       replay: !result.inserted,
     };
   });
@@ -453,20 +484,37 @@ async function settleContract(
         "The contractual balance must be zero before settlement.",
       );
     assertGate(gate);
+    const snapshot = await captureSettlementApprovalSnapshot(
+      repo,
+      input.contractId,
+    );
     const approvals = await repo.findSettlementApprovals(input.contractId);
     const finance = approvals.find(
-      (item) => item.approvalType === "FINANCE_RECONCILIATION",
+      (item) =>
+        item.approvalType === "FINANCE_RECONCILIATION" &&
+        approvalMatchesSnapshot(item, snapshot),
     );
     const business = approvals.find(
-      (item) => item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER",
+      (item) =>
+        item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER" &&
+        approvalMatchesSnapshot(item, snapshot),
     );
     const evidence = await repo.findSettlementEvidence(input.contractId);
-    if (
-      finance === undefined ||
-      business === undefined ||
-      evidence === null ||
-      evidence.verificationStatus !== "CLEAN"
-    )
+    if (finance === undefined || business === undefined) {
+      const hasStaleBundle = approvals.some((item) =>
+        ["FINANCE_RECONCILIATION", "BUSINESS_OWNERSHIP_TRANSFER"].includes(
+          item.approvalType,
+        ),
+      );
+      throw new AppError(
+        409,
+        hasStaleBundle
+          ? "SETTLEMENT_APPROVAL_STALE"
+          : "SETTLEMENT_GATES_INCOMPLETE",
+        "A current matching dual settlement approval bundle is required.",
+      );
+    }
+    if (evidence === null || evidence.verificationStatus !== "CLEAN")
       throw new AppError(
         409,
         "SETTLEMENT_GATES_INCOMPLETE",
@@ -490,12 +538,20 @@ async function settleContract(
         "The contractual balance must be zero before settlement.",
       );
     assertGate(finalGate);
+    const finalSnapshot = await captureSettlementApprovalSnapshot(
+      repo,
+      input.contractId,
+    );
     const finalApprovals = await repo.findSettlementApprovals(input.contractId);
     const finalFinance = finalApprovals.find(
-      (item) => item.approvalType === "FINANCE_RECONCILIATION",
+      (item) =>
+        item.approvalType === "FINANCE_RECONCILIATION" &&
+        approvalMatchesSnapshot(item, finalSnapshot),
     );
     const finalBusiness = finalApprovals.find(
-      (item) => item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER",
+      (item) =>
+        item.approvalType === "BUSINESS_OWNERSHIP_TRANSFER" &&
+        approvalMatchesSnapshot(item, finalSnapshot),
     );
     const finalEvidence = await repo.findSettlementEvidence(input.contractId);
     if (
@@ -573,6 +629,73 @@ async function settleContract(
       replay: false,
     };
   });
+}
+
+interface SettlementApprovalSnapshot {
+  contractVersion: number;
+  ledgerHeadId: string | null;
+  ledgerDigest: string;
+  balanceMinorUnits: bigint;
+  reconciliationCheckpoint: string;
+  bundleDigest: string;
+}
+
+async function captureSettlementApprovalSnapshot(
+  repo: ReturnType<typeof collectionsRepo>,
+  contractId: string,
+): Promise<SettlementApprovalSnapshot> {
+  const row = await repo.settlementApprovalSnapshot(contractId);
+  if (row === null)
+    throw new AppError(
+      404,
+      "CONTRACT_NOT_FOUND",
+      "The contract was not found.",
+    );
+  const ledgerDigest = sha256Json(row.ledger_state);
+  const reconciliationCheckpoint = sha256Json({
+    reconciliation: row.reconciliation_state,
+    payments: row.payment_state,
+  });
+  const base = {
+    contractVersion: row.contract_version,
+    ledgerHeadId: row.ledger_head_id,
+    ledgerDigest,
+    balanceMinorUnits: row.balance,
+    reconciliationCheckpoint,
+  };
+  return {
+    contractVersion: base.contractVersion,
+    ledgerHeadId: base.ledgerHeadId,
+    ledgerDigest: base.ledgerDigest,
+    balanceMinorUnits: BigInt(base.balanceMinorUnits),
+    reconciliationCheckpoint: base.reconciliationCheckpoint,
+    bundleDigest: sha256Json(base),
+  };
+}
+
+function approvalMatchesSnapshot(
+  approval: {
+    contractVersion: number;
+    ledgerHeadId: string | null;
+    ledgerDigest: string;
+    balanceMinorUnits: bigint;
+    reconciliationCheckpoint: string;
+    bundleDigest: string;
+  },
+  snapshot: SettlementApprovalSnapshot,
+): boolean {
+  return (
+    approval.contractVersion === snapshot.contractVersion &&
+    approval.ledgerHeadId === snapshot.ledgerHeadId &&
+    approval.ledgerDigest === snapshot.ledgerDigest &&
+    BigInt(approval.balanceMinorUnits) === snapshot.balanceMinorUnits &&
+    approval.reconciliationCheckpoint === snapshot.reconciliationCheckpoint &&
+    approval.bundleDigest === snapshot.bundleDigest
+  );
+}
+
+function sha256Json(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function assertGate(gate: {

@@ -8,7 +8,9 @@ export type StaffRole =
   | "INVENTORY_OFFICER"
   | "FINANCE_OFFICER"
   | "RECOVERY_OFFICER"
+  | "COMPLIANCE_OFFICER"
   | "COMPLIANCE_AUDITOR"
+  | "DPO"
   | "CUSTOMER_SUPPORT"
   | "SYSTEM_ADMIN";
 
@@ -216,6 +218,7 @@ export type StaffContractStatus =
   | "EXECUTED"
   | "ACTIVE"
   | "SETTLED"
+  | "TRANSFERRED"
   | "RECOVERY"
   | "TERMINATED";
 
@@ -229,7 +232,7 @@ export interface StaffContractSummary {
   version: number;
   canonicalHash: string;
   previewReference: string;
-  ownershipHolder: "SOMOCO";
+  ownershipHolder: "SOMOCO" | "CUSTOMER";
   outstandingBalanceMinor: string;
   generatedAt: string;
   activatedAt: string | null;
@@ -971,12 +974,16 @@ function mapContractSummary(value: unknown): StaffContractSummary {
     "EXECUTED",
     "ACTIVE",
     "SETTLED",
+    "TRANSFERRED",
     "RECOVERY",
     "TERMINATED",
   ];
   if (!statuses.includes(value.status as StaffContractStatus))
     throw malformedStaff("MALFORMED_CONTRACT_DTO");
-  if (value.ownershipHolder !== "SOMOCO")
+  if (
+    value.ownershipHolder !== "SOMOCO" &&
+    value.ownershipHolder !== "CUSTOMER"
+  )
     throw malformedStaff("MALFORMED_CONTRACT_DTO");
   return {
     id: requiredString(value.id, "MALFORMED_CONTRACT_DTO"),
@@ -1003,7 +1010,7 @@ function mapContractSummary(value: unknown): StaffContractSummary {
       value.previewReference,
       "MALFORMED_CONTRACT_DTO",
     ),
-    ownershipHolder: "SOMOCO",
+    ownershipHolder: value.ownershipHolder,
     outstandingBalanceMinor: requiredString(
       value.outstandingBalanceMinor,
       "MALFORMED_CONTRACT_DTO",

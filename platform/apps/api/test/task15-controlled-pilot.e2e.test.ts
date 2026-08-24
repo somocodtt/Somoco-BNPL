@@ -689,6 +689,10 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     const ownershipEvidence = await queryTestSql<{
       contract_status: string;
       ownership_holder: string;
+      vehicle_status: string;
+      registration_owner: string;
+      registration_evidence_id: string | null;
+      transfer_evidence_id: string | null;
       finance_approvals: string;
       business_approvals: string;
       transfer_count: string;
@@ -697,21 +701,63 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       databaseUrl,
       `select c.status as contract_status,
               c.ownership_holder,
+              vehicle.status::text as vehicle_status,
+              registration.registered_owner::text as registration_owner,
+              registration.evidence_document_id::text as registration_evidence_id,
+              transfer.evidence->>'registrationEvidenceDocumentId' as transfer_evidence_id,
               (select count(*) from settlement_approval where contract_id = c.id and approval_type = 'FINANCE_RECONCILIATION')::text as finance_approvals,
               (select count(*) from settlement_approval where contract_id = c.id and approval_type = 'BUSINESS_OWNERSHIP_TRANSFER')::text as business_approvals,
               (select count(*) from ownership_transfer where contract_id = c.id)::text as transfer_count,
-              (select status::text from ownership_transfer where contract_id = c.id) as transfer_status
+              transfer.status::text as transfer_status
          from contract c
+         join vehicle_unit vehicle on vehicle.id = c.vehicle_unit_id
+         join ownership_transfer transfer on transfer.contract_id = c.id
+         join lateral (
+           select * from registration_record record
+            where record.vehicle_unit_id = vehicle.id
+            order by record.created_at desc, record.id desc limit 1
+         ) registration on true
         where c.id = $1`,
       [contractId],
     );
     expect(ownershipEvidence).toEqual({
-      contract_status: "SETTLED",
-      ownership_holder: "SOMOCO",
+      contract_status: "TRANSFERRED",
+      ownership_holder: "CUSTOMER",
+      vehicle_status: "TRANSFERRED",
+      registration_owner: "CUSTOMER",
+      registration_evidence_id: flow.transferEvidenceDocumentId,
+      transfer_evidence_id: flow.transferEvidenceDocumentId,
       finance_approvals: "1",
       business_approvals: "1",
       transfer_count: "1",
       transfer_status: "COMPLETED",
+    });
+
+    const freshStaffContract = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      `/v1/staff/applications/${flow.applicationId}/contract`,
+      { headers: runtime.staff.get("INVENTORY_OFFICER")!.headers },
+    );
+    expect(freshStaffContract.status()).toBe(200);
+    await expect(body(freshStaffContract)).resolves.toMatchObject({
+      status: "TRANSFERRED",
+      ownershipHolder: "CUSTOMER",
+    });
+    const freshCustomerContract = await call(
+      request,
+      runtime.baseUrl,
+      "get",
+      `/v1/customer/applications/${flow.applicationId}/contract`,
+      { headers: runtime.customer.applicant.headers },
+    );
+    expect(freshCustomerContract.status()).toBe(200);
+    await expect(body(freshCustomerContract)).resolves.toMatchObject({
+      status: "TRANSFERRED",
+      ownershipHolder: "CUSTOMER",
+      vehicleStatus: "TRANSFERRED",
+      registrationOwner: "CUSTOMER",
     });
   }, 60_000);
 
@@ -985,9 +1031,9 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       databaseUrl,
       `select
           (select count(*) from payment_transaction where provider_transaction_id = $1)::text as payment_count,
-          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id = $2 and processed_at is not null)::text as processed_count,
-          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id = $2 and payload->>'rawBodyBase64' is not null)::text as raw_body_count`,
-      [event.providerTransactionId, event.eventId],
+          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id like 'unverified:sha256:%' and processed_at is not null)::text as processed_count,
+          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id like 'unverified:sha256:%' and payload->>'rawBodyBase64' is not null)::text as raw_body_count`,
+      [event.providerTransactionId],
     );
     expect(preserved).toEqual({
       payment_count: "0",

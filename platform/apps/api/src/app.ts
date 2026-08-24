@@ -90,6 +90,7 @@ import { registerMigrationRoutes } from "./modules/migration/routes.js";
 import { registerPrivacyRoutes } from "./modules/privacy/routes.js";
 import {
   createPrivacyService,
+  isDurablePrivacyService,
   type PrivacyService,
 } from "./modules/privacy/service.js";
 
@@ -177,6 +178,9 @@ export async function buildApp(
   const database = options.database ?? connection!.db;
   if (productionRuntime && options.privacy?.service === undefined) {
     throw new Error("PRODUCTION_PRIVACY_COMPOSITION_REQUIRED");
+  }
+  if (productionRuntime && !isDurablePrivacyService(options.privacy?.service)) {
+    throw new Error("PRODUCTION_DURABLE_PRIVACY_REQUIRED");
   }
   const telemetry = options.telemetry ?? createTelemetry();
   const databaseProbe = options.databaseProbe ?? probeDatabase;

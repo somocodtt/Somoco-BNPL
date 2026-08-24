@@ -15,7 +15,10 @@ import {
 } from "../src/modules/payments/ledger-service.js";
 import { buildApp, type BuildAppOptions } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
-import { createPrivacyService } from "../src/modules/privacy/service.js";
+import {
+  createPostgresPrivacyService,
+  createPrivacyService,
+} from "../src/modules/privacy/service.js";
 
 const testConfig: AppConfig = {
   environment: "test",
@@ -95,6 +98,37 @@ describe("Task 14 fix round 3", () => {
     expect(databaseProbe).not.toHaveBeenCalled();
     expect(dependencyCheck).not.toHaveBeenCalled();
     expect(telemetry.setDependency).not.toHaveBeenCalled();
+  });
+
+  it("rejects the test-only Map privacy service and accepts an attested PostgreSQL service in production", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const databaseProbe = vi.fn(async () => true);
+    const dependencyCheck = vi.fn(async () => true);
+    const telemetry = spyTelemetry();
+    const options = validProductionOptions({
+      databaseProbe,
+      dependencyCheck,
+      telemetry,
+    });
+
+    await expect(
+      buildApp({
+        ...options,
+        config: productionConfig,
+        privacy: { service: createPrivacyService() },
+      }),
+    ).rejects.toThrow("PRODUCTION_DURABLE_PRIVACY_REQUIRED");
+    expect(databaseProbe).not.toHaveBeenCalled();
+
+    const app = await buildApp({
+      ...options,
+      config: productionConfig,
+      privacy: {
+        service: createPostgresPrivacyService({ database: options.database! }),
+      },
+    });
+    expect(databaseProbe).toHaveBeenCalledTimes(1);
+    await app.close();
   });
 });
 

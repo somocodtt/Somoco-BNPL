@@ -36,7 +36,7 @@ const config: AppConfig = {
   paymentAdapter: "approved-payment",
   objectStoragePublic: false,
   encryptionKeyRef: "secret/somo/prod/document-encryption",
-  backupLastVerifiedAt: "2026-08-22T00:00:00.000Z",
+  backupLastVerifiedAt: new Date(Date.now() - 60_000).toISOString(),
 };
 
 describe("production API bootstrap", () => {

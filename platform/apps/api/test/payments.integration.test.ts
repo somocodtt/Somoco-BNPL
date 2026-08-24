@@ -54,6 +54,7 @@ import {
 } from "../src/modules/payments/ledger-service.js";
 import { createReconciliationService } from "../src/modules/payments/reconciliation-service.js";
 import { createReceiptService } from "../src/modules/payments/receipt-service.js";
+import { createSettlementService } from "../src/modules/contracts/settlement-service.js";
 import type {
   CustomerPrincipal,
   StaffPrincipal,
@@ -223,6 +224,34 @@ describe("Somoco payment boundary", () => {
     ).toBe(0);
   });
 
+  it("rejects a verified payment amount above signed bigint storage before persistence", async () => {
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: "evt-payment-overflow",
+        providerTransactionId: "txn-payment-overflow",
+        amount: { currency: "GHS", minorUnits: "9223372036854775808" },
+      })),
+      policy: policy(),
+    });
+
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("payment-overflow")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).rejects.toMatchObject({ code: "MALFORMED_PAYMENT_EVENT" });
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ count: number }>(
+          sql`select count(*)::int as count from inbox_message`,
+        )
+      ).rows[0]?.count,
+    ).toBe(0);
+  });
+
   it("preserves a nested production transport outage and posts recovery once", async () => {
     const graph = await insertContractGraph(database);
     const outageEvent: CanonicalPaymentEvent = {
@@ -298,12 +327,12 @@ describe("Somoco payment boundary", () => {
           (select count(*)::int
              from inbox_message
             where provider = 'SOMOCO_PAYMENTS'
-              and provider_event_id = ${outageEvent.eventId}
+              and provider_event_id like 'unverified:sha256:%'
               and processed_at is not null) as processed_count,
           (select payload->>'rawBodyBase64'
              from inbox_message
             where provider = 'SOMOCO_PAYMENTS'
-              and provider_event_id = ${outageEvent.eventId}) as raw_body_base64
+              and provider_event_id like 'unverified:sha256:%') as raw_body_base64
       `);
       expect(preserved.rows[0]).toEqual({
         payment_count: 0,
@@ -359,6 +388,104 @@ describe("Somoco payment boundary", () => {
     } finally {
       await app.close();
     }
+  });
+
+  it("keeps attacker outage fields non-canonical and links verified recovery exactly once", async () => {
+    const graph = await insertContractGraph(database);
+    const canonical: CanonicalPaymentEvent = {
+      ...event,
+      eventId: "evt-adversarial-outage-canonical",
+      eventType: "PAYMENT_SUCCEEDED",
+      providerTransactionId: "txn-adversarial-outage-canonical",
+      customerReference: graph.reference,
+    };
+    const attackerBody = JSON.stringify({
+      eventId: canonical.eventId,
+      eventType: "PAYMENT_REFUNDED",
+      providerTransactionId: "txn-attacker-controlled",
+      customerReference: "ATTACKER-CONTROLLED",
+      amount: { currency: "GHS", minorUnits: "9223372036854775807" },
+    });
+    let available = false;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => {
+        if (!available)
+          throw Object.assign(new Error("network down"), {
+            code: "ECONNRESET",
+          });
+        return canonical;
+      }),
+      policy: policy(),
+    });
+    const input = {
+      rawBody: new Uint8Array(Buffer.from(attackerBody)),
+      signature: "adversarial-outage-signature",
+      requestTimestamp: canonical.occurredAt,
+    };
+
+    await expect(service.receive(input)).rejects.toMatchObject({
+      code: "PAYMENT_PROVIDER_UNAVAILABLE",
+    });
+    available = true;
+    await expect(service.receive(input)).resolves.toMatchObject({
+      eventId: canonical.eventId,
+      outcome: "POSTED",
+      duplicate: false,
+    });
+    await expect(service.receive(input)).resolves.toMatchObject({
+      eventId: canonical.eventId,
+      outcome: "POSTED",
+    });
+
+    const evidence = await getInternalDatabase(database).execute<{
+      provider_event_id: string;
+      event_type: string;
+      provider_transaction_id: string | null;
+      preservation_message_id: string | null;
+    }>(sql`
+      select provider_event_id, event_type,
+             payload->>'providerTransactionId' as provider_transaction_id,
+             preservation_message_id::text
+        from inbox_message
+       where provider = 'SOMOCO_PAYMENTS'
+       order by provider_event_id
+    `);
+    expect(evidence.rows).toHaveLength(2);
+    const preservation = evidence.rows.find((row) =>
+      row.provider_event_id.startsWith("unverified:sha256:"),
+    );
+    const verified = evidence.rows.find(
+      (row) => row.provider_event_id === canonical.eventId,
+    );
+    expect(preservation).toMatchObject({
+      event_type: "PAYMENT_VERIFICATION_UNAVAILABLE",
+      provider_transaction_id: null,
+      preservation_message_id: null,
+    });
+    expect(verified).toMatchObject({
+      event_type: "PAYMENT_SUCCEEDED",
+      provider_transaction_id: canonical.providerTransactionId,
+      preservation_message_id: expect.any(String),
+    });
+    expect(verified?.preservation_message_id).toBe(
+      (
+        await getInternalDatabase(database).execute<{ id: string }>(sql`
+          select id::text from inbox_message
+           where provider_event_id like 'unverified:sha256:%'
+        `)
+      ).rows[0]?.id,
+    );
+    expect(
+      (
+        await getInternalDatabase(database).execute<{ count: number }>(sql`
+          select count(*)::int as count
+            from ledger_entry l
+            join payment_transaction p on p.id = l.payment_transaction_id
+           where p.provider_transaction_id = ${canonical.providerTransactionId}
+        `)
+      ).rows[0]?.count,
+    ).toBe(1);
   });
 
   it("quarantines a duplicate provider transaction without a second posting", async () => {
@@ -1092,6 +1219,180 @@ describe("Somoco payment boundary", () => {
     ).toBe(2);
   });
 
+  it("treats reversal and refund notifications as one compensation lifecycle", async () => {
+    const graph = await insertContractGraph(database);
+    let notification: "ORIGINAL" | "REVERSAL" | "REFUND" = "ORIGINAL";
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId:
+          notification === "ORIGINAL"
+            ? "evt-one-compensation-original"
+            : notification === "REVERSAL"
+              ? "evt-one-compensation-reversal"
+              : "evt-one-compensation-refund",
+        eventType:
+          notification === "ORIGINAL"
+            ? "PAYMENT_SUCCEEDED"
+            : notification === "REVERSAL"
+              ? "PAYMENT_REVERSED"
+              : "PAYMENT_REFUNDED",
+        providerTransactionId: "txn-one-compensation",
+        customerReference: graph.reference,
+      })),
+      policy: policy(),
+    });
+
+    await service.receive({
+      rawBody: new Uint8Array(Buffer.from("one-compensation-original")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    notification = "REVERSAL";
+    const reversal = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("one-compensation-reversal")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    notification = "REFUND";
+    const refund = await service.receive({
+      rawBody: new Uint8Array(Buffer.from("one-compensation-refund")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+
+    expect(reversal.duplicate).toBe(false);
+    expect(refund).toMatchObject({
+      duplicate: true,
+      paymentTransactionId: reversal.paymentTransactionId,
+    });
+    expect(
+      await getInternalDatabase(database).execute<{
+        payments: number;
+        compensations: number;
+        balance: string;
+      }>(sql`
+        select (select count(*)::int from payment_transaction) as payments,
+               (select count(*)::int from ledger_entry where reverses_entry_id is not null) as compensations,
+               (select outstanding_balance_minor_units::text from contract where id = ${graph.contractId}) as balance
+      `),
+    ).toMatchObject({
+      rows: [{ payments: 2, compensations: 1, balance: "100000" }],
+    });
+  });
+
+  it("allows a resolved reversal plus replacement payment to settle", async () => {
+    const graph = await insertContractGraph(database);
+    let phase: "ORIGINAL" | "REVERSAL" | "REPLACEMENT" = "ORIGINAL";
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: `evt-replacement-${phase.toLowerCase()}`,
+        eventType:
+          phase === "REVERSAL" ? "PAYMENT_REVERSED" : "PAYMENT_SUCCEEDED",
+        providerTransactionId:
+          phase === "REPLACEMENT"
+            ? "txn-replacement-new"
+            : "txn-replacement-original",
+        customerReference: graph.reference,
+        amount: { currency: "GHS", minorUnits: "100000" },
+      })),
+      policy: policy(),
+    });
+    for (const next of ["ORIGINAL", "REVERSAL", "REPLACEMENT"] as const) {
+      phase = next;
+      await service.receive({
+        rawBody: new Uint8Array(Buffer.from(`replacement-${next}`)),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      });
+    }
+
+    const settled = await settlePaymentFixture(database, graph.contractId);
+    expect(settled).toMatchObject({ status: "SETTLED" });
+  });
+
+  it("quarantines post-settlement reversals and adjustments without reopening the contract", async () => {
+    const graph = await insertContractGraph(database);
+    let reversal = false;
+    const service = createPaymentWebhookService({
+      database,
+      verifier: verifierFor(async () => ({
+        ...event,
+        eventId: reversal
+          ? "evt-post-settlement-reversal"
+          : "evt-post-settlement-original",
+        eventType: reversal ? "PAYMENT_REVERSED" : "PAYMENT_SUCCEEDED",
+        providerTransactionId: "txn-post-settlement",
+        customerReference: graph.reference,
+        amount: { currency: "GHS", minorUnits: "100000" },
+      })),
+      policy: policy(),
+    });
+    await service.receive({
+      rawBody: new Uint8Array(Buffer.from("post-settlement-original")),
+      signature: "sig",
+      requestTimestamp: event.occurredAt,
+    });
+    await settlePaymentFixture(database, graph.contractId);
+
+    reversal = true;
+    await expect(
+      service.receive({
+        rawBody: new Uint8Array(Buffer.from("post-settlement-reversal")),
+        signature: "sig",
+        requestTimestamp: event.occurredAt,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "QUARANTINED",
+      reason: "POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION",
+    });
+
+    const maker = await insertStaff(database, "FINANCE_OFFICER");
+    const checker = await insertStaff(database, "COMPLIANCE_OFFICER");
+    const ledger = createLedgerService({ database });
+    const adjustment = await ledger.requestAdjustment({
+      contractId: graph.contractId,
+      amountMinorUnits: 1_000n,
+      direction: "DEBIT",
+      reason: "Late provider correction",
+      maker: staffPrincipal(maker, "FINANCE_OFFICER"),
+      idempotencyKey: "post-settlement-adjustment",
+    });
+    await expect(
+      ledger.approveAdjustment({
+        adjustmentId: adjustment.id,
+        checker: staffPrincipal(checker, "COMPLIANCE_OFFICER"),
+        decision: "APPROVE",
+        reason: "Escalate to human exception",
+      }),
+    ).resolves.toMatchObject({ status: "QUARANTINED" });
+
+    const state = await getInternalDatabase(database).execute<{
+      status: string;
+      balance: string;
+      ledger_count: number;
+      open_cases: number;
+    }>(sql`
+      select c.status,
+             c.outstanding_balance_minor_units::text as balance,
+             (select count(*)::int from ledger_entry l where l.contract_id = c.id) as ledger_count,
+             (select count(*)::int from reconciliation_case rc
+               left join payment_transaction p on p.id = rc.payment_transaction_id
+              where rc.status <> 'RESOLVED'
+                and (p.contract_id = c.id or rc.dedupe_key = ${`POST_SETTLEMENT_ADJUSTMENT:${adjustment.id}`})) as open_cases
+        from contract c where c.id = ${graph.contractId}
+    `);
+    expect(state.rows[0]).toEqual({
+      status: "SETTLED",
+      balance: "0",
+      ledger_count: 1,
+      open_cases: 2,
+    });
+  });
+
   it("requires separate maker and checker for adjustment decisions", async () => {
     const graph = await insertContractGraph(database);
     const makerId = await insertStaff(database, "FINANCE_OFFICER");
@@ -1159,6 +1460,56 @@ describe("Somoco payment boundary", () => {
         reason: "replay",
       }),
     ).rejects.toThrow("PAYMENT_ADJUSTMENT_ALREADY_DECIDED");
+  });
+
+  it("keeps auditor and system admin read-only while a compliance officer checks an adjustment", async () => {
+    const graph = await insertContractGraph(database);
+    const makerId = await insertStaff(database, "FINANCE_OFFICER");
+    const checkerId = await insertStaff(database, "CFO");
+    const ledger = createLedgerService({ database });
+    const pending = await ledger.requestAdjustment({
+      contractId: graph.contractId,
+      amountMinorUnits: 1_000n,
+      direction: "CREDIT",
+      reason: "Correct an independently verified allocation",
+      maker: {
+        kind: "staff",
+        staffUserId: makerId,
+        roles: ["FINANCE_OFFICER"],
+        sessionId: randomUUID(),
+      },
+      idempotencyKey: randomUUID(),
+    });
+
+    for (const role of ["COMPLIANCE_AUDITOR", "SYSTEM_ADMIN"] as StaffRole[]) {
+      await expect(
+        ledger.approveAdjustment({
+          adjustmentId: pending.id,
+          checker: {
+            kind: "staff",
+            staffUserId: checkerId,
+            roles: [role],
+            sessionId: randomUUID(),
+          },
+          decision: "APPROVE",
+          reason: "Read-only role must not post an adjustment",
+        }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+
+    await expect(
+      ledger.approveAdjustment({
+        adjustmentId: pending.id,
+        checker: {
+          kind: "staff",
+          staffUserId: checkerId,
+          roles: ["COMPLIANCE_OFFICER" as StaffRole],
+          sessionId: randomUUID(),
+        },
+        decision: "APPROVE",
+        reason: "Independent compliance review completed",
+      }),
+    ).resolves.toMatchObject({ status: "APPROVED" });
   });
 
   it("persists matched and variance settlement cases", async () => {
@@ -1658,7 +2009,7 @@ async function insertContractGraph(
 
 async function insertStaff(
   database: Database,
-  role: "FINANCE_OFFICER" | "CFO",
+  role: StaffRole,
 ): Promise<string> {
   const db = getInternalDatabase(database);
   const id = randomUUID();
@@ -1667,6 +2018,62 @@ async function insertStaff(
     .values({ id, email: `${id}@example.test`, passwordHash: "test-hash" });
   await db.insert(staffRoleAssignment).values({ staffUserId: id, role });
   return id;
+}
+
+function staffPrincipal(staffUserId: string, role: StaffRole): StaffPrincipal {
+  return {
+    kind: "staff",
+    staffUserId,
+    roles: [role],
+    sessionId: randomUUID(),
+  };
+}
+
+async function settlePaymentFixture(
+  database: Database,
+  contractId: string,
+): Promise<Record<string, unknown>> {
+  const financeId = await insertStaff(database, "CFO");
+  const businessId = await insertStaff(database, "MD");
+  const documentId = randomUUID();
+  const internal = getInternalDatabase(database);
+  await internal.execute(sql`
+    insert into privacy.document
+      (id, person_id, document_type, object_key, declared_mime_type,
+       declared_size_bytes, upload_ticket_hash, upload_expires_at,
+       accepted_object_key, accepted_object_version_id, accepted_object_etag,
+       sha256, status, malware_scanned)
+    select ${documentId}, a.applicant_person_id, 'TRANSFER_EVIDENCE',
+           ${`pending/${documentId}`}, 'application/pdf', 128,
+           ${"a".repeat(64)}, now() + interval '5 minutes',
+           ${`accepted/${documentId}`}, 'v1', 'etag', ${"b".repeat(64)},
+           'ACCEPTED', true
+      from contract c
+      join application a on a.id = c.application_id
+     where c.id = ${contractId}
+  `);
+  const settlement = createSettlementService({ database });
+  await settlement.recordEvidence({
+    contractId,
+    evidenceDocumentId: documentId,
+    actor: staffPrincipal(businessId, "MD"),
+  });
+  await settlement.approveFinance({
+    contractId,
+    reason: "Verified replacement payment reconciliation",
+    idempotencyKey: `finance-${contractId}`,
+    actor: staffPrincipal(financeId, "CFO"),
+  });
+  await settlement.approveBusiness({
+    contractId,
+    reason: "Verified ownership transfer prerequisites",
+    idempotencyKey: `business-${contractId}`,
+    actor: staffPrincipal(businessId, "MD"),
+  });
+  return settlement.settle({
+    contractId,
+    actor: staffPrincipal(financeId, "CFO"),
+  });
 }
 
 async function insertHttpStaff(database: Database, role: StaffRole) {

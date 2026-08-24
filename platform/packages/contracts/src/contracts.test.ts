@@ -5,6 +5,7 @@ import {
   GhanaCardNumberSchema,
   GuarantorInvitationSchema,
   MoneyDtoSchema,
+  parseMinorUnits,
   PaginationSchema,
   PhoneNumberSchema,
   ProblemDetailSchema,
@@ -33,13 +34,17 @@ describe("shared transport contracts", () => {
     expect(UuidSchema.safeParse("not-a-uuid").success).toBe(false);
   });
 
-  it("accepts canonical signed 64-bit money DTO values", () => {
-    expect(
-      MoneyDtoSchema.safeParse({
-        currency: "GHS",
-        minorUnits: "9223372036854775807",
-      }).success,
-    ).toBe(true);
+  it.each(["99", "999", "9223372036854775807"])(
+    "accepts canonical signed 64-bit money DTO value %s",
+    (minorUnits) => {
+      expect(
+        MoneyDtoSchema.safeParse({ currency: "GHS", minorUnits }).success,
+      ).toBe(true);
+      expect(parseMinorUnits(minorUnits)).toBe(BigInt(minorUnits));
+    },
+  );
+
+  it("rejects noncanonical and signed-bigint-overflow money DTO values", () => {
     expect(
       MoneyDtoSchema.safeParse({ currency: "GHS", minorUnits: "01" }).success,
     ).toBe(false);
@@ -49,6 +54,9 @@ describe("shared transport contracts", () => {
         minorUnits: "9223372036854775808",
       }).success,
     ).toBe(false);
+    expect(() => parseMinorUnits("9223372036854775808")).toThrow(
+      "MONEY_MINOR_UNITS_INVALID",
+    );
   });
 
   it("defaults pagination and rejects unknown pagination fields", () => {

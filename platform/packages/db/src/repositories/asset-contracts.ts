@@ -921,25 +921,31 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
       vehicle_model_id: string;
       registration_number: string | null;
       registration_valid_to: string | null;
+      registration_owner: string | null;
       insurance_valid_to: string | null;
       handed_over: boolean;
+      vehicle_status: string;
     } | null> {
       const result = await executor.execute<{
         vehicle_model_id: string;
         registration_number: string | null;
         registration_valid_to: string | null;
+        registration_owner: string | null;
         insurance_valid_to: string | null;
         handed_over: boolean;
+        vehicle_status: string;
       }>(sql`
         select vehicle.vehicle_model_id,
                registration.registration_number,
                registration.valid_to as registration_valid_to,
+               registration.registered_owner::text as registration_owner,
                insurance.valid_to as insurance_valid_to,
-               vehicle.status = 'HANDED_OVER' as handed_over
+               vehicle.status in ('HANDED_OVER', 'TRANSFERRED') as handed_over,
+               vehicle.status::text as vehicle_status
           from vehicle_assignment assignment
           join vehicle_unit vehicle on vehicle.id = assignment.vehicle_unit_id
           left join lateral (
-            select registration_number, valid_to from registration_record
+            select registration_number, valid_to, registered_owner from registration_record
              where vehicle_unit_id = vehicle.id order by valid_to desc nulls last, created_at desc limit 1
           ) registration on true
           left join lateral (

@@ -10,6 +10,7 @@ export {
 } from "./outbox-context.js";
 export {
   completeInboxMessage,
+  findInboxMessage,
   receiveInboxMessage,
   type InboxMessage,
   type InboxMessageInput,

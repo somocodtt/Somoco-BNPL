@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -27,6 +28,7 @@ export const inboxMessage = pgTable(
     processingStartedAt: timestamp("processing_started_at", {
       withTimezone: true,
     }),
+    preservationMessageId: uuid("preservation_message_id"),
   },
   (table) => [
     uniqueIndex("inbox_provider_event_unique").on(
@@ -36,9 +38,19 @@ export const inboxMessage = pgTable(
     index("inbox_unprocessed_idx")
       .on(table.receivedAt)
       .where(sql`${table.processedAt} is null`),
+    index("inbox_preservation_message_idx").on(table.preservationMessageId),
     check(
       "inbox_processing_lease_consistent",
       sql`(${table.processingToken} is null) = (${table.processingStartedAt} is null)`,
+    ),
+    foreignKey({
+      columns: [table.preservationMessageId],
+      foreignColumns: [table.id],
+      name: "inbox_preservation_message_fk",
+    }).onDelete("restrict"),
+    check(
+      "inbox_preservation_not_self",
+      sql`${table.preservationMessageId} is null or ${table.preservationMessageId} <> ${table.id}`,
     ),
   ],
 );

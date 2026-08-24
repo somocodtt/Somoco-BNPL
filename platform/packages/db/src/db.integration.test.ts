@@ -94,7 +94,7 @@ describe("PostgreSQL persistence", () => {
     const after = await db.execute<{ count: number }>(sql`
       select count(*)::int as count from drizzle.__drizzle_migrations
     `);
-    expect(before.rows[0]?.count).toBe(32);
+    expect(before.rows[0]?.count).toBe(33);
     expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
   });
 
@@ -602,11 +602,36 @@ describe("PostgreSQL persistence", () => {
       id: transferId,
       contractId: graph.contractId,
     });
+    await db.insert(registrationRecord).values({
+      vehicleUnitId: graph.vehicleUnitId,
+      registrationNumber: "REG-SOMOCO-1001",
+      registeredOwner: "SOMOCO",
+      validFrom: "2026-08-14",
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+    });
+    const registrationEvidenceDocumentId = randomUUID();
+    await db.execute(sql`
+      insert into privacy.document
+        (id, person_id, document_type, object_key, declared_mime_type,
+         declared_size_bytes, upload_ticket_hash, upload_expires_at,
+         accepted_object_key, accepted_object_version_id,
+         accepted_object_etag, sha256, status, malware_scanned)
+      select ${registrationEvidenceDocumentId}::uuid,
+             application.applicant_person_id,
+             'TRANSFER_EVIDENCE',
+             ${`pending/${registrationEvidenceDocumentId}`},
+             'application/pdf', 128, repeat('a', 64), now() + interval '5 minutes',
+             ${`accepted/${registrationEvidenceDocumentId}`},
+             'v1', 'etag', repeat('b', 64), 'ACCEPTED', true
+        from contract
+        join application on application.id = contract.application_id
+       where contract.id = ${graph.contractId}
+    `);
 
     const completed = await completeOwnershipTransfer(database, {
       id: transferId,
       expectedVersion: 1,
-      evidence: { documentId: randomUUID() },
+      evidence: { registrationEvidenceDocumentId },
       transferredAt: new Date("2026-08-14T12:00:00.000Z"),
       effects: writeEffects(transferId, "OWNERSHIP_TRANSFER_COMPLETED"),
     });
@@ -616,13 +641,31 @@ describe("PostgreSQL persistence", () => {
     expect(await countRows(db, "audit_event")).toBe(1);
     expect(await countRows(db, "outbox_message")).toBe(1);
 
-    await db.insert(registrationRecord).values({
-      vehicleUnitId: graph.vehicleUnitId,
-      registrationNumber: "REG-CUSTOMER-1001",
-      registeredOwner: "CUSTOMER",
-      validFrom: "2026-08-14",
+    expect(await countRows(db, "registration_record")).toBe(2);
+    const authoritative = await db.execute<{
+      contract_status: string;
+      ownership_holder: string;
+      vehicle_status: string;
+      registered_owner: string;
+      evidence_document_id: string;
+    }>(sql`
+      select c.status::text as contract_status, c.ownership_holder,
+             v.status::text as vehicle_status,
+             r.registered_owner::text, r.evidence_document_id::text
+        from contract c join vehicle_unit v on v.id = c.vehicle_unit_id
+        join lateral (
+          select * from registration_record where vehicle_unit_id = v.id
+           order by created_at desc, id desc limit 1
+        ) r on true
+       where c.id = ${graph.contractId}
+    `);
+    expect(authoritative.rows[0]).toEqual({
+      contract_status: "TRANSFERRED",
+      ownership_holder: "CUSTOMER",
+      vehicle_status: "TRANSFERRED",
+      registered_owner: "CUSTOMER",
+      evidence_document_id: registrationEvidenceDocumentId,
     });
-    expect(await countRows(db, "registration_record")).toBe(1);
   });
 
   it("rejects customer registration before ownership transfer completes", async () => {
@@ -1921,6 +1964,77 @@ describe("populated legacy schema migration", () => {
         [legacy.contractId, staffId],
       ),
     ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("upgrades populated 0032 settlement and reconciliation rows through 0033", async () => {
+    const journal = JSON.parse(
+      await readFile(`${migrationsFolder}meta/_journal.json`, "utf8"),
+    ) as { entries: ReadonlyArray<{ tag: string }> };
+    for (const entry of journal.entries.slice(1, -1))
+      await applyMigrationFile(pool, `${entry.tag}.sql`);
+
+    const legacy = await insertLegacyFinancialGraph(pool, {
+      provider: "SOMOCO_PAYMENTS",
+      channel: "MOBILE_MONEY",
+      registeredOwner: "SOMOCO",
+      calculationMethod: "REDUCING_BALANCE",
+    });
+    const approverId = randomUUID();
+    await pool.query(
+      `insert into staff_user (id, email, password_hash)
+       values ($1, $2, 'hash')`,
+      [approverId, `${approverId}@example.test`],
+    );
+    const approvalId = randomUUID();
+    await pool.query(
+      `insert into settlement_approval
+        (id, contract_id, approval_type, idempotency_key, approved_by,
+         reason, approved_at)
+       values ($1, $2, 'FINANCE_RECONCILIATION', $3, $4, 'legacy approval', now())`,
+      [approvalId, legacy.contractId, `legacy-${approvalId}`, approverId],
+    );
+    const reconciliationId = randomUUID();
+    await pool.query(
+      `insert into reconciliation_case
+        (id, payment_transaction_id, reason, status)
+       values ($1, $2, 'LEGACY_REVIEW', 'OPEN')`,
+      [reconciliationId, legacy.paymentTransactionId],
+    );
+
+    await applyMigrationFile(pool, "0033_final_controlled_pilot_hardening.sql");
+
+    await expect(
+      pool.query(
+        `select approval.contract_version,
+                approval.balance_minor_units::text,
+                approval.ledger_digest,
+                approval.reconciliation_checkpoint,
+                approval.bundle_digest,
+                contract.outstanding_balance_minor_units::text as contract_balance
+           from settlement_approval approval
+           join contract on contract.id = approval.contract_id
+          where approval.id = $1`,
+        [approvalId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          contract_version: 1,
+          balance_minor_units: "100000",
+          contract_balance: "100000",
+          ledger_digest: "0".repeat(64),
+          reconciliation_checkpoint: "0".repeat(64),
+          bundle_digest: "0".repeat(64),
+        },
+      ],
+    });
+    await expect(
+      pool.query(`select contract_id from reconciliation_case where id = $1`, [
+        reconciliationId,
+      ]),
+    ).resolves.toMatchObject({
+      rows: [{ contract_id: legacy.contractId }],
+    });
   });
 
   it("fails 0008 closed with actionable remediation when legacy applications have multiple guarantors", async () => {

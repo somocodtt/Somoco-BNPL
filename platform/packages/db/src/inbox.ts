@@ -24,6 +24,24 @@ export type InboxReceipt = InboxMessage & {
   processingToken: string | null;
 };
 
+export async function findInboxMessage(
+  db: Database | DatabaseTransaction,
+  provider: string,
+  providerEventId: string,
+): Promise<InboxMessage | null> {
+  const [row] = await getInternalExecutor(db)
+    .select()
+    .from(inboxMessage)
+    .where(
+      and(
+        eq(inboxMessage.provider, provider),
+        eq(inboxMessage.providerEventId, providerEventId),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
 export async function receiveInboxMessage(
   db: Database | DatabaseTransaction,
   message: InboxMessageInput,

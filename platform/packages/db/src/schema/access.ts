@@ -29,7 +29,9 @@ export const staffRole = pgEnum("staff_role", [
   "INVENTORY_OFFICER",
   "FINANCE_OFFICER",
   "RECOVERY_OFFICER",
+  "COMPLIANCE_OFFICER",
   "COMPLIANCE_AUDITOR",
+  "DPO",
   "CUSTOMER_SUPPORT",
   "SYSTEM_ADMIN",
 ]);

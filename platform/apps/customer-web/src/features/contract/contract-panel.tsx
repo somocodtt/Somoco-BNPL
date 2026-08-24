@@ -6,6 +6,7 @@ export type CustomerContractStatus =
   | "EXECUTED"
   | "ACTIVE"
   | "SETTLED"
+  | "TRANSFERRED"
   | "RECOVERY"
   | "TERMINATED";
 
@@ -15,6 +16,9 @@ export interface CustomerContractView {
   previewAvailable: boolean;
   executed: boolean;
   assignedVehicleAvailable: boolean;
+  ownershipHolder: "SOMOCO" | "CUSTOMER";
+  vehicleStatus: string;
+  registrationOwner: "SOMOCO" | "CUSTOMER" | null;
   registrationNumber: string | null;
   registrationValidTo: string | null;
   insuranceValidTo: string | null;
@@ -141,7 +145,9 @@ export function ContractPanel({
           </p>
           <ul aria-label="Handover checklist">
             {checklist.items.map((item) => (
-              <li key={item.itemId}>{item.itemId.replaceAll("_", " ")}: PASS</li>
+              <li key={item.itemId}>
+                {item.itemId.replaceAll("_", " ")}: PASS
+              </li>
             ))}
           </ul>
           <button
@@ -149,7 +155,9 @@ export function ContractPanel({
             onClick={() => void acknowledgeHandover()}
             disabled={acknowledging}
           >
-            {acknowledging ? "Recording acknowledgement…" : "Acknowledge handover"}
+            {acknowledging
+              ? "Recording acknowledgement…"
+              : "Acknowledge handover"}
           </button>
           {ackError ? <p role="alert">{ackError}</p> : null}
         </section>
@@ -161,10 +169,18 @@ export function ContractPanel({
         <section aria-labelledby="vehicle-summary-title">
           <h2 id="vehicle-summary-title">Assigned vehicle summary</h2>
           <p>
-            Vehicle details are shown after handover. Somoco remains the
-            ownership holder.
+            Vehicle details are shown after handover. Ownership holder:{" "}
+            {contract.ownershipHolder}.
           </p>
           <dl>
+            <div>
+              <dt>Registration owner</dt>
+              <dd>{contract.registrationOwner ?? "Not recorded"}</dd>
+            </div>
+            <div>
+              <dt>Vehicle status</dt>
+              <dd>{contract.vehicleStatus}</dd>
+            </div>
             <div>
               <dt>Registration</dt>
               <dd>{contract.registrationNumber ?? "Not recorded"}</dd>

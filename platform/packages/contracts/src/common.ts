@@ -1,6 +1,17 @@
 import { z } from "zod";
 
-const MAX_SIGNED_64_BIT = "9223372036854775807";
+export const MAX_SIGNED_64_BIT_MINOR_UNITS = 9_223_372_036_854_775_807n;
+
+export function parseMinorUnits(value: string): bigint {
+  if (!/^(0|[1-9]\d*)$/.test(value)) {
+    throw new Error("MONEY_MINOR_UNITS_INVALID");
+  }
+  const minorUnits = BigInt(value);
+  if (minorUnits < 0n || minorUnits > MAX_SIGNED_64_BIT_MINOR_UNITS) {
+    throw new Error("MONEY_MINOR_UNITS_INVALID");
+  }
+  return minorUnits;
+}
 
 export const PhoneNumberSchema = z.string().regex(/^\+233[1-9]\d{8}$/);
 
@@ -11,15 +22,18 @@ export const UuidSchema = z.uuid();
 export const MoneyDtoSchema = z
   .strictObject({
     currency: z.literal("GHS"),
-    minorUnits: z
-      .string()
-      .regex(/^(0|[1-9]\d*)$/)
-      .max(19),
+    minorUnits: z.string().superRefine((value, context) => {
+      try {
+        parseMinorUnits(value);
+      } catch {
+        context.addIssue({
+          code: "custom",
+          message: "Money minor units must fit signed 64-bit storage",
+        });
+      }
+    }),
   })
-  .refine(({ minorUnits }) => minorUnits <= MAX_SIGNED_64_BIT, {
-    message: "Money minor units exceed signed 64-bit storage range",
-    path: ["minorUnits"],
-  });
+  .strict();
 
 export const PaginationSchema = z.strictObject({
   cursor: UuidSchema.optional(),

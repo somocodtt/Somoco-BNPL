@@ -596,6 +596,7 @@ function mapContractView(value: unknown): CustomerContractView {
     "EXECUTED",
     "ACTIVE",
     "SETTLED",
+    "TRANSFERRED",
     "RECOVERY",
     "TERMINATED",
   ];
@@ -609,12 +610,24 @@ function mapContractView(value: unknown): CustomerContractView {
     throw malformedContract();
   }
   if (!Array.isArray(value.schedule)) throw malformedContract();
+  if (
+    (value.ownershipHolder !== "SOMOCO" &&
+      value.ownershipHolder !== "CUSTOMER") ||
+    typeof value.vehicleStatus !== "string" ||
+    (value.registrationOwner !== null &&
+      value.registrationOwner !== "SOMOCO" &&
+      value.registrationOwner !== "CUSTOMER")
+  )
+    throw malformedContract();
   return {
     contractId: requiredString(value.contractId, "contractId"),
     status: value.status as CustomerContractStatus,
     previewAvailable: value.previewAvailable,
     executed: value.executed,
     assignedVehicleAvailable: value.assignedVehicleAvailable,
+    ownershipHolder: value.ownershipHolder,
+    vehicleStatus: value.vehicleStatus,
+    registrationOwner: value.registrationOwner,
     registrationNumber: nullableContractString(value.registrationNumber),
     registrationValidTo: nullableContractString(value.registrationValidTo),
     insuranceValidTo: nullableContractString(value.insuranceValidTo),

@@ -76,6 +76,7 @@ export const contractStatus = pgEnum("contract_status", [
   "EXECUTED",
   "ACTIVE",
   "SETTLED",
+  "TRANSFERRED",
   "RECOVERY",
   "TERMINATED",
 ]);
@@ -133,8 +134,8 @@ export const contract = pgTable(
     ),
     check("contract_version_positive", sql`${table.version} > 0`),
     check(
-      "contract_ownership_holder_somoco",
-      sql`${table.ownershipHolder} = 'SOMOCO'`,
+      "contract_ownership_holder_coherent",
+      sql`((${table.status}::text = 'TRANSFERRED' and ${table.ownershipHolder} = 'CUSTOMER') or (${table.status}::text <> 'TRANSFERRED' and ${table.ownershipHolder} = 'SOMOCO'))`,
     ),
     check(
       "contract_canonical_hash_sha256",

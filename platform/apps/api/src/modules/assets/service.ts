@@ -130,13 +130,23 @@ export interface AssetService {
     actor: StaffPrincipal;
     idempotencyKey: string;
     requestId: string;
-  }): Promise<{ id: string; status: "PENDING"; effectiveFrom: string; effectiveUntil: string | null }>;
+  }): Promise<{
+    id: string;
+    status: "PENDING";
+    effectiveFrom: string;
+    effectiveUntil: string | null;
+  }>;
   approveReassignment(input: {
     approvalId: string;
     actor: StaffPrincipal;
     idempotencyKey: string;
     requestId: string;
-  }): Promise<{ id: string; status: "APPROVED"; effectiveFrom: string; effectiveUntil: string | null }>;
+  }): Promise<{
+    id: string;
+    status: "APPROVED";
+    effectiveFrom: string;
+    effectiveUntil: string | null;
+  }>;
   getAssignment(applicationId: string): Promise<AssignmentRecord | null>;
   getTrackerAccess(input: {
     vehicleUnitId: string;
@@ -161,6 +171,7 @@ export function createAssetService(options: {
         error instanceof Error
           ? error.message
           : "PRODUCTION_CONNECTOR_CAPABILITY_REQUIRED",
+        { cause: error },
       );
     }
   }
@@ -360,7 +371,11 @@ export function createAssetService(options: {
             version: updatedVehicle.version,
             renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
           };
-          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+          await repo.updateCommandResponse(
+            scope,
+            input.idempotencyKey,
+            response,
+          );
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
@@ -387,7 +402,10 @@ export function createAssetService(options: {
             "REGISTRATION_DUPLICATE",
             "The registration is already recorded.",
           );
-        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+        if (
+          error instanceof Error &&
+          error.message === "VEHICLE_VERSION_CONFLICT"
+        )
           throw new AppError(
             409,
             "STALE_VERSION",
@@ -482,7 +500,11 @@ export function createAssetService(options: {
             version: updatedVehicle.version,
             renewalWarningState: "RENEWAL_REVIEW_REQUIRED" as const,
           };
-          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+          await repo.updateCommandResponse(
+            scope,
+            input.idempotencyKey,
+            response,
+          );
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
@@ -509,7 +531,10 @@ export function createAssetService(options: {
             "INSURANCE_DUPLICATE",
             "The insurance policy is already recorded.",
           );
-        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+        if (
+          error instanceof Error &&
+          error.message === "VEHICLE_VERSION_CONFLICT"
+        )
           throw new AppError(
             409,
             "STALE_VERSION",
@@ -590,7 +615,11 @@ export function createAssetService(options: {
             vehicleUnitId: vehicle.id,
             version: updatedVehicle.version,
           };
-          await repo.updateCommandResponse(scope, input.idempotencyKey, response);
+          await repo.updateCommandResponse(
+            scope,
+            input.idempotencyKey,
+            response,
+          );
           await appendAuditEvent(tx, {
             aggregateType: "vehicle_unit",
             aggregateId: vehicle.id,
@@ -617,7 +646,10 @@ export function createAssetService(options: {
             "TRACKER_IDENTIFIER_DUPLICATE",
             "The tracker is already associated.",
           );
-        if (error instanceof Error && error.message === "VEHICLE_VERSION_CONFLICT")
+        if (
+          error instanceof Error &&
+          error.message === "VEHICLE_VERSION_CONFLICT"
+        )
           throw new AppError(
             409,
             "STALE_VERSION",
@@ -972,7 +1004,10 @@ export function createAssetService(options: {
         );
       return withTransaction(options.database, async (tx) => {
         const repo = assetContractRepo(tx);
-        const application = await repo.findApplication(input.applicationId, true);
+        const application = await repo.findApplication(
+          input.applicationId,
+          true,
+        );
         if (application === null)
           throw notFound("APPLICATION_NOT_FOUND", "Application not found.");
         const current = await repo.currentAssignment(input.applicationId, true);
@@ -982,7 +1017,9 @@ export function createAssetService(options: {
             "ASSIGNMENT_STALE",
             "The reassignment request is not bound to the current assignment.",
           );
-        const contract = await repo.findContractByApplication(input.applicationId);
+        const contract = await repo.findContractByApplication(
+          input.applicationId,
+        );
         if (contract !== null)
           throw new AppError(
             409,
@@ -1085,9 +1122,15 @@ export function createAssetService(options: {
       const now = new Date();
       return withTransaction(options.database, async (tx) => {
         const repo = assetContractRepo(tx);
-        const pending = await repo.findReassignmentApproval(input.approvalId, true);
+        const pending = await repo.findReassignmentApproval(
+          input.approvalId,
+          true,
+        );
         if (pending === null)
-          throw notFound("REASSIGNMENT_APPROVAL_NOT_FOUND", "Reassignment approval not found.");
+          throw notFound(
+            "REASSIGNMENT_APPROVAL_NOT_FOUND",
+            "Reassignment approval not found.",
+          );
         if (pending.requested_by === input.actor.staffUserId)
           throw new AppError(
             403,
@@ -1185,9 +1228,9 @@ export function createAssetService(options: {
           "TRACKER_CAPABILITY_UNAVAILABLE",
           "An attested read-only tracker capability is required.",
         );
-      const association = await assetContractRepo(options.database).currentTracker(
-        input.vehicleUnitId,
-      );
+      const association = await assetContractRepo(
+        options.database,
+      ).currentTracker(input.vehicleUnitId);
       if (association === null || association.tracker_identifier === null)
         throw new AppError(
           404,
@@ -1450,7 +1493,10 @@ function replayTrackerAssociation(value: Record<string, unknown>): {
   vehicleUnitId: string;
   version: number;
 } {
-  if (typeof value.vehicleUnitId !== "string" || typeof value.version !== "number")
+  if (
+    typeof value.vehicleUnitId !== "string" ||
+    typeof value.version !== "number"
+  )
     throw new AppError(
       409,
       "IDEMPOTENCY_REPLAY_INVALID",

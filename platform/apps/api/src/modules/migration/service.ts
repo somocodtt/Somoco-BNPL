@@ -2269,7 +2269,6 @@ function requireImportRole(actor: StaffPrincipal): void {
   if (
     !actor.roles.some((role) =>
       [
-        "SYSTEM_ADMIN",
         "FINANCE_OFFICER",
         "CFO",
         "VERIFICATION_OFFICER",

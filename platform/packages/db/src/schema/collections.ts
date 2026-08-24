@@ -196,6 +196,14 @@ export const settlementApproval = pgTable(
       .notNull()
       .references(() => staffUser.id, { onDelete: "restrict" }),
     reason: text("reason").notNull(),
+    contractVersion: integer("contract_version").notNull(),
+    ledgerHeadId: uuid("ledger_head_id"),
+    ledgerDigest: text("ledger_digest").notNull(),
+    balanceMinorUnits: bigint("balance_minor_units", {
+      mode: "bigint",
+    }).notNull(),
+    reconciliationCheckpoint: text("reconciliation_checkpoint").notNull(),
+    bundleDigest: text("bundle_digest").notNull(),
     approvedAt: timestamp("approved_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -205,9 +213,10 @@ export const settlementApproval = pgTable(
     uniqueIndex("settlement_approval_idempotency_unique").on(
       table.idempotencyKey,
     ),
-    uniqueIndex("settlement_approval_contract_type_unique").on(
+    uniqueIndex("settlement_approval_contract_type_bundle_unique").on(
       table.contractId,
       table.approvalType,
+      table.bundleDigest,
     ),
     check(
       "settlement_approval_type_allowed",
@@ -216,6 +225,13 @@ export const settlementApproval = pgTable(
     check(
       "settlement_approval_reason_nonempty",
       sql`length(btrim(${table.reason})) > 0`,
+    ),
+    check(
+      "settlement_approval_snapshot_valid",
+      sql`${table.contractVersion} > 0 and ${table.balanceMinorUnits} >= 0
+        and ${table.ledgerDigest} ~ '^[0-9a-f]{64}$'
+        and ${table.reconciliationCheckpoint} ~ '^[0-9a-f]{64}$'
+        and ${table.bundleDigest} ~ '^[0-9a-f]{64}$'`,
     ),
   ],
 );

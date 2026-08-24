@@ -605,7 +605,11 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         .where(eq(settlementApproval.contractId, contractId));
     },
 
-    async findSettlementApproval(contractId: string, approvalType: string) {
+    async findSettlementApproval(
+      contractId: string,
+      approvalType: string,
+      bundleDigest?: string,
+    ) {
       const [row] = await executor
         .select()
         .from(settlementApproval)
@@ -613,7 +617,14 @@ export function collectionsRepo(tx: DatabaseTransaction) {
           and(
             eq(settlementApproval.contractId, contractId),
             eq(settlementApproval.approvalType, approvalType),
+            ...(bundleDigest === undefined
+              ? []
+              : [eq(settlementApproval.bundleDigest, bundleDigest)]),
           ),
+        )
+        .orderBy(
+          desc(settlementApproval.approvedAt),
+          desc(settlementApproval.id),
         )
         .limit(1);
       return row ?? null;
@@ -711,22 +722,86 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         select c.status as contract_status,
                c.outstanding_balance_minor_units as balance,
                exists (
-                 select 1 from reconciliation_case rc
+                select 1 from reconciliation_case rc
                  left join payment_transaction pt on pt.id = rc.payment_transaction_id
                 where rc.status <> 'RESOLVED'
-                  and (pt.contract_id = c.id
-                    or rc.payment_transaction_id is null
-                    or pt.contract_id is null)
+                  and (rc.contract_id = c.id or pt.contract_id = c.id)
                ) as unresolved_reconciliation,
                exists (
                  select 1 from payment_transaction pt
                 where pt.contract_id = c.id and pt.status in ('RECEIVED', 'MATCHED')
                ) as unresolved_payment,
                exists (
-                 select 1 from payment_transaction pt
-                where pt.contract_id = c.id
-                  and pt.status in ('REVERSED', 'REFUNDED')
+                 select 1 from reconciliation_case rc
+                 left join payment_transaction pt on pt.id = rc.payment_transaction_id
+                where rc.status <> 'RESOLVED'
+                  and (rc.contract_id = c.id or pt.contract_id = c.id)
+                  and rc.reason in (
+                    'PAYMENT_REVERSAL_REQUIRES_EXCEPTION',
+                    'POST_SETTLEMENT_REVERSAL_REQUIRES_EXCEPTION'
+                  )
                ) as reversed_payment
+          from contract c
+         where c.id = ${contractId}
+         for update
+      `);
+      return result.rows[0] ?? null;
+    },
+
+    async settlementApprovalSnapshot(contractId: string) {
+      const result = await executor.execute<{
+        contract_status: string;
+        contract_version: number;
+        balance: string;
+        ledger_head_id: string | null;
+        ledger_state: unknown;
+        reconciliation_state: unknown;
+        payment_state: unknown;
+      }>(sql`
+        select c.status::text as contract_status,
+               c.version as contract_version,
+               c.outstanding_balance_minor_units::text as balance,
+               (select l.id
+                  from ledger_entry l
+                 where l.contract_id = c.id
+                 order by l.occurred_at desc, l.created_at desc, l.id desc
+                 limit 1) as ledger_head_id,
+               coalesce((
+                 select jsonb_agg(
+                   jsonb_build_array(
+                     l.id, l.posting_key, l.entry_type, l.direction,
+                     l.amount_minor_units::text,
+                     l.balance_after_minor_units::text,
+                     l.reverses_entry_id, l.occurred_at
+                   ) order by l.occurred_at, l.created_at, l.id
+                 )
+                   from ledger_entry l
+                  where l.contract_id = c.id
+               ), '[]'::jsonb) as ledger_state,
+               coalesce((
+                 select jsonb_agg(
+                   jsonb_build_array(
+                     rc.id, rc.status, rc.version, rc.reason,
+                     rc.resolution, rc.updated_at
+                   ) order by rc.created_at, rc.id
+                 )
+                   from reconciliation_case rc
+                   left join payment_transaction related
+                     on related.id = rc.payment_transaction_id
+                  where rc.contract_id = c.id
+                     or related.contract_id = c.id
+               ), '[]'::jsonb) as reconciliation_state,
+               coalesce((
+                 select jsonb_agg(
+                   jsonb_build_array(
+                     pt.id, pt.provider_transaction_id, pt.event_id,
+                     pt.event_type, pt.status, pt.version,
+                     pt.amount_minor_units::text, pt.updated_at
+                   ) order by pt.created_at, pt.id
+                 )
+                   from payment_transaction pt
+                  where pt.contract_id = c.id
+               ), '[]'::jsonb) as payment_state
           from contract c
          where c.id = ${contractId}
          for update
@@ -797,7 +872,9 @@ export function collectionsRepo(tx: DatabaseTransaction) {
     async completeOwnershipTransfer(input: {
       contractId: string;
       approvedBy: string;
-      evidence: Record<string, unknown>;
+      evidence: Record<string, unknown> & {
+        registrationEvidenceDocumentId: string;
+      };
       transferredAt: Date;
     }) {
       const existing = await executor
@@ -807,6 +884,80 @@ export function collectionsRepo(tx: DatabaseTransaction) {
         .for("update");
       if (existing[0]?.status === "COMPLETED") return existing[0];
       const transfer = existing[0];
+      const authoritative = await executor.execute<{
+        contract_status: string;
+        ownership_holder: string;
+        outstanding_balance_minor_units: bigint | string;
+        vehicle_unit_id: string;
+        registration_number: string | null;
+        registered_owner: string | null;
+        valid_from: string | null;
+        valid_to: string | null;
+      }>(sql`
+        select agreement.status::text as contract_status,
+               agreement.ownership_holder,
+               agreement.outstanding_balance_minor_units,
+               asset.id as vehicle_unit_id,
+               registration.registration_number,
+               registration.registered_owner::text,
+               registration.valid_from::text,
+               registration.valid_to::text
+          from contract agreement
+          join vehicle_unit asset on asset.id = agreement.vehicle_unit_id
+          left join lateral (
+            select record.registration_number, record.registered_owner,
+                   record.valid_from, record.valid_to
+              from registration_record record
+             where record.vehicle_unit_id = asset.id
+             order by record.created_at desc, record.id desc
+             limit 1
+          ) registration on true
+         where agreement.id = ${input.contractId}
+         for update of agreement, asset
+      `);
+      const state = authoritative.rows[0];
+      if (state === undefined) throw new Error("CONTRACT_NOT_FOUND");
+      if (
+        state.contract_status !== "SETTLED" ||
+        state.ownership_holder !== "SOMOCO" ||
+        BigInt(state.outstanding_balance_minor_units) !== 0n
+      )
+        throw new Error("CONTRACT_NOT_SETTLED");
+      if (
+        state.registration_number === null ||
+        state.registered_owner !== "SOMOCO" ||
+        state.valid_from === null
+      )
+        throw new Error("REGISTRATION_TRANSFER_EVIDENCE_REQUIRED");
+
+      const contractTransition = await executor.execute(sql`
+        update contract
+           set status = 'TRANSFERRED', ownership_holder = 'CUSTOMER',
+               version = version + 1, updated_at = ${input.transferredAt}
+         where id = ${input.contractId}
+           and status = 'SETTLED' and ownership_holder = 'SOMOCO'
+           and outstanding_balance_minor_units = 0
+      `);
+      if ((contractTransition.rowCount ?? 0) !== 1)
+        throw new Error("OWNERSHIP_TRANSFER_CONFLICT");
+      const vehicleTransition = await executor.execute(sql`
+        update vehicle_unit
+           set status = 'TRANSFERRED', version = version + 1,
+               updated_at = ${input.transferredAt}
+         where id = ${state.vehicle_unit_id}
+           and status <> 'TRANSFERRED'
+      `);
+      if ((vehicleTransition.rowCount ?? 0) !== 1)
+        throw new Error("OWNERSHIP_TRANSFER_CONFLICT");
+      await executor.execute(sql`
+        insert into registration_record
+          (vehicle_unit_id, registration_number, registered_owner,
+           valid_from, valid_to, evidence_document_id, created_at)
+        values (${state.vehicle_unit_id}, ${state.registration_number}, 'CUSTOMER',
+                ${state.valid_from}::date, ${state.valid_to}::date,
+                ${input.evidence.registrationEvidenceDocumentId}::uuid,
+                ${input.transferredAt})
+      `);
       if (transfer === undefined) {
         const [inserted] = await executor
           .insert(ownershipTransfer)

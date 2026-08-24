@@ -226,3 +226,185 @@ export const signatureEvidence = privacySchema.table(
   },
   (table) => [index("signature_evidence_person_idx").on(table.personId)],
 );
+
+export const privacyRequestEvidence = privacySchema.table(
+  "privacy_request_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    subjectId: uuid("subject_id").notNull(),
+    subjectType: text("subject_type").notNull(),
+    requestType: text("request_type").notNull(),
+    requestedBy: uuid("requested_by").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index("privacy_request_subject_idx").on(table.subjectId, table.createdAt),
+    check(
+      "privacy_request_subject_type_allowed",
+      sql`${table.subjectType} in ('APPLICANT', 'GUARANTOR')`,
+    ),
+    check(
+      "privacy_request_type_allowed",
+      sql`${table.requestType} in ('ACCESS', 'CORRECTION', 'RESTRICTION')`,
+    ),
+  ],
+);
+
+export const privacyRequestEvent = privacySchema.table(
+  "privacy_request_event",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => privacyRequestEvidence.id, { onDelete: "restrict" }),
+    status: text("status").notNull(),
+    actorId: uuid("actor_id").notNull(),
+    evidence: jsonb("evidence")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index("privacy_request_event_request_idx").on(
+      table.requestId,
+      table.occurredAt,
+    ),
+    check(
+      "privacy_request_event_status_allowed",
+      sql`${table.status} in ('OPEN', 'IN_REVIEW', 'COMPLETED', 'REJECTED', 'CLOSED')`,
+    ),
+  ],
+);
+
+export const privacyCorrectionEvidence = privacySchema.table(
+  "privacy_correction_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => privacyRequestEvidence.id, { onDelete: "restrict" }),
+    subjectId: uuid("subject_id").notNull(),
+    field: text("field").notNull(),
+    proposedValue: jsonb("proposed_value").$type<unknown>().notNull(),
+    reason: text("reason").notNull(),
+    version: integer("version").notNull(),
+    recordedBy: uuid("recorded_by").notNull(),
+    recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("privacy_correction_subject_field_version_unique").on(
+      table.subjectId,
+      table.field,
+      table.version,
+    ),
+    index("privacy_correction_request_idx").on(table.requestId),
+    check("privacy_correction_version_positive", sql`${table.version} > 0`),
+  ],
+);
+
+export const privacyRestrictionEvidence = privacySchema.table(
+  "privacy_restriction_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => privacyRequestEvidence.id, { onDelete: "restrict" }),
+    subjectId: uuid("subject_id").notNull(),
+    reason: text("reason").notNull(),
+    requestedBy: uuid("requested_by").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+  },
+  (table) => [index("privacy_restriction_subject_idx").on(table.subjectId)],
+);
+
+export const privacyLegalHoldEvidence = privacySchema.table(
+  "privacy_legal_hold_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    subjectId: uuid("subject_id").notNull(),
+    action: text("action").notNull(),
+    reason: text("reason"),
+    actorId: uuid("actor_id").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index("privacy_legal_hold_subject_idx").on(
+      table.subjectId,
+      table.occurredAt,
+    ),
+    check(
+      "privacy_legal_hold_action_allowed",
+      sql`${table.action} in ('PLACED', 'RELEASED')`,
+    ),
+  ],
+);
+
+export const privacyRetentionPolicyEvidence = privacySchema.table(
+  "privacy_retention_policy_evidence",
+  {
+    version: text("version").primaryKey(),
+    retentionDays: integer("retention_days").notNull(),
+    approvedBy: uuid("approved_by").notNull(),
+    approvedAt: timestamp("approved_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    check("privacy_retention_days_positive", sql`${table.retentionDays} > 0`),
+  ],
+);
+
+export const privacySubjectRetentionEvidence = privacySchema.table(
+  "privacy_subject_retention_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    subjectId: uuid("subject_id").notNull(),
+    policyVersion: text("policy_version")
+      .notNull()
+      .references(() => privacyRetentionPolicyEvidence.version, {
+        onDelete: "restrict",
+      }),
+    action: text("action").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("privacy_subject_anonymized_unique")
+      .on(table.subjectId)
+      .where(sql`${table.action} = 'ANONYMIZED'`),
+    check(
+      "privacy_subject_retention_action_allowed",
+      sql`${table.action} = 'ANONYMIZED'`,
+    ),
+  ],
+);
+
+export const privacyRetentionRunEvidence = privacySchema.table(
+  "privacy_retention_run_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    policyVersion: text("policy_version")
+      .notNull()
+      .references(() => privacyRetentionPolicyEvidence.version, {
+        onDelete: "restrict",
+      }),
+    actorId: uuid("actor_id").notNull(),
+    asOf: timestamp("as_of", { withTimezone: true }).notNull(),
+    evaluated: integer("evaluated").notNull(),
+    anonymized: integer("anonymized").notNull(),
+    retained: integer("retained").notNull(),
+    skippedLegalHold: integer("skipped_legal_hold").notNull(),
+    immutableEvidenceRetained: integer("immutable_evidence_retained").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index("privacy_retention_run_policy_idx").on(
+      table.policyVersion,
+      table.createdAt,
+    ),
+    check(
+      "privacy_retention_run_counts_nonnegative",
+      sql`${table.evaluated} >= 0 and ${table.anonymized} >= 0 and ${table.retained} >= 0 and ${table.skippedLegalHold} >= 0 and ${table.immutableEvidenceRetained} >= 0`,
+    ),
+  ],
+);

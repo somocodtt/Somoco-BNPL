@@ -14,6 +14,7 @@ import {
   ALLOCATION_POLICY_BEHAVIOR_DIGEST,
   ALLOCATION_POLICY_EXECUTION_KEY,
   ALLOCATION_POLICY_VERSION,
+  createLedgerService,
   hashAllocationEvidenceArtifact,
 } from "../src/modules/payments/ledger-service.js";
 import { buildApp } from "../src/app.js";
@@ -191,8 +192,108 @@ describe("collections hardening against actor and contract scope", () => {
 });
 
 describe("settlement aggregate concurrency", () => {
-  it("does not let one dual-role actor approve finance and business concurrently", async () => {
+  it("refuses either settlement approval until the active contract is zero and reconciled", async () => {
     const fixture = await seedContract("ACTIVE", 100_000);
+    const financeId = await seedStaff("CFO");
+    const businessId = await seedStaff("MD");
+    const settlement = createSettlementService({ database });
+
+    await expect(
+      settlement.approveFinance({
+        contractId: fixture.contractId,
+        reason: "Balance is still outstanding",
+        idempotencyKey: "finance-before-zero-1",
+        actor: principal(financeId, "CFO"),
+      }),
+    ).rejects.toMatchObject({ code: "CONTRACT_BALANCE_OUTSTANDING" });
+    await expect(
+      settlement.approveBusiness({
+        contractId: fixture.contractId,
+        reason: "Balance is still outstanding",
+        idempotencyKey: "business-before-zero-1",
+        actor: principal(businessId, "MD"),
+      }),
+    ).rejects.toMatchObject({ code: "CONTRACT_BALANCE_OUTSTANDING" });
+  });
+
+  it("rejects a stale dual approval bundle and permits reapproval after financial mutation", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const financeId = await seedStaff("CFO");
+    const businessId = await seedStaff("MD");
+    const adjustmentMakerId = await seedStaff("FINANCE_OFFICER");
+    const adjustmentCheckerId = await seedStaff("COMPLIANCE_OFFICER");
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
+    const settlement = createSettlementService({ database });
+    const ledger = createLedgerService({ database });
+    await settlement.recordEvidence({
+      contractId: fixture.contractId,
+      evidenceDocumentId,
+      actor: principal(businessId, "MD"),
+    });
+    const oldFinance = await settlement.approveFinance({
+      contractId: fixture.contractId,
+      reason: "Initial zero-balance reconciliation",
+      idempotencyKey: "stale-finance-v1",
+      actor: principal(financeId, "CFO"),
+    });
+    const oldBusiness = await settlement.approveBusiness({
+      contractId: fixture.contractId,
+      reason: "Initial transfer authorization",
+      idempotencyKey: "stale-business-v1",
+      actor: principal(businessId, "MD"),
+    });
+
+    for (const [direction, key] of [
+      ["DEBIT", "stale-debit"],
+      ["CREDIT", "stale-replacement"],
+    ] as const) {
+      const adjustment = await ledger.requestAdjustment({
+        contractId: fixture.contractId,
+        amountMinorUnits: 100n,
+        direction,
+        reason: "Verified post-approval financial correction",
+        maker: principal(adjustmentMakerId, "FINANCE_OFFICER"),
+        idempotencyKey: key,
+      });
+      await ledger.approveAdjustment({
+        adjustmentId: adjustment.id,
+        checker: principal(adjustmentCheckerId, "COMPLIANCE_OFFICER"),
+        decision: "APPROVE",
+        reason: "Independent correction check",
+      });
+    }
+
+    await expect(
+      settlement.settle({
+        contractId: fixture.contractId,
+        actor: principal(financeId, "CFO"),
+      }),
+    ).rejects.toMatchObject({ code: "SETTLEMENT_APPROVAL_STALE" });
+
+    const newFinance = await settlement.approveFinance({
+      contractId: fixture.contractId,
+      reason: "Reapproved after replacement entry",
+      idempotencyKey: "stale-finance-v2",
+      actor: principal(financeId, "CFO"),
+    });
+    const newBusiness = await settlement.approveBusiness({
+      contractId: fixture.contractId,
+      reason: "Reapproved current ledger bundle",
+      idempotencyKey: "stale-business-v2",
+      actor: principal(businessId, "MD"),
+    });
+    expect(newFinance.id).not.toBe(oldFinance.id);
+    expect(newBusiness.id).not.toBe(oldBusiness.id);
+    await expect(
+      settlement.settle({
+        contractId: fixture.contractId,
+        actor: principal(financeId, "CFO"),
+      }),
+    ).resolves.toMatchObject({ status: "SETTLED" });
+  });
+
+  it("does not let one dual-role actor approve finance and business concurrently", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
     const actorId = await seedStaff("CFO", "MD");
     const actor = principal(actorId, "CFO", "MD");
     const settlement = createSettlementService({ database });
@@ -434,6 +535,97 @@ describe("settlement transfer evidence", () => {
       settlement.transferOwnership({ contractId: fixture.contractId, actor }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
+
+  it("atomically transfers the contract, vehicle, and evidence-bound registration to the customer", async () => {
+    const fixture = await seedContract("ACTIVE", 0);
+    const financeId = await seedStaff("CFO");
+    const businessId = await seedStaff("MD");
+    const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
+    await executeTestSql(
+      databaseUrl,
+      `insert into registration_record
+        (vehicle_unit_id, registration_number, registered_owner, valid_from, valid_to)
+       values ($1, 'GT-TRANSFER-26', 'SOMOCO', '2026-08-01', '2027-08-01')`,
+      [fixture.vehicleId],
+    );
+    const settlement = createSettlementService({ database });
+    await settlement.recordEvidence({
+      contractId: fixture.contractId,
+      evidenceDocumentId,
+      actor: principal(businessId, "MD"),
+    });
+    await settlement.approveFinance({
+      contractId: fixture.contractId,
+      reason: "Zero balance is reconciled",
+      idempotencyKey: "authoritative-transfer-finance",
+      actor: principal(financeId, "CFO"),
+    });
+    await settlement.approveBusiness({
+      contractId: fixture.contractId,
+      reason: "Registration transfer is authorized",
+      idempotencyKey: "authoritative-transfer-business",
+      actor: principal(businessId, "MD"),
+    });
+    await settlement.settle({
+      contractId: fixture.contractId,
+      actor: principal(financeId, "CFO"),
+    });
+    await settlement.transferOwnership({
+      contractId: fixture.contractId,
+      actor: principal(businessId, "MD"),
+    });
+
+    expect(
+      await queryTestSql<{
+        contract_status: string;
+        ownership_holder: string;
+        vehicle_status: string;
+        registered_owner: string;
+        registration_evidence_id: string | null;
+        transfer_evidence_id: string | null;
+      }>(
+        databaseUrl,
+        `select c.status::text as contract_status,
+                c.ownership_holder,
+                v.status::text as vehicle_status,
+                registration.registered_owner::text,
+                registration.evidence_document_id::text as registration_evidence_id,
+                transfer.evidence->>'registrationEvidenceDocumentId' as transfer_evidence_id
+           from contract c
+           join vehicle_unit v on v.id = c.vehicle_unit_id
+           join ownership_transfer transfer on transfer.contract_id = c.id
+           join lateral (
+             select * from registration_record
+              where vehicle_unit_id = v.id
+              order by created_at desc, id desc limit 1
+           ) registration on true
+          where c.id = $1`,
+        [fixture.contractId],
+      ),
+    ).toEqual({
+      contract_status: "TRANSFERRED",
+      ownership_holder: "CUSTOMER",
+      vehicle_status: "TRANSFERRED",
+      registered_owner: "CUSTOMER",
+      registration_evidence_id: evidenceDocumentId,
+      transfer_evidence_id: evidenceDocumentId,
+    });
+
+    await expect(
+      executeTestSql(
+        databaseUrl,
+        "update contract set status = 'SETTLED', ownership_holder = 'SOMOCO' where id = $1",
+        [fixture.contractId],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      executeTestSql(
+        databaseUrl,
+        "update vehicle_unit set status = 'HANDED_OVER' where id = $1",
+        [fixture.vehicleId],
+      ),
+    ).rejects.toThrow();
+  });
 });
 
 describe("recovery action replay", () => {
@@ -507,22 +699,19 @@ describe("settlement and reconciliation serialization", () => {
     const business = await seedStaff("MD");
     const evidence = randomUUID();
     const evidenceDocumentId = await seedCleanDocument(fixture.applicantId);
-    await executeTestSql(
-      databaseUrl,
-      `insert into settlement_approval
-        (id, contract_id, approval_type, idempotency_key, approved_by, reason, approved_at)
-       values ($1, $2, 'FINANCE_RECONCILIATION', $3, $4, 'Finance', now()),
-              ($5, $2, 'BUSINESS_OWNERSHIP_TRANSFER', $6, $7, 'Business', now())`,
-      [
-        randomUUID(),
-        fixture.contractId,
-        "gate-finance-1",
-        finance,
-        randomUUID(),
-        "gate-business-1",
-        business,
-      ],
-    );
+    const settlement = createSettlementService({ database });
+    await settlement.approveFinance({
+      contractId: fixture.contractId,
+      idempotencyKey: "gate-finance-1",
+      reason: "Finance",
+      actor: principal(finance, "CFO"),
+    });
+    await settlement.approveBusiness({
+      contractId: fixture.contractId,
+      idempotencyKey: "gate-business-1",
+      reason: "Business",
+      actor: principal(business, "MD"),
+    });
     await executeTestSql(
       databaseUrl,
       `insert into settlement_evidence
@@ -546,6 +735,7 @@ describe("settlement and reconciliation serialization", () => {
     });
     const insertion = withTransaction(database, async (tx) => {
       await paymentRepo(tx).createReconciliationCase({
+        contractId: fixture.contractId,
         reason: "UNMATCHED_SETTLEMENT_TEST",
         dedupeKey: "unmatched-settlement-test-1",
       });
@@ -555,7 +745,6 @@ describe("settlement and reconciliation serialization", () => {
     while (!inserted) await new Promise((resolve) => setTimeout(resolve, 5));
 
     let settled = false;
-    const settlement = createSettlementService({ database });
     const pending = settlement
       .settle({
         contractId: fixture.contractId,
@@ -586,6 +775,14 @@ describe("collections HTTP authorization", () => {
     const finance = await seedHttpStaff("CFO");
     const inventory = await seedHttpStaff("INVENTORY_OFFICER");
     const transferDocumentId = await seedCleanDocument(fixture.applicantId);
+    await executeTestSql(
+      databaseUrl,
+      `insert into registration_record
+        (vehicle_unit_id, registration_number, registered_owner, valid_from,
+         evidence_document_id)
+       values ($1, $2, 'SOMOCO', current_date, $3)`,
+      [fixture.vehicleId, `REG-${randomUUID()}`, transferDocumentId],
+    );
     const app = await buildApp({
       config,
       database,
@@ -913,7 +1110,7 @@ describe("collections HTTP authorization", () => {
           "x-csrf-token": inventoryLogin.csrf,
         },
       });
-      expect(ownershipTransfer.statusCode).toBe(200);
+      expect(ownershipTransfer.statusCode, ownershipTransfer.body).toBe(200);
 
       await executeTestSql(
         databaseUrl,
@@ -1110,6 +1307,7 @@ async function seedContract(
   contractId: string;
   applicantId: string;
   applicationId: string;
+  vehicleId: string;
 }> {
   const suffix = randomUUID();
   const applicantId = randomUUID();
@@ -1183,5 +1381,5 @@ async function seedContract(
       balance,
     ],
   );
-  return { contractId, applicantId, applicationId };
+  return { contractId, applicantId, applicationId, vehicleId };
 }

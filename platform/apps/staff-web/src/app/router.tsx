@@ -84,12 +84,12 @@ export function StaffRouter({
     return <StaffLogin api={api} onAuthenticated={setSession} />;
   }
   const canOperateFinancing = session.roles.some((role) =>
-    ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_AUDITOR"].includes(
+    ["PRODUCT_ADMIN", "BSM", "AGM", "CFO", "MD", "COMPLIANCE_OFFICER"].includes(
       role,
     ),
   );
   const canOperatePayments = session.roles.some((role) =>
-    ["FINANCE_OFFICER", "CFO", "COMPLIANCE_AUDITOR", "MD"].includes(role),
+    ["FINANCE_OFFICER", "CFO", "COMPLIANCE_OFFICER", "MD"].includes(role),
   );
   const canOperateCollections = canOperateCollectionsRole(session.roles);
   const canReadReports = session.roles.some((role) =>
@@ -102,6 +102,7 @@ export function StaffRouter({
       "FINANCE_OFFICER",
       "RECOVERY_OFFICER",
       "COMPLIANCE_AUDITOR",
+      "COMPLIANCE_OFFICER",
       "CUSTOMER_SUPPORT",
       "SYSTEM_ADMIN",
       "MIGRATION_IMPORTER",
@@ -244,6 +245,7 @@ function canOperateCollectionsRole(roles: readonly string[]): boolean {
       "CFO",
       "MD",
       "COMPLIANCE_AUDITOR",
+      "COMPLIANCE_OFFICER",
     ].includes(role),
   );
 }

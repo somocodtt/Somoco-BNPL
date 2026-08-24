@@ -9,7 +9,9 @@ import type {
  * cross it.  Keep this mapper deliberately explicit so adding a persisted
  * amount cannot accidentally make a route's JSON response unserialisable.
  */
-export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unknown> {
+export function serializeRuleDto(
+  rule: FinancingRuleRecord,
+): Record<string, unknown> {
   assertApprovedFeePolicy(rule.permittedFees);
   if (rule.gateStatus !== "OPEN" && rule.gateStatus !== "CLOSED") {
     throw new Error("RULE_GATE_STATUS_REQUIRED");
@@ -48,7 +50,9 @@ export function serializeRuleDto(rule: FinancingRuleRecord): Record<string, unkn
   };
 }
 
-export function serializeExceptionDto(exception: ExceptionRecord): Record<string, unknown> {
+export function serializeExceptionDto(
+  exception: ExceptionRecord,
+): Record<string, unknown> {
   return {
     id: exception.id,
     applicationId: exception.applicationId,
@@ -101,14 +105,20 @@ export function serializeOfferDto(offer: OfferRecord): Record<string, unknown> {
     depositMinor: money("depositMinor", offer.offerVersion?.depositMinor),
     principalMinor: money("principalMinor", offer.offerVersion?.principalMinor),
     financeChargeMinor: money("financeChargeMinor"),
-    totalPayableMinor: money("totalPayableMinor", offer.offerVersion?.totalPayableMinor),
+    totalPayableMinor: money(
+      "totalPayableMinor",
+      offer.offerVersion?.totalPayableMinor,
+    ),
     frequency: stringValue(terms.frequency),
     tenureMonths: numberValue(terms.tenureMonths),
     method: stringValue(terms.method),
     rateBasisPoints: numberValue(terms.rateBasisPoints),
     fees: terms.fees,
-    disclosureVersion: stringValue(terms.disclosureVersion) ?? offer.disclosedVersion,
-    disclosureContent: isRecord(terms.disclosureContent) ? terms.disclosureContent : null,
+    disclosureVersion:
+      stringValue(terms.disclosureVersion) ?? offer.disclosedVersion,
+    disclosureContent: isRecord(terms.disclosureContent)
+      ? terms.disclosureContent
+      : null,
     installments,
   };
 }
@@ -141,13 +151,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function assertApprovedFeePolicy(value: unknown): asserts value is Record<string, unknown> {
+function assertApprovedFeePolicy(
+  value: unknown,
+): asserts value is Record<string, unknown> {
   try {
-    if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.keys(value).length > 0) {
+    if (
+      !isRecord(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.keys(value).length > 0
+    ) {
       throw new Error("FEES_POLICY_INVALID");
     }
   } catch (error) {
-    if (error instanceof Error && error.message === "FEES_POLICY_INVALID") throw error;
-    throw new Error("FEES_POLICY_INVALID");
+    if (error instanceof Error && error.message === "FEES_POLICY_INVALID")
+      throw error;
+    throw new Error("FEES_POLICY_INVALID", { cause: error });
   }
 }

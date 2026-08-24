@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   completeInboxMessage,
+  findInboxMessage,
   receiveInboxMessage,
   withTransaction,
   type Database,
@@ -20,6 +21,7 @@ import {
   type LedgerPostResult,
 } from "./ledger-service.js";
 import type { ReceiptService } from "./receipt-service.js";
+import { parseMinorUnits } from "../../../../../packages/contracts/src/common.js";
 
 export type { AllocationPolicy } from "./ledger-service.js";
 
@@ -92,6 +94,11 @@ export function createPaymentWebhookService(options: {
       }
       validateCanonicalEvent(event);
       return withTransaction(options.database, async (tx) => {
+        const preservation = await findInboxMessage(
+          tx,
+          "SOMOCO_PAYMENTS",
+          preservationProviderEventId(input),
+        );
         const inbox = await receiveInboxMessage(tx, {
           provider: "SOMOCO_PAYMENTS",
           providerEventId: event.eventId,
@@ -106,6 +113,9 @@ export function createPaymentWebhookService(options: {
             settlementReference: event.settlementReference,
           },
           receivedAt: new Date(),
+          ...(preservation === null
+            ? {}
+            : { preservationMessageId: preservation.id }),
         });
         if (!inbox.inserted) {
           if (inbox.processingToken === null) {
@@ -265,6 +275,7 @@ function validateCanonicalEvent(event: CanonicalPaymentEvent): void {
     );
   if (
     !isNonEmptyString(event.eventId) ||
+    event.eventId.startsWith("unverified:sha256:") ||
     !isNonEmptyString(event.providerTransactionId) ||
     !isNonEmptyString(event.payerPhoneE164) ||
     !isNonEmptyString(event.customerReference)
@@ -294,11 +305,19 @@ function validateCanonicalEvent(event: CanonicalPaymentEvent): void {
       "UNKNOWN_PAYMENT_EVENT",
       "The payment event type is not supported.",
     );
+  let amountMinorUnits: bigint | null = null;
+  if (isRecord(event.amount) && typeof event.amount.minorUnits === "string") {
+    try {
+      amountMinorUnits = parseMinorUnits(event.amount.minorUnits);
+    } catch {
+      amountMinorUnits = null;
+    }
+  }
   if (
     !isRecord(event.amount) ||
     event.amount.currency !== "GHS" ||
-    !/^\d+$/.test(event.amount.minorUnits) ||
-    BigInt(event.amount.minorUnits) <= 0n
+    amountMinorUnits === null ||
+    amountMinorUnits <= 0n
   )
     throw new AppError(
       400,
@@ -358,23 +377,13 @@ async function preserveUnverifiedPayment(
   database: Database,
   input: PaymentWebhookInput,
 ): Promise<void> {
-  const rawText = new TextDecoder().decode(input.rawBody);
-  const parsed = parseUntrustedRecord(rawText);
-  const digest = createHash("sha256")
-    .update(input.rawBody)
-    .update(input.signature)
-    .update(input.requestTimestamp)
-    .digest("hex");
-  const providerEventId =
-    boundedString(parsed?.eventId, 256) ?? `unverified-${digest}`;
-  const eventType =
-    boundedString(parsed?.eventType, 128) ?? "PAYMENT_PROVIDER_UNAVAILABLE";
   await withTransaction(database, async (tx) => {
     await receiveInboxMessage(tx, {
       provider: "SOMOCO_PAYMENTS",
-      providerEventId,
-      eventType,
+      providerEventId: preservationProviderEventId(input),
+      eventType: "PAYMENT_VERIFICATION_UNAVAILABLE",
       payload: {
+        evidenceSchema: "SOMOCO_PAYMENT_PRESERVATION_V1",
         preservationReason: "PAYMENT_PROVIDER_UNAVAILABLE",
         rawBodyBase64: Buffer.from(input.rawBody).toString("base64"),
         signature: input.signature,
@@ -384,6 +393,19 @@ async function preserveUnverifiedPayment(
       claim: false,
     });
   });
+}
+
+function preservationProviderEventId(input: PaymentWebhookInput): string {
+  const rawBodyBase64 = Buffer.from(input.rawBody).toString("base64");
+  const digest = createHash("sha256")
+    .update("SOMOCO_PAYMENT_PRESERVATION_V1\n", "utf8")
+    .update(rawBodyBase64, "utf8")
+    .update("\n", "utf8")
+    .update(input.signature, "utf8")
+    .update("\n", "utf8")
+    .update(input.requestTimestamp, "utf8")
+    .digest("hex");
+  return `unverified:sha256:${digest}`;
 }
 
 const paymentProviderUnavailableCodes = new Set([
@@ -439,23 +461,6 @@ function readStringProperty(
   } catch {
     return null;
   }
-}
-
-function parseUntrustedRecord(value: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function boundedString(value: unknown, maxLength: number): string | null {
-  return typeof value === "string" &&
-    value.trim().length > 0 &&
-    value.length <= maxLength
-    ? value
-    : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
