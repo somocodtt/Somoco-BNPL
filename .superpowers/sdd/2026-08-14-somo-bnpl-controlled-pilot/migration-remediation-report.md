@@ -184,7 +184,7 @@ provided.
 
 Exact staged diff review before commit:
 
-```text
+````text
 git diff --cached --check
 Result: no output; exit 0.
 
@@ -210,7 +210,7 @@ changes:
 $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'belongs to another person|populated completed ownership transfer is unapproved'
 Result: 2 failed; both promises resolved undefined instead of rejecting with
 LEGACY_COMPLETED_OWNERSHIP_TRANSFER_REMEDIATION_REQUIRED.
-```
+````
 
 ```text
 $env:TEST_DATABASE_URL='postgresql://somo_test@127.0.0.1:55432/somo_bnpl_test'; node node_modules/vitest/vitest.mjs run packages/db/src/db.integration.test.ts -t 'otherwise coherent unapproved ownership transfer replay'
@@ -353,4 +353,7 @@ exported contracts repository.
 git status --short
 Result: empty after commit.
 ```
+
+```
+
 ```
