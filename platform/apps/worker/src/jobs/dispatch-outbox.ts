@@ -20,6 +20,7 @@ export interface WorkerLogger {
 export interface ClaimOutboxOptions {
   workerId: string;
   limit: number;
+  topic?: string;
   claimLeaseMs: number;
   maxAttempts: number;
 }
@@ -122,6 +123,7 @@ export function inspectOutboxHandlerRegistration(
 export interface DispatchOutboxOptions {
   store: OutboxClaimStore;
   workerId: string;
+  topic?: string;
   handlers: ReadonlyMap<string, OutboxHandler>;
   concurrency: number;
   maxAttempts: number;
@@ -159,6 +161,7 @@ export async function dispatchOutboxBatch(
   const messages = await options.store.claim({
     workerId: options.workerId,
     limit: options.concurrency,
+    ...(options.topic === undefined ? {} : { topic: options.topic }),
     claimLeaseMs: options.claimLeaseMs,
     maxAttempts: options.maxAttempts,
   });

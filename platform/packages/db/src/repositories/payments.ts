@@ -451,7 +451,7 @@ export function paymentRepo(db: DatabaseTransaction) {
       amountMinorUnits: bigint;
       evidenceHash: string;
     }) {
-      const [row] = await executor
+      const [inserted] = await executor
         .insert(depositReconciliation)
         .values({
           applicationId: input.applicationId,
@@ -463,23 +463,28 @@ export function paymentRepo(db: DatabaseTransaction) {
           reconciledAt: new Date(),
           evidenceHash: input.evidenceHash,
         })
-        .onConflictDoUpdate({
+        .onConflictDoNothing({
           target: [
             depositReconciliation.applicationId,
             depositReconciliation.offerId,
           ],
-          set: {
-            paymentTransactionId: input.paymentTransactionId,
-            amountMinorUnits: input.amountMinorUnits,
-            status: "RECONCILED",
-            reconciledAt: new Date(),
-            evidenceHash: input.evidenceHash,
-            version: sql`${depositReconciliation.version} + 1`,
-          },
         })
         .returning();
-      if (row === undefined) throw new Error("DEPOSIT_RECONCILIATION_FAILED");
-      return row;
+      if (inserted !== undefined)
+        return { row: inserted, inserted: true as const };
+      const [existing] = await executor
+        .select()
+        .from(depositReconciliation)
+        .where(
+          and(
+            eq(depositReconciliation.applicationId, input.applicationId),
+            eq(depositReconciliation.offerId, input.offerId),
+          ),
+        )
+        .limit(1);
+      if (existing === undefined)
+        throw new Error("DEPOSIT_RECONCILIATION_FAILED");
+      return { row: existing, inserted: false as const };
     },
     async invalidateDeposit(input: {
       paymentTransactionId: string;

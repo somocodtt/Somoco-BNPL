@@ -295,6 +295,49 @@ export function createLedgerService(options: {
                 reason,
               };
             }
+            const reconciled = await repo.reconcileDeposit({
+              applicationId: preContractDeposit.applicationId,
+              offerId: preContractDeposit.offerId,
+              paymentTransactionId: payment.id,
+              amountMinorUnits: input.amountMinorUnits,
+              evidenceHash: sha256(input.eventId),
+            });
+            if (!reconciled.inserted) {
+              const reason = "DEPOSIT_ALREADY_RECONCILED";
+              await repo.createReconciliationCase({
+                paymentTransactionId: payment.id,
+                reason,
+                dedupeKey: `PRE_CONTRACT_DEPOSIT:${preContractDeposit.applicationId}:${preContractDeposit.offerId}:${payment.id}`,
+                resolution: {
+                  winnerPaymentTransactionId:
+                    reconciled.row.paymentTransactionId,
+                  depositReconciliationId: reconciled.row.id,
+                },
+              });
+              await appendAuditEvent(tx, {
+                aggregateType: "payment_transaction",
+                aggregateId: payment.id,
+                action: "DEPOSIT_PAYMENT_QUARANTINED",
+                actorStaffUserId: null,
+                actorPersonId: preContractDeposit.payerPersonId,
+                requestId: null,
+                data: {
+                  applicationId: preContractDeposit.applicationId,
+                  offerId: preContractDeposit.offerId,
+                  winnerPaymentTransactionId:
+                    reconciled.row.paymentTransactionId,
+                  reason,
+                },
+                occurredAt: input.occurredAt,
+              });
+              return {
+                paymentTransaction: payment,
+                outcome: "QUARANTINED",
+                ledgerEntryIds: [],
+                depositReconciled: false,
+                reason,
+              };
+            }
             const matched = await repo.updateStatus(payment.id, "MATCHED");
             const receipt =
               options.receipts === undefined
@@ -304,13 +347,6 @@ export function createLedgerService(options: {
                     now: input.occurredAt,
                     transaction: tx,
                   });
-            await repo.reconcileDeposit({
-              applicationId: preContractDeposit.applicationId,
-              offerId: preContractDeposit.offerId,
-              paymentTransactionId: matched.id,
-              amountMinorUnits: input.amountMinorUnits,
-              evidenceHash: sha256(input.eventId),
-            });
             await appendAuditEvent(tx, {
               aggregateType: "payment_transaction",
               aggregateId: matched.id,

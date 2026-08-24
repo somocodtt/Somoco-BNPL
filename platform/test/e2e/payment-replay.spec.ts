@@ -51,7 +51,7 @@ describe("controlled-pilot payment replay boundary", () => {
     });
   }, 60_000);
 
-  it("recovers a simulator provider outage without accepting an unsigned event", async () => {
+  it("recovers a simulator provider outage without accepting an unverified event", async () => {
     runtime = await startRealPilot();
     const request = createApiRequest(runtime.app);
     const flow = await completeOnboarding(request, runtime);
@@ -67,9 +67,9 @@ describe("controlled-pilot payment replay boundary", () => {
     };
     runtime.controls.setPaymentAvailable(false);
     const unavailable = await postPayment(request, flow, event);
-    expect(unavailable.status()).toBe(401);
+    expect(unavailable.status()).toBe(503);
     await expect(body(unavailable)).resolves.toMatchObject({
-      code: "PAYMENT_VERIFICATION_FAILED",
+      code: "PAYMENT_PROVIDER_UNAVAILABLE",
     });
     runtime.controls.setPaymentAvailable(true);
     const recovered = await postPayment(request, flow, event);

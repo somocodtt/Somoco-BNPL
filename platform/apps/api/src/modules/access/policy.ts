@@ -39,6 +39,7 @@ const actionRoles = {
   "inventory.manage": ["INVENTORY_OFFICER"],
   "tracker.view": ["RECOVERY_OFFICER"],
   "payment.post": ["FINANCE_OFFICER"],
+  "collections.compute": ["RECOVERY_OFFICER"],
   "recovery.authorize": ["RECOVERY_OFFICER"],
   "compliance.audit": ["COMPLIANCE_AUDITOR"],
   "customer_support.manage": ["CUSTOMER_SUPPORT"],

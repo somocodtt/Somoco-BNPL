@@ -201,18 +201,21 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     const depositEvidence = await queryTestSql<{
       payment_count: string;
       receipt_count: string;
+      receipt_contract_count: string;
       reconciled_count: string;
     }>(
       databaseUrl,
       `select
           (select count(*) from payment_transaction where provider_transaction_id = $1)::text as payment_count,
           (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id = $1)::text as receipt_count,
+          (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id = $1 and pr.contract_id is not null)::text as receipt_contract_count,
           (select count(*) from deposit_reconciliation where application_id = $2 and status = 'RECONCILED')::text as reconciled_count`,
       [depositEvent.providerTransactionId, flow.applicationId],
     );
     expect(depositEvidence).toEqual({
       payment_count: "1",
       receipt_count: "1",
+      receipt_contract_count: "0",
       reconciled_count: "1",
     });
 
@@ -322,11 +325,13 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     const depositBinding = await queryTestSql<{
       payment_status: string;
       contract_id: string;
+      receipt_contract_id: string | null;
       deposit_ledger_count: string;
     }>(
       databaseUrl,
       `select p.status as payment_status,
               p.contract_id::text as contract_id,
+              (select pr.contract_id::text from payment_receipt pr where pr.payment_transaction_id = p.id) as receipt_contract_id,
               (select count(*) from ledger_entry l
                 where l.contract_id = p.contract_id
                   and l.payment_transaction_id = p.id
@@ -338,6 +343,7 @@ describe("Task 15 controlled pilot against the real app composition", () => {
     expect(depositBinding).toEqual({
       payment_status: "POSTED",
       contract_id: contractId,
+      receipt_contract_id: contractId,
       deposit_ledger_count: "1",
     });
 
@@ -483,6 +489,25 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       totalUnpaid: 6,
       consecutiveMissed: 6,
       escalationSignals: ["THREE_CONSECUTIVE_MISSED", "THREE_TOTAL_UNPAID"],
+    });
+    const arrearsAudit = await queryTestSql<{
+      actor_staff_user_id: string | null;
+      request_id: string | null;
+    }>(
+      databaseUrl,
+      `select actor_staff_user_id::text as actor_staff_user_id,
+              request_id
+         from audit_event
+        where aggregate_type = 'contract'
+          and aggregate_id = $1
+          and action = 'ARREARS_COMPUTED'
+        order by occurred_at desc
+        limit 1`,
+      [contractId],
+    );
+    expect(arrearsAudit).toEqual({
+      actor_staff_user_id: runtime.staff.get("RECOVERY_OFFICER")!.staffUserId,
+      request_id: expect.any(String),
     });
 
     const repaymentEvents: CanonicalPaymentEvent[] = Array.from(
@@ -783,6 +808,189 @@ describe("Task 15 controlled pilot against the real app composition", () => {
       [event.providerTransactionId],
     );
     expect(persisted).toEqual({ payment_count: "1", case_count: "1" });
+  }, 60_000);
+
+  it("keeps one winning pre-contract deposit and quarantines a concurrent distinct payment", async () => {
+    runtime = await startRealPilot();
+    const request = injectRequest(runtime.app);
+    const flow = await completeOnboarding(request, runtime);
+    await approveAllStages(request, flow);
+    await createAndAcceptOffer(request, flow);
+
+    const firstEvent: CanonicalPaymentEvent = {
+      eventId: "controlled-pilot-concurrent-deposit-event-001",
+      eventType: "PAYMENT_SUCCEEDED",
+      channel: "MOBILE_MONEY",
+      providerTransactionId: "controlled-pilot-concurrent-deposit-provider-001",
+      payerPhoneE164: "+233241000001",
+      customerReference: flow.applicationId,
+      amount: { currency: "GHS", minorUnits: "10000" },
+      occurredAt: "2026-08-02T12:10:00.000Z",
+    };
+    const secondEvent: CanonicalPaymentEvent = {
+      ...firstEvent,
+      eventId: "controlled-pilot-concurrent-deposit-event-002",
+      providerTransactionId: "controlled-pilot-concurrent-deposit-provider-002",
+    };
+    const [first, second] = await Promise.all([
+      postPayment(request, flow, firstEvent),
+      postPayment(request, flow, secondEvent),
+    ]);
+    expect(first.status()).toBe(202);
+    expect(second.status()).toBe(202);
+    const outcomes = await Promise.all([body(first), body(second)]);
+    expect(outcomes.map((item) => item.outcome).sort()).toEqual([
+      "POSTED",
+      "QUARANTINED",
+    ]);
+    expect(
+      outcomes.filter((item) => item.depositReconciled === true),
+    ).toHaveLength(1);
+    expect(
+      outcomes.find((item) => item.outcome === "QUARANTINED"),
+    ).toMatchObject({
+      reason: "DEPOSIT_ALREADY_RECONCILED",
+    });
+
+    const persisted = await queryTestSql<{
+      payment_count: string;
+      reconciled_count: string;
+      receipt_count: string;
+      case_count: string;
+      winner_payment_count: string;
+      loser_case_count: string;
+    }>(
+      databaseUrl,
+      `select
+          (select count(*) from payment_transaction where provider_transaction_id in ($1, $2))::text as payment_count,
+          (select count(*) from deposit_reconciliation where application_id = $3 and status = 'RECONCILED')::text as reconciled_count,
+          (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id in ($1, $2))::text as receipt_count,
+          (select count(*) from reconciliation_case rc join payment_transaction p on p.id = rc.payment_transaction_id where p.provider_transaction_id in ($1, $2))::text as case_count,
+          (select count(*) from deposit_reconciliation dr join payment_transaction p on p.id = dr.payment_transaction_id where p.provider_transaction_id in ($1, $2))::text as winner_payment_count,
+          (select count(*) from reconciliation_case rc join payment_transaction p on p.id = rc.payment_transaction_id where p.provider_transaction_id in ($1, $2) and rc.reason = 'DEPOSIT_ALREADY_RECONCILED')::text as loser_case_count`,
+      [
+        firstEvent.providerTransactionId,
+        secondEvent.providerTransactionId,
+        flow.applicationId,
+      ],
+    );
+    expect(persisted).toEqual({
+      payment_count: "2",
+      reconciled_count: "1",
+      receipt_count: "1",
+      case_count: "1",
+      winner_payment_count: "1",
+      loser_case_count: "1",
+    });
+  }, 60_000);
+
+  it("rejects arrears computation for a non-collections role and audits the denial", async () => {
+    runtime = await startRealPilot();
+    const request = injectRequest(runtime.app);
+    const response = await call(
+      request,
+      runtime.baseUrl,
+      "post",
+      `/v1/staff/contracts/${randomUUID()}/arrears/compute`,
+      {
+        headers: runtime.staff.get("CUSTOMER_SUPPORT")!.headers,
+        body: { asOfDate: "2027-04-01" },
+      },
+    );
+    expect(response.status()).toBe(403);
+    await expect(body(response)).resolves.toMatchObject({ code: "FORBIDDEN" });
+    const denied = await queryTestSql<{
+      action: string;
+      actor_staff_user_id: string;
+    }>(
+      databaseUrl,
+      `select action, actor_staff_user_id::text as actor_staff_user_id
+         from audit_event
+        where aggregate_type = 'access_control'
+          and action = 'ACCESS_DENIED'
+          and data->>'action' = 'collections.compute'
+        order by occurred_at desc
+        limit 1`,
+    );
+    expect(denied).toEqual({
+      action: "ACCESS_DENIED",
+      actor_staff_user_id: runtime.staff.get("CUSTOMER_SUPPORT")!.staffUserId,
+    });
+  }, 60_000);
+
+  it("preserves a provider-outage payment for retry, then posts one idempotent recovery", async () => {
+    runtime = await startRealPilot();
+    const request = injectRequest(runtime.app);
+    const flow = await completeOnboarding(request, runtime);
+    await approveAllStages(request, flow);
+    await createAndAcceptOffer(request, flow);
+    const event: CanonicalPaymentEvent = {
+      eventId: "controlled-pilot-provider-outage-event-001",
+      eventType: "PAYMENT_SUCCEEDED",
+      channel: "MOBILE_MONEY",
+      providerTransactionId: "controlled-pilot-provider-outage-provider-001",
+      payerPhoneE164: "+233241000001",
+      customerReference: flow.applicationId,
+      amount: { currency: "GHS", minorUnits: "10000" },
+      occurredAt: "2026-08-02T12:11:00.000Z",
+    };
+    runtime.controls.setPaymentAvailable(false);
+    const outage = await postPayment(request, flow, event);
+    expect(outage.status()).toBe(503);
+    await expect(body(outage)).resolves.toMatchObject({
+      code: "PAYMENT_PROVIDER_UNAVAILABLE",
+    });
+    const preserved = await queryTestSql<{
+      payment_count: string;
+      processed_count: string;
+      raw_body_count: string;
+    }>(
+      databaseUrl,
+      `select
+          (select count(*) from payment_transaction where provider_transaction_id = $1)::text as payment_count,
+          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id = $2 and processed_at is not null)::text as processed_count,
+          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id = $2 and payload->>'rawBodyBase64' is not null)::text as raw_body_count`,
+      [event.providerTransactionId, event.eventId],
+    );
+    expect(preserved).toEqual({
+      payment_count: "0",
+      processed_count: "0",
+      raw_body_count: "1",
+    });
+
+    runtime.controls.setPaymentAvailable(true);
+    const recovered = await postPayment(request, flow, event);
+    expect(recovered.status(), await recovered.text()).toBe(202);
+    await expect(body(recovered)).resolves.toMatchObject({
+      accepted: true,
+      duplicate: false,
+      outcome: "POSTED",
+      depositReconciled: true,
+    });
+    const replay = await postPayment(request, flow, event);
+    expect(replay.status()).toBe(202);
+    await expect(body(replay)).resolves.toMatchObject({
+      accepted: true,
+      duplicate: false,
+      outcome: "POSTED",
+    });
+    const recoveredEvidence = await queryTestSql<{
+      payment_count: string;
+      processed_count: string;
+      receipt_count: string;
+    }>(
+      databaseUrl,
+      `select
+          (select count(*) from payment_transaction where provider_transaction_id = $1)::text as payment_count,
+          (select count(*) from inbox_message where provider = 'SOMOCO_PAYMENTS' and provider_event_id = $2 and processed_at is not null)::text as processed_count,
+          (select count(*) from payment_receipt pr join payment_transaction p on p.id = pr.payment_transaction_id where p.provider_transaction_id = $1)::text as receipt_count`,
+      [event.providerTransactionId, event.eventId],
+    );
+    expect(recoveredEvidence).toEqual({
+      payment_count: "1",
+      processed_count: "1",
+      receipt_count: "1",
+    });
   }, 60_000);
 
   it("enforces inventory-officer ownership, registration, insurance, and deposit guards", async () => {

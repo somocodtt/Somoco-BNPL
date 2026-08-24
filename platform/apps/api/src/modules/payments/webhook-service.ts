@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   completeInboxMessage,
   receiveInboxMessage,
@@ -68,6 +69,14 @@ export function createPaymentWebhookService(options: {
       try {
         event = await options.verifier.verify(input);
       } catch (cause) {
+        if (isPaymentProviderUnavailable(cause)) {
+          await preserveUnverifiedPayment(options.database, input);
+          throw new AppError(
+            503,
+            "PAYMENT_PROVIDER_UNAVAILABLE",
+            "Payment provider verification is temporarily unavailable; retry the event.",
+          );
+        }
         throw mapVerifierFailure(cause);
       }
       if (input.validateJson === true) {
@@ -99,14 +108,15 @@ export function createPaymentWebhookService(options: {
           receivedAt: new Date(),
         });
         if (!inbox.inserted) {
-          if (inbox.result === null || inbox.result === undefined) {
+          if (inbox.processingToken === null) {
+            if (inbox.result !== null && inbox.result !== undefined)
+              return inbox.result as PaymentWebhookAcknowledgement;
             throw new AppError(
               409,
               "PAYMENT_EVENT_IN_FLIGHT",
               "This payment event is already being processed.",
             );
           }
-          return inbox.result as PaymentWebhookAcknowledgement;
         }
         const duplicateProviderPayment =
           event.eventType === "PAYMENT_SUCCEEDED"
@@ -318,6 +328,12 @@ function validateCanonicalEvent(event: CanonicalPaymentEvent): void {
 function mapVerifierFailure(cause: unknown): AppError {
   const code =
     cause instanceof Error ? cause.message : "PAYMENT_VERIFICATION_FAILED";
+  if (isPaymentProviderUnavailable(cause))
+    return new AppError(
+      503,
+      "PAYMENT_PROVIDER_UNAVAILABLE",
+      "Payment provider verification is temporarily unavailable; retry the event.",
+    );
   if (code === "INVALID_SIGNATURE")
     return new AppError(
       401,
@@ -336,6 +352,73 @@ function mapVerifierFailure(cause: unknown): AppError {
     "PAYMENT_VERIFICATION_FAILED",
     "The payment signature could not be verified.",
   );
+}
+
+async function preserveUnverifiedPayment(
+  database: Database,
+  input: PaymentWebhookInput,
+): Promise<void> {
+  const rawText = new TextDecoder().decode(input.rawBody);
+  const parsed = parseUntrustedRecord(rawText);
+  const digest = createHash("sha256")
+    .update(input.rawBody)
+    .update(input.signature)
+    .update(input.requestTimestamp)
+    .digest("hex");
+  const providerEventId =
+    boundedString(parsed?.eventId, 256) ?? `unverified-${digest}`;
+  const eventType =
+    boundedString(parsed?.eventType, 128) ?? "PAYMENT_PROVIDER_UNAVAILABLE";
+  await withTransaction(database, async (tx) => {
+    await receiveInboxMessage(tx, {
+      provider: "SOMOCO_PAYMENTS",
+      providerEventId,
+      eventType,
+      payload: {
+        preservationReason: "PAYMENT_PROVIDER_UNAVAILABLE",
+        rawBodyBase64: Buffer.from(input.rawBody).toString("base64"),
+        signature: input.signature,
+        requestTimestamp: input.requestTimestamp,
+      },
+      receivedAt: new Date(),
+      claim: false,
+    });
+  });
+}
+
+function isPaymentProviderUnavailable(cause: unknown): boolean {
+  const values = [
+    cause instanceof Error ? cause.message : String(cause),
+    ...(isRecord(cause) && typeof cause.code === "string" ? [cause.code] : []),
+  ];
+  return values.some((code) =>
+    [
+      "PAYMENT_PROVIDER_UNAVAILABLE",
+      "SIMULATOR_PROVIDER_UNAVAILABLE",
+      "PROVIDER_UNAVAILABLE",
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "EAI_AGAIN",
+    ].includes(code),
+  );
+}
+
+function parseUntrustedRecord(value: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function boundedString(value: unknown, maxLength: number): string | null {
+  return typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maxLength
+    ? value
+    : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

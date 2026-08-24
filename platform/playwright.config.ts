@@ -12,7 +12,9 @@ export default defineConfig({
     command: "node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 4178",
     cwd: "apps/customer-web",
     url: "http://127.0.0.1:4178",
-    reuseExistingServer: true,
+    // Always launch the checked-out customer app; a pre-existing process on
+    // the fixed test port is not evidence for this checkout.
+    reuseExistingServer: false,
     timeout: 120_000,
   },
   use: {

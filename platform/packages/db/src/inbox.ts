@@ -14,6 +14,8 @@ export interface InboxMessageInput {
   eventType: string;
   payload: unknown;
   receivedAt: Date;
+  /** Preserve an unverified payload without claiming it for processing. */
+  claim?: boolean;
 }
 
 export type InboxMessage = typeof inboxMessage.$inferSelect;
@@ -27,13 +29,14 @@ export async function receiveInboxMessage(
   message: InboxMessageInput,
 ): Promise<InboxReceipt> {
   const executor = getInternalExecutor(db);
-  const processingToken = randomUUID();
+  const { claim, ...persistedMessage } = message;
+  const processingToken = claim === false ? null : randomUUID();
   const [inserted] = await executor
     .insert(inboxMessage)
     .values({
-      ...message,
+      ...persistedMessage,
       processingToken,
-      processingStartedAt: new Date(),
+      processingStartedAt: processingToken === null ? null : new Date(),
     })
     .onConflictDoNothing({
       target: [inboxMessage.provider, inboxMessage.providerEventId],
@@ -57,6 +60,28 @@ export async function receiveInboxMessage(
 
   if (existing === undefined) {
     throw new Error("INBOX_DEDUPLICATION_FAILED");
+  }
+  if (
+    message.claim !== false &&
+    existing.processedAt === null &&
+    existing.processingToken === null
+  ) {
+    const [claimed] = await executor
+      .update(inboxMessage)
+      .set({
+        processingToken,
+        processingStartedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(inboxMessage.id, existing.id),
+          isNull(inboxMessage.processedAt),
+          isNull(inboxMessage.processingToken),
+        ),
+      )
+      .returning();
+    if (claimed !== undefined)
+      return { ...claimed, inserted: false, processingToken };
   }
   return { ...existing, inserted: false, processingToken: null };
 }

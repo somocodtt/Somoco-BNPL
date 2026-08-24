@@ -28,6 +28,7 @@ export type NewOutboxMessage = Omit<OutboxMessage, "attempts"> & {
 export interface ClaimOutboxBatchOptions {
   workerId: string;
   limit: number;
+  topic?: string;
   claimLeaseMs?: number;
   maxAttempts?: number;
 }
@@ -105,6 +106,10 @@ export async function claimOutboxBatch(
     Number.MAX_SAFE_INTEGER,
     "OUTBOX_MAX_ATTEMPTS_INVALID",
   );
+  const topicClause =
+    options.topic === undefined
+      ? sql`true`
+      : sql`message.topic = ${options.topic}`;
 
   const result = await getInternalExecutor(db).execute<{
     id: string;
@@ -122,6 +127,7 @@ export async function claimOutboxBatch(
       from ${outboxMessage} as message, database_time
       where message.published_at is null
         and message.exception_at is null
+        and ${topicClause}
         and message.available_at <= database_time.now
         and message.attempts >= ${maxAttempts}
         and (message.claimed_by is null or message.claimed_at < database_time.now - (${claimLeaseMs} * interval '1 millisecond'))
@@ -161,6 +167,7 @@ export async function claimOutboxBatch(
       from ${outboxMessage} as message, database_time
       where message.published_at is null
         and message.exception_at is null
+        and ${topicClause}
         and message.available_at <= database_time.now
         and message.attempts < ${maxAttempts}
         and (message.claimed_by is null or message.claimed_at < database_time.now - (${claimLeaseMs} * interval '1 millisecond'))

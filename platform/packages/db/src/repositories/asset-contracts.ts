@@ -446,6 +446,25 @@ export function assetContractRepo(db: Database | DatabaseTransaction) {
            returning id
         `);
         paymentId = payment.rows[0]?.id ?? paymentId;
+        const receipt = await executor.execute<{
+          id: string;
+          contract_id: string | null;
+        }>(sql`
+          select id, contract_id::text as contract_id
+            from payment_receipt
+           where payment_transaction_id = ${paymentId}::uuid
+             and (contract_id is null or contract_id = ${input.contractId}::uuid)
+           for update
+        `);
+        const receiptRow = receipt.rows[0];
+        if (receiptRow === undefined)
+          throw new Error("PAYMENT_RECEIPT_REQUIRED");
+        if (receiptRow.contract_id === null)
+          await executor.execute(sql`
+            update payment_receipt
+               set contract_id = ${input.contractId}::uuid
+             where id = ${receiptRow.id}::uuid
+          `);
       }
       const contract = await executor.execute<{
         outstanding_balance_minor_units: bigint | string;

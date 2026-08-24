@@ -15,6 +15,8 @@ export interface CollectionsService {
   computeArrears(input: {
     contractId: string;
     asOfDate: string;
+    actor: StaffPrincipal;
+    requestId: string;
   }): Promise<ArrearsResult & { contractId: string }>;
   listArrears(
     actor: StaffPrincipal,
@@ -76,6 +78,7 @@ export function createCollectionsService(options: {
       : validatePaymentInstructions(options.ussdInstructions);
   return {
     async computeArrears(input) {
+      requireRecoveryRole(input.actor);
       const result = await withTransaction(options.database, async (tx) => {
         const repo = collectionsRepo(tx);
         if ((await repo.findContractContext(input.contractId)) === null)
@@ -112,6 +115,22 @@ export function createCollectionsService(options: {
             consecutiveMissedInstallments: arrears.consecutiveMissed,
           });
         }
+        await appendAuditEvent(tx, {
+          aggregateType: "contract",
+          aggregateId: input.contractId,
+          action: "ARREARS_COMPUTED",
+          actorStaffUserId: input.actor.staffUserId,
+          actorPersonId: null,
+          requestId: input.requestId,
+          data: {
+            asOfDate: arrears.asOfDate,
+            overdueMinorUnits: arrears.overdueMinor.toString(),
+            totalUnpaid: arrears.totalUnpaid,
+            consecutiveMissed: arrears.consecutiveMissed,
+            escalationSignals: [...arrears.escalationSignals],
+          },
+          occurredAt: new Date(),
+        });
         return arrears;
       });
       return { contractId: input.contractId, ...result };

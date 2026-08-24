@@ -67,9 +67,18 @@ export async function registerCollectionsRoutes(
       },
     },
     async (request, reply) => {
+      const actor = requireStaffPrincipal(request);
+      await access.authorizePrivileged({
+        principal: actor,
+        action: "collections.compute",
+        requestId: request.id,
+        targetId: request.params.contractId,
+      });
       const result = await collections.computeArrears({
         contractId: request.params.contractId,
         asOfDate: request.body.asOfDate,
+        actor,
+        requestId: request.id,
       });
       return reply.send({
         ...result,

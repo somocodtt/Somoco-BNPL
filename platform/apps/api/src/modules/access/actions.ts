@@ -9,6 +9,7 @@ export type StaffAction =
   | "inventory.manage"
   | "tracker.view"
   | "payment.post"
+  | "collections.compute"
   | "recovery.authorize"
   | "compliance.audit"
   | "customer_support.manage"
