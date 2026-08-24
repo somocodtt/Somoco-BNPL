@@ -1,0 +1,244 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1786711751547,
+      "tag": "0000_worthless_glorian",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786714073507,
+      "tag": "0001_fresh_talon",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786721089658,
+      "tag": "0002_lovely_maginty",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786733392208,
+      "tag": "0003_square_zaran",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786735841423,
+      "tag": "0004_tearful_dark_phoenix",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786738950841,
+      "tag": "0005_fantastic_kabuki",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786784262800,
+      "tag": "0006_worthless_marrow",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786788791842,
+      "tag": "0007_concerned_siren",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786956093202,
+      "tag": "0008_regular_juggernaut",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787230830904,
+      "tag": "0009_whole_nightmare",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787230830905,
+      "tag": "0010_controlled_financing",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1787230830906,
+      "tag": "0011_financing_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1787230830907,
+      "tag": "0012_financing_disclosures",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1787230830908,
+      "tag": "0013_asset_contract_handover",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1787230830909,
+      "tag": "0014_asset_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787230830910,
+      "tag": "0015_asset_privacy_controls",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1787230830911,
+      "tag": "0016_payment_ledger_reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787317911293,
+      "tag": "0017_wooden_selene",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787400000000,
+      "tag": "0018_sealed_payment_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1787400000001,
+      "tag": "0019_external_payment_policy_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1787329877753,
+      "tag": "0020_flippant_bishop",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1787425007463,
+      "tag": "0021_high_siren",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1787430477858,
+      "tag": "0022_condemned_deathbird",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1787433826794,
+      "tag": "0023_bound_settlement_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1787435822604,
+      "tag": "0024_safe_evidence_replacement",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1787438733046,
+      "tag": "0025_bumpy_kang",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1787442849791,
+      "tag": "0026_loose_stellaris",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1787445000000,
+      "tag": "0027_complete_export_and_migration_lifecycles",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1787446000000,
+      "tag": "0028_composite_migration_sample_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1787447000000,
+      "tag": "0030_require_sample_verification_command",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1787448000000,
+      "tag": "0031_bind_payment_receipt_contract",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1787534400000,
+      "tag": "0032_runtime_receipt_contract_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1787565600000,
+      "tag": "0033_final_controlled_pilot_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1787569200000,
+      "tag": "0034_populated_financial_ownership_remediation",
+      "breakpoints": true
+    }
+  ]
+}

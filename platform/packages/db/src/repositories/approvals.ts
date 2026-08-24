@@ -1,0 +1,500 @@
+import { sql } from "drizzle-orm";
+import type { Database } from "../client.js";
+import {
+  getInternalExecutor,
+  getInternalTransaction,
+  type DatabaseTransaction,
+  type InternalDatabaseExecutor,
+} from "../transaction.js";
+
+export interface LockedApprovalApplication {
+  id: string;
+  status: string;
+  version: number;
+  applicantPersonId: string;
+  informationRequestedStage: string | null;
+}
+
+export interface ApplicationVersionRecord {
+  id: string;
+  versionNumber: number;
+  snapshot: Record<string, unknown>;
+}
+
+export interface ApprovalQueueRecord {
+  id: string;
+  status: string;
+  version: number;
+  submittedAt: Date | string | null;
+  snapshot: Record<string, unknown>;
+}
+
+export interface ApprovalDetailRecord extends ApprovalQueueRecord {
+  decisions: Array<Record<string, unknown>>;
+  underwriting: Array<Record<string, unknown>>;
+  informationRequestedStage: string | null;
+}
+
+export interface ApprovalDecisionRecord extends Record<string, unknown> {
+  id: string;
+}
+
+export interface WorkflowCommandRecord {
+  id: string;
+  applicationId: string;
+  idempotencyKey: string;
+  commandType: string;
+  payloadHash: string;
+  response: Record<string, unknown>;
+}
+
+export interface DelegationRecord {
+  id: string;
+  delegateId: string;
+  role: string;
+  scope: string[];
+  approvedBy: string;
+  approvedAt: Date | string;
+  effectiveFrom: Date | string;
+  effectiveUntil: Date | string;
+}
+
+export function approvalRepo(db: Database | DatabaseTransaction) {
+  const executor = executorFor(db);
+
+  return {
+    async lockApplication(
+      applicationId: string,
+    ): Promise<LockedApprovalApplication | null> {
+      const result = await executor.execute<{
+        id: string;
+        status: string;
+        version: number;
+        applicant_person_id: string;
+        information_requested_stage: string | null;
+      }>(sql`
+        select id, status, version, applicant_person_id,
+               information_requested_stage
+          from application
+         where id = ${applicationId}::uuid
+         for update
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            status: row.status,
+            version: row.version,
+            applicantPersonId: row.applicant_person_id,
+            informationRequestedStage: row.information_requested_stage,
+          };
+    },
+
+    async latestVersion(
+      applicationId: string,
+    ): Promise<ApplicationVersionRecord | null> {
+      const result = await executor.execute<{
+        id: string;
+        version_number: number;
+        snapshot: Record<string, unknown>;
+      }>(sql`
+        select id, version_number, snapshot
+          from application_version
+         where application_id = ${applicationId}::uuid
+         order by version_number desc
+         limit 1
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            versionNumber: row.version_number,
+            snapshot: row.snapshot,
+          };
+    },
+
+    async insertDecision(input: {
+      applicationVersionId: string;
+      stage: string;
+      action: string;
+      reason: string;
+      decidedBy: string;
+      decidedAt: Date;
+    }): Promise<ApprovalDecisionRecord> {
+      const result = await executor.execute<ApprovalDecisionRecord>(sql`
+        insert into approval_decision
+          (application_version_id, stage, action, reason, decided_by, decided_at)
+        values (
+          ${input.applicationVersionId}::uuid,
+          ${input.stage}::approval_stage,
+          ${input.action}::approval_action,
+          ${input.reason},
+          ${input.decidedBy}::uuid,
+          ${input.decidedAt}
+        )
+        returning id
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("APPROVAL_DECISION_INSERT_FAILED");
+      return row;
+    },
+
+    async updateApplication(
+      applicationId: string,
+      expectedVersion: number,
+      status: string,
+      updatedAt: Date,
+      informationRequestedStage: string | null = null,
+    ): Promise<{ id: string; status: string; version: number }> {
+      const result = await executor.execute<{
+        id: string;
+        status: string;
+        version: number;
+      }>(sql`
+        update application
+           set status = ${status}::application_status,
+               information_requested_stage = ${informationRequestedStage}::approval_stage,
+               version = version + 1,
+               updated_at = ${updatedAt}
+         where id = ${applicationId}::uuid
+           and version = ${expectedVersion}
+         returning id, status, version
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("STALE_VERSION");
+      return row;
+    },
+
+    async latestInformationRequestStage(
+      applicationId: string,
+    ): Promise<string | null> {
+      const result = await executor.execute<{ stage: string }>(sql`
+        select d.stage
+          from approval_decision d
+          join application_version av on av.id = d.application_version_id
+         where av.application_id = ${applicationId}::uuid
+           and d.action = 'REQUEST_INFORMATION'::approval_action
+         order by d.decided_at desc, d.id desc
+         limit 1
+      `);
+      return result.rows[0]?.stage ?? null;
+    },
+
+    async findWorkflowCommand(
+      applicationId: string,
+      idempotencyKey: string,
+    ): Promise<WorkflowCommandRecord | null> {
+      const result = await executor.execute<{
+        id: string;
+        application_id: string;
+        idempotency_key: string;
+        command_type: string;
+        payload_hash: string;
+        response: Record<string, unknown>;
+      }>(sql`
+        select id, application_id, idempotency_key, command_type, payload_hash, response
+          from workflow_command
+         where application_id = ${applicationId}::uuid
+           and idempotency_key = ${idempotencyKey}::uuid
+         limit 1
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            applicationId: row.application_id,
+            idempotencyKey: row.idempotency_key,
+            commandType: row.command_type,
+            payloadHash: row.payload_hash,
+            response: row.response,
+          };
+    },
+
+    async insertWorkflowCommand(input: {
+      applicationId: string;
+      idempotencyKey: string;
+      commandType: string;
+      payloadHash: string;
+      requestId: string;
+      actorStaffUserId?: string;
+      actorPersonId?: string;
+      response: Record<string, unknown>;
+    }): Promise<WorkflowCommandRecord> {
+      const result = await executor.execute<{
+        id: string;
+        application_id: string;
+        idempotency_key: string;
+        command_type: string;
+        payload_hash: string;
+        response: Record<string, unknown>;
+      }>(sql`
+        insert into workflow_command
+          (application_id, idempotency_key, command_type, payload_hash, request_id,
+           actor_staff_user_id, actor_person_id, response)
+        values (
+          ${input.applicationId}::uuid,
+          ${input.idempotencyKey}::uuid,
+          ${input.commandType},
+          ${input.payloadHash},
+          ${input.requestId}::uuid,
+          ${input.actorStaffUserId ?? null}::uuid,
+          ${input.actorPersonId ?? null}::uuid,
+          ${input.response}::jsonb
+        )
+        returning id, application_id, idempotency_key, command_type, payload_hash, response
+      `);
+      const row = result.rows[0];
+      if (row === undefined) throw new Error("WORKFLOW_COMMAND_INSERT_FAILED");
+      return {
+        id: row.id,
+        applicationId: row.application_id,
+        idempotencyKey: row.idempotency_key,
+        commandType: row.command_type,
+        payloadHash: row.payload_hash,
+        response: row.response,
+      };
+    },
+
+    async findActiveDelegation(
+      staffUserId: string,
+      stage: string,
+      now: Date,
+    ): Promise<DelegationRecord | null> {
+      const result = await executor.execute<{
+        id: string;
+        delegated_staff_user_id: string;
+        delegated_role: string;
+        scope: string[];
+        approved_by: string;
+        approved_at: Date | string;
+        effective_from: Date | string;
+        effective_until: Date | string;
+      }>(sql`
+        select id, delegated_staff_user_id, delegated_role, scope, approved_by,
+               approved_at, effective_from, effective_until
+          from staff_delegation
+         where delegated_staff_user_id = ${staffUserId}::uuid
+           and status = 'APPROVED'
+           and revoked_at is null
+           and approved_at is not null
+           and effective_from <= ${now}
+           and effective_until > ${now}
+           and scope @> ${JSON.stringify([stage])}::jsonb
+         order by effective_until asc, id asc
+         limit 1
+      `);
+      const row = result.rows[0];
+      return row === undefined
+        ? null
+        : {
+            id: row.id,
+            delegateId: row.delegated_staff_user_id,
+            role: row.delegated_role,
+            scope: row.scope,
+            approvedBy: row.approved_by,
+            approvedAt: row.approved_at,
+            effectiveFrom: row.effective_from,
+            effectiveUntil: row.effective_until,
+          };
+    },
+
+    async insertApplicationVersion(input: {
+      applicationId: string;
+      versionNumber: number;
+      snapshot: Record<string, unknown>;
+      submittedAt: Date;
+    }): Promise<{ id: string }> {
+      const result = await executor.execute<{ id: string }>(sql`
+        insert into application_version
+          (application_id, version_number, snapshot, submitted_at)
+        values (
+          ${input.applicationId}::uuid,
+          ${input.versionNumber},
+          ${input.snapshot}::jsonb,
+          ${input.submittedAt}
+        )
+        returning id
+      `);
+      const row = result.rows[0];
+      if (row === undefined)
+        throw new Error("APPLICATION_VERSION_INSERT_FAILED");
+      return row;
+    },
+
+    async hasPendingExceptionRequestedBy(
+      applicationId: string,
+      staffUserId: string,
+    ): Promise<boolean> {
+      const result = await executor.execute<{ exists: boolean }>(sql`
+        select exists(
+          select 1
+            from exception_request
+           where application_id = ${applicationId}::uuid
+             and requested_by = ${staffUserId}::uuid
+             and status = 'PENDING'
+        )
+      `);
+      return result.rows[0]?.exists ?? false;
+    },
+
+    async findManualCheckByIdempotency(
+      applicationId: string,
+      idempotencyKey: string,
+    ): Promise<Record<string, unknown> | null> {
+      const result = await executor.execute<{
+        assessment: Record<string, unknown>;
+      }>(sql`
+        select ua.assessment
+          from underwriting_assessment ua
+          join application_version av on av.id = ua.application_version_id
+         where av.application_id = ${applicationId}::uuid
+           and ua.assessment->>'kind' = 'MANUAL_CREDIT_BUREAU_CHECK'
+           and ua.assessment->>'idempotencyKey' = ${idempotencyKey}
+         order by ua.assessed_at desc
+         limit 1
+      `);
+      return result.rows[0]?.assessment ?? null;
+    },
+
+    async evidenceDocumentBelongsToApplication(
+      applicationId: string,
+      evidenceDocumentId: string,
+    ): Promise<boolean> {
+      const result = await executor.execute<{ exists: boolean }>(sql`
+        select exists(
+          select 1
+            from application a
+            join privacy.document d on d.person_id = a.applicant_person_id
+           where a.id = ${applicationId}::uuid
+             and d.id = ${evidenceDocumentId}::uuid
+             and d.document_type = 'CREDIT_BUREAU_REPORT'
+             and d.status = 'ACCEPTED'
+             and d.malware_scanned = true
+             and d.sha256 is not null
+             and d.accepted_object_key is not null
+             and d.accepted_object_version_id is not null
+             and d.accepted_object_etag is not null
+        )
+      `);
+      return result.rows[0]?.exists ?? false;
+    },
+
+    async insertUnderwritingAssessment(input: {
+      applicationVersionId: string;
+      assessment: Record<string, unknown>;
+      assessedBy: string;
+      assessedAt: Date;
+    }): Promise<void> {
+      await executor.execute(sql`
+        insert into underwriting_assessment
+          (application_version_id, assessment, assessed_by, assessed_at)
+        values (
+          ${input.applicationVersionId}::uuid,
+          ${input.assessment}::jsonb,
+          ${input.assessedBy}::uuid,
+          ${input.assessedAt}
+        )
+      `);
+    },
+
+    async listQueue(
+      statuses: readonly string[],
+    ): Promise<ApprovalQueueRecord[]> {
+      if (statuses.length === 0) return [];
+      const result = await getInternalExecutor(db as Database).execute<{
+        id: string;
+        status: string;
+        version: number;
+        submitted_at: Date | string | null;
+        snapshot: Record<string, unknown>;
+      }>(sql`
+        select a.id, a.status, a.version, a.submitted_at,
+               coalesce((
+                 select av.snapshot from application_version av
+                  where av.application_id = a.id
+                  order by av.version_number desc limit 1
+               ), '{}'::jsonb) as snapshot
+          from application a
+         where a.status in (${sql.join(
+           statuses.map((status) => sql`${status}::application_status`),
+           sql`, `,
+         )})
+         order by a.submitted_at nulls last, a.id
+      `);
+      return result.rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        version: row.version,
+        submittedAt: row.submitted_at,
+        snapshot: row.snapshot,
+      }));
+    },
+
+    async detail(applicationId: string): Promise<ApprovalDetailRecord | null> {
+      const publicExecutor = getInternalExecutor(db as Database);
+      const base = await publicExecutor.execute<{
+        id: string;
+        status: string;
+        version: number;
+        submitted_at: Date | string | null;
+        information_requested_stage: string | null;
+        snapshot: Record<string, unknown>;
+      }>(sql`
+        select a.id, a.status, a.version, a.submitted_at,
+               a.information_requested_stage,
+               coalesce((
+                 select av.snapshot from application_version av
+                  where av.application_id = a.id
+                  order by av.version_number desc limit 1
+               ), '{}'::jsonb) as snapshot
+          from application a
+         where a.id = ${applicationId}::uuid
+      `);
+      const row = base.rows[0];
+      if (row === undefined) return null;
+      const decisions = await publicExecutor.execute<Record<string, unknown>>(
+        sql`
+          select d.stage, d.action, d.reason, d.decided_by as "decidedBy",
+                 d.decided_at as "decidedAt", av.version_number as "versionNumber"
+            from approval_decision d
+            join application_version av on av.id = d.application_version_id
+           where av.application_id = ${applicationId}::uuid
+           order by d.decided_at, d.id
+        `,
+      );
+      const underwriting = await publicExecutor.execute<
+        Record<string, unknown>
+      >(sql`
+        select ua.assessment, ua.assessed_by as "assessedBy",
+               ua.assessed_at as "assessedAt", av.version_number as "versionNumber"
+          from underwriting_assessment ua
+          join application_version av on av.id = ua.application_version_id
+         where av.application_id = ${applicationId}::uuid
+         order by ua.assessed_at, ua.id
+      `);
+      return {
+        id: row.id,
+        status: row.status,
+        version: row.version,
+        submittedAt: row.submitted_at,
+        snapshot: row.snapshot,
+        informationRequestedStage: row.information_requested_stage,
+        decisions: decisions.rows,
+        underwriting: underwriting.rows,
+      };
+    },
+  };
+}
+
+function executorFor(
+  db: Database | DatabaseTransaction,
+): InternalDatabaseExecutor {
+  try {
+    return getInternalTransaction(db as DatabaseTransaction);
+  } catch {
+    return getInternalExecutor(db as Database);
+  }
+}

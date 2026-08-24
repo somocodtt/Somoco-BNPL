@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://somoco.example/schemas/financing-worked-example-v1.json",
+  "title": "Finance and Compliance approved financing worked example",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "fixtureId",
+    "method",
+    "frequency",
+    "tenureMonths",
+    "workedExample",
+    "canonicalHash",
+    "financeApproved",
+    "complianceApproved",
+    "licencePermitted",
+    "synthetic"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "fixtureId": { "type": "string", "minLength": 1 },
+    "method": { "enum": ["FLAT_MARKUP", "REDUCING_BALANCE"] },
+    "frequency": { "enum": ["WEEKLY", "MONTHLY"] },
+    "tenureMonths": { "enum": [6, 8, 12, 24, 36, 48] },
+    "workedExample": { "type": "object" },
+    "canonicalHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "financeApproved": { "type": "boolean" },
+    "complianceApproved": { "type": "boolean" },
+    "licencePermitted": { "type": "boolean" },
+    "synthetic": { "type": "boolean" }
+  }
+}

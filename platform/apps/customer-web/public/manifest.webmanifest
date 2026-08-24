@@ -1,0 +1,9 @@
+{
+  "name": "Somoco vehicle finance",
+  "short_name": "Somoco",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7faf9",
+  "theme_color": "#006b5b",
+  "description": "Secure applicant and guarantor onboarding for Somoco vehicle finance"
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@somo/worker",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/main.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json --noEmit && esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/main.js",
+    "lint": "eslint src test",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@somo/db": "workspace:*",
+    "@somo/integrations": "workspace:*"
+  },
+  "devDependencies": {
+    "@somo/testkit": "workspace:*",
+    "esbuild": "^0.28.2"
+  }
+}

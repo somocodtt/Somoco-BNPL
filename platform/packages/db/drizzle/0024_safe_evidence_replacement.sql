@@ -1,0 +1,2 @@
+DROP INDEX "settlement_evidence_contract_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "settlement_evidence_contract_active_unique" ON "settlement_evidence" USING btree ("contract_id") WHERE "settlement_evidence"."verification_status" = 'CLEAN';

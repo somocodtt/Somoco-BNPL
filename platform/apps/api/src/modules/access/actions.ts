@@ -1,0 +1,18 @@
+export type StaffAction =
+  | "application.verify"
+  | "application.approve.bsm.initial"
+  | "application.approve.bsm.final"
+  | "application.approve.agm"
+  | "application.approve.cfo"
+  | "application.approve.md"
+  | "product.manage"
+  | "inventory.manage"
+  | "tracker.view"
+  | "payment.post"
+  | "collections.compute"
+  | "recovery.authorize"
+  | "compliance.audit"
+  | "customer_support.manage"
+  | "ownership.transfer"
+  | "staff_user.create"
+  | "staff_user.update";
